@@ -116,7 +116,9 @@ def main() -> int:
     console.print("\n[bold]--- Filter results ---[/]")
     console.print(f"Target tag: {TARGET_TAG!r}")
     console.print(f"Matched devices: {len(targets.inventory.hosts)}")
-    console.print(f"Device names: {list(targets.inventory.hosts)}")
+    console.print("Devices selected:")
+    for device_number, host_name in enumerate(targets.inventory.hosts, start=1):
+        console.print(f"  {device_number:>3}. {escape(host_name)}")
 
     #Provides error output for if no devices are assigned to the specified parameter(Tag)
     if not targets.inventory.hosts:
@@ -155,14 +157,9 @@ def main() -> int:
         TextColumn("{task.fields[status]}", markup=True),
         TimeElapsedColumn(),
         console=console,
-        transient=False,
+        transient=True,
         expand=True,
     )
-
-    # Rich normally replaces rows beyond the terminal height with an ellipsis.
-    # Keep the complete device inventory visible so engineers can scroll back
-    # through every device while the live display continues to update.
-    progress.live.vertical_overflow = "visible"
 
     with progress:
         progress_tasks = {
@@ -171,6 +168,7 @@ def main() -> int:
                 total=PROGRESS_STEPS,
                 host=host_name,
                 status="[dim]Queued[/]",
+                visible=False,
             )
             for host_name in targets.inventory.hosts
         }
@@ -224,15 +222,26 @@ def make_progress_updater(
     progress: Progress,
     progress_tasks: dict[str, TaskID],
 ) -> Callable[[str, int, str], None]:
-    """Create a thread-safe per-host progress callback for Nornir workers."""
+    """Create a scroll-safe per-host progress callback for Nornir workers."""
+
+    finished_hosts: set[str] = set()
 
     def update(host_name: str, completed: int, status: str) -> None:
+        task_id = progress_tasks[host_name]
         progress.update(
-            progress_tasks[host_name],
+            task_id,
             completed=completed,
             status=status,
+            visible=True,
             refresh=True,
         )
+
+        if completed >= PROGRESS_STEPS and host_name not in finished_hosts:
+            finished_hosts.add(host_name)
+            failed = "failed" in status.casefold()
+            label = "[bold red]FAILED[/]" if failed else "[bold green]COMPLETE[/]"
+            progress.console.print(f"{label} {escape(host_name)}")
+            progress.update(task_id, visible=False, refresh=True)
 
     return update
 
