@@ -48,7 +48,7 @@ except ImportError as exc:
 
 
 
-TARGET_TAG = "nornirtest"  #Tag used on Objects within Netbox.
+TARGET_TAG = "networking-active"  #Tag used on Objects within Netbox.
 BACKUP_ROOT = Path("./config_backups")  #Dir path for configuration backups
 PROGRESS_STEPS = 10
 console = Console()
@@ -712,7 +712,7 @@ def save_device_outputs(
         environment_results = task.run(
             name="Get environment information",
             task=netmiko_send_command,
-            command_string="show environment all",
+            command_string="show env all",
             read_timeout=120,
         )
     except Exception as exc:
