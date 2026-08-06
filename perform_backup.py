@@ -150,12 +150,19 @@ def main() -> int:
     progress = Progress(
         SpinnerColumn(),
         TextColumn("[bold blue]{task.fields[host]}", justify="right"),
-        BarColumn(),
+        BarColumn(bar_width=24),
         TextColumn("{task.completed:.0f}/{task.total:.0f}"),
         TextColumn("{task.fields[status]}", markup=True),
         TimeElapsedColumn(),
         console=console,
+        transient=False,
+        expand=True,
     )
+
+    # Rich normally replaces rows beyond the terminal height with an ellipsis.
+    # Keep the complete device inventory visible so engineers can scroll back
+    # through every device while the live display continues to update.
+    progress.live.vertical_overflow = "visible"
 
     with progress:
         progress_tasks = {
@@ -668,7 +675,12 @@ def save_device_outputs(
         progress_update(host_name, completed, status)
 
     def failure(message: str, exception: Exception | None = None) -> Result:
-        set_progress(PROGRESS_STEPS, f"[bold red]Failed:[/] {escape(message)}")
+        # Print a durable error above the live display. Keeping the progress-row
+        # message short prevents long exceptions from wrapping over other hosts.
+        console.print(
+            f"[bold red]ERROR[/] [bold]{escape(host_name)}[/]: {escape(message)}"
+        )
+        set_progress(PROGRESS_STEPS, "[bold red]Failed — see error above[/]")
         return Result(
             host=task.host,
             failed=True,
