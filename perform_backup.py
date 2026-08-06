@@ -11,7 +11,9 @@ Features in work:
 import os
 import re
 from collections.abc import Callable
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime
+from io import StringIO
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +43,7 @@ try:
         TextColumn,
         TimeElapsedColumn,
     )
+    from rich.text import Text
 except ImportError as exc:
     raise SystemExit(
         "ERROR: This script requires Rich. Install it with: pip install rich"
@@ -51,7 +54,7 @@ except ImportError as exc:
 TARGET_TAG = "networking-active"  #Tag used on Objects within Netbox.
 BACKUP_ROOT = Path("./config_backups")  #Dir path for configuration backups
 PROGRESS_STEPS = 10
-console = Console()
+console = Console(record=True)
 
 INTERFACE_COMMANDS = {
     "ip_brief": "show ip interface brief",
@@ -147,6 +150,10 @@ def main() -> int:
     console.print(f"\nOutput directory: {dated_output_dir.resolve()}")
     console.print("\n[bold]--- Starting configuration backups ---[/]")
 
+    # Save the stable pre-run display separately. The animated progress frames
+    # are intentionally discarded from the log because they contain redraws.
+    pre_run_log = console.export_text(clear=True, styles=False)
+
     # Collect the running configuration and environment output
     # from each device filtered from NetBox.
     progress = Progress(
@@ -180,8 +187,12 @@ def main() -> int:
             progress_update=make_progress_updater(progress, progress_tasks),
         )
 
+    # Clear recorded live frames before capturing durable result output.
+    console.export_text(clear=True, styles=False)
+
     # This is essential while troubleshooting.
-    print_result(results)
+    nornir_output = capture_print_result(results)
+    console.print(Text.from_ansi(nornir_output), end="")
 
     console.print("\n[bold]--- Backup summary ---[/]")
 
@@ -215,7 +226,36 @@ def main() -> int:
         f"\nCompleted: [green]{successful_count} successful[/], "
         f"[red]{failed_count} failed[/]"
     )
+
+    run_log_path = (
+        dated_output_dir
+        / f"nornir_backup_{backup_date.strftime('%Y%m%d_%H%M%S')}.log"
+    )
+    post_run_log = console.export_text(clear=True, styles=False)
+
+    try:
+        run_log_path.write_text(
+            pre_run_log + post_run_log,
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        console.print(
+            f"[bold red]ERROR:[/] Could not save run log to "
+            f"{escape(str(run_log_path.resolve()))}: {escape(str(exc))}"
+        )
+        return 1
+
+    console.print(f"Run log: {run_log_path.resolve()}")
     return 1 if failed_count else 0
+
+
+def capture_print_result(results: Any) -> str:
+    """Capture nornir_utils print_result output as plain loggable text."""
+
+    output = StringIO()
+    with redirect_stdout(output), redirect_stderr(output):
+        print_result(results)
+    return output.getvalue()
 
 
 def make_progress_updater(
