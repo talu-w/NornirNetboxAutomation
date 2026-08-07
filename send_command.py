@@ -19,12 +19,13 @@ from nornir.core.inventory import ConnectionOptions
 
 USERNETWORKCOMMAND = input('Please input the network command:')
 
-LEGACY_SSH_TAG = "legacy-ssh"
+LEGACY_SSH_TAGS = {"ssh-legacy", "legacy-ssh"}
 
 DEFAULT_NETMIKO_EXTRAS = {
     "conn_timeout": 30,
     "banner_timeout": 60,
     "auth_timeout": 60,
+    "read_timeout_override": 120,
     "fast_cli": False,
 }
 
@@ -35,6 +36,9 @@ LEGACY_SSH_EXTRAS = {
     **DEFAULT_NETMIKO_EXTRAS,
     "disabled_algorithms": {
         "pubkeys": ["rsa-sha2-256", "rsa-sha2-512"],
+        # Force the RSA host key to use its legacy ssh-rsa/SHA-1 signature
+        # instead of the RSA-SHA2 host-key signature variants.
+        "keys": ["rsa-sha2-256", "rsa-sha2-512"],
         # Netmiko/Paramiko exposes an exclusion list rather than an enable
         # list. Removing the newer KEX methods makes explicitly tagged legacy
         # devices negotiate diffie-hellman-group-exchange-sha1.
@@ -82,10 +86,16 @@ def main() -> int:
         )
 
         # Keep modern SSH negotiation by default. Only devices explicitly tagged
-        # "legacy-ssh" in NetBox receive the compatibility settings.
+        # "ssh-legacy" (or the older alias "legacy-ssh") in NetBox receive the
+        # compatibility settings.
+        host.data["ssh_profile"] = (
+            "legacy"
+            if LEGACY_SSH_TAGS.intersection(host.data["tag_slugs"])
+            else "default"
+        )
         netmiko_extras = (
             LEGACY_SSH_EXTRAS
-            if LEGACY_SSH_TAG in host.data["tag_slugs"]
+            if host.data["ssh_profile"] == "legacy"
             else DEFAULT_NETMIKO_EXTRAS
         )
         host.connection_options["netmiko"] = ConnectionOptions(
@@ -108,6 +118,7 @@ def main() -> int:
             f"  {host.name}: "
             f"hostname={host.hostname}, "
             f"platform={host.platform}, "
+            f"ssh_profile={host.data['ssh_profile']}, "
             f"tags={host.data['tag_slugs']}"
         )
     #Calls upon the send_command function to use Netmiko
