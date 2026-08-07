@@ -1012,6 +1012,15 @@ def sync_report_to_netbox(
             if trunk.get("native_vlan") is not None
             else None
         )
+        allowed_vlans = [int(vlan_id) for vlan_id in trunk.get("allowed_vlans", [])]
+        # IOS renders an unrestricted trunk as "all" (1-4094). Assigning all
+        # 4094 IDs would make the update fail for every VLAN not represented in
+        # NetBox, so use the device's active VLAN set in that case.
+        if len(allowed_vlans) == 4094:
+            allowed_vlans = [
+                int(vlan_id) for vlan_id in trunk.get("active_vlans", [])
+            ]
+
         desired_interfaces.append(
             (
                 trunk["interface"],
@@ -1019,7 +1028,7 @@ def sync_report_to_netbox(
                 native_vlan,
                 [
                     int(vlan_id)
-                    for vlan_id in trunk.get("allowed_vlans", [])
+                    for vlan_id in allowed_vlans
                     # NetBox represents the native VLAN only as untagged; do
                     # not also assign it to tagged_vlans.
                     if int(vlan_id) != native_vlan
@@ -1111,6 +1120,11 @@ def parse_arguments() -> argparse.Namespace:
     )
     parser.add_argument("--config", default="config.yaml", help="Nornir config file")
     parser.add_argument(
+        "--tag",
+        default="nornirtest",
+        help="Only process NetBox devices with this tag (default: nornirtest)",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Read NetBox and show changes without writing them",
@@ -1121,6 +1135,34 @@ def parse_arguments() -> argparse.Namespace:
         help="Create JSON reports without connecting to NetBox",
     )
     return parser.parse_args()
+
+
+def inventory_device_id(host: Any) -> int | None:
+    """Return a NetBox device ID supplied by the inventory plugin, if present."""
+
+    value = host.get("netbox_device_id") or host.get("device_id") or host.get("id")
+    try:
+        return int(value) if value not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
+def select_tagged_hosts(nr: Any, tagged_devices: Iterable[Any]) -> Any:
+    """Match NetBox's tagged-device result to the loaded Nornir inventory."""
+
+    device_ids = {int(device.id) for device in tagged_devices}
+    device_names = {str(device.name).casefold() for device in tagged_devices}
+
+    def is_tagged(host: Any) -> bool:
+        host_device_id = inventory_device_id(host)
+        inventory_name = str(host.get("netbox_device_name") or host.name).casefold()
+        return (
+            host_device_id in device_ids
+            if host_device_id is not None
+            else inventory_name in device_names
+        )
+
+    return nr.filter(filter_func=is_tagged)
 
 
 def main() -> int:
@@ -1153,15 +1195,25 @@ def main() -> int:
     exit_code = 0
 
     try:
-        # Apply your existing NetBox/Nornir filter here if needed.
-        #
-        # Examples:
-        #
-        # switches = nr.filter(platform="ios")
-        #
-        # Or use the same tag-filtering method already present in your
-        # current NetBox-backed scripts.
-        switches = nr
+        nb = pynetbox.api(netbox_url, token=netbox_token)
+        tagged_devices = list(nb.dcim.devices.filter(tag=args.tag))
+        switches = select_tagged_hosts(nr, tagged_devices)
+
+        LOGGER.info(
+            "NetBox tag %r selected %d device(s); %d matched the Nornir inventory",
+            args.tag,
+            len(tagged_devices),
+            len(switches.inventory.hosts),
+        )
+        if not tagged_devices:
+            LOGGER.warning("No NetBox devices have the tag %r; nothing to do", args.tag)
+            return 0
+        if not switches.inventory.hosts:
+            LOGGER.error(
+                "Devices with tag %r were found, but none matched the Nornir inventory",
+                args.tag,
+            )
+            return 1
 
         results = switches.run(
             task=collect_vlan_and_trunk_data,
@@ -1188,7 +1240,6 @@ def main() -> int:
             successful_reports.append(report)
 
         if not args.collect_only:
-            nb = pynetbox.api(netbox_url, token=netbox_token)
             vlan_cache = build_vlan_cache(nb)
 
             # Deliberately synchronize sequentially: a pynetbox API/session is
