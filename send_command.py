@@ -19,6 +19,26 @@ from nornir.core.inventory import ConnectionOptions
 
 USERNETWORKCOMMAND = input('Please input the network command:')
 
+LEGACY_SSH_TAG = "legacy-ssh"
+
+DEFAULT_NETMIKO_EXTRAS = {
+    "conn_timeout": 30,
+    "banner_timeout": 60,
+    "auth_timeout": 60,
+    "fast_cli": False,
+}
+
+# Some older SSH servers advertise an RSA host key but cannot process the newer
+# rsa-sha2-256/rsa-sha2-512 signatures. Disabling those signatures makes
+# Paramiko/Netmiko fall back to ssh-rsa for devices explicitly tagged in NetBox.
+LEGACY_SSH_EXTRAS = {
+    **DEFAULT_NETMIKO_EXTRAS,
+    "disabled_algorithms": {
+        "pubkeys": ["rsa-sha2-256", "rsa-sha2-512"],
+    },
+    "disable_sha2_fix": True,
+}
+
 def main() -> int:
     
     username = os.getenv("NORNIR_USERNAME")
@@ -46,12 +66,16 @@ def main() -> int:
             host.data.get("tags", [])
         )
 
-        #Connection options - Configured currently for connecting to legacy SSH/slower devices.
-        #Applied to all the objects that are pulled above from nr.inventory.hosts
-        host.connection_options["netmiko"] = ConnectionOptions(extras= {"conn_timeout": 30,
-                                                                        "banner_timeout": 60,
-                                                                        "auth_timeout": 60,
-                                                                        "fast_cli": False})
+        # Keep modern SSH negotiation by default. Only devices explicitly tagged
+        # "legacy-ssh" in NetBox receive the compatibility settings.
+        netmiko_extras = (
+            LEGACY_SSH_EXTRAS
+            if LEGACY_SSH_TAG in host.data["tag_slugs"]
+            else DEFAULT_NETMIKO_EXTRAS
+        )
+        host.connection_options["netmiko"] = ConnectionOptions(
+            extras=netmiko_extras
+        )
 
     #Local Nornir inventory filtering.
     testing_devices = nr.filter(
