@@ -1212,10 +1212,17 @@ def configure_pynetbox_session(nb: Any, inventory_options: dict[str, Any]) -> No
 def main() -> int:
     args = parse_arguments()
     netbox_token = os.getenv("NB_TOKEN")
+    nornir_username = os.getenv("NORNIR_USERNAME")
+    nornir_password = os.getenv("NORNIR_PASSWORD")
     if not netbox_token:
         raise SystemExit(
             "NB_TOKEN is not set. Export the NetBox API token first: "
             "export NB_TOKEN='your-token'"
+        )
+    if not nornir_username or not nornir_password:
+        raise SystemExit(
+            "NORNIR_USERNAME and NORNIR_PASSWORD must both be set before "
+            "connecting to network devices."
         )
 
     # Preserve every configured inventory option while replacing only the API
@@ -1229,6 +1236,12 @@ def main() -> int:
         config_file=args.config,
         inventory={"options": inventory_options},
     )
+    # NetBox supplies the hosts and management addresses; device login
+    # credentials come from the same environment variables used by the other
+    # Nornir scripts in this project. Inventory defaults are inherited by each
+    # host when Netmiko opens its Paramiko-backed SSH connection.
+    nr.inventory.defaults.username = nornir_username
+    nr.inventory.defaults.password = nornir_password
 
     exit_code = 0
 
