@@ -81,6 +81,20 @@ class SyncSummary:
     errors: list[str] = field(default_factory=list)
 
 
+@dataclass
+class InterfaceSearchScope:
+    """NetBox devices and interfaces belonging to one managed switch/stack."""
+
+    connected_device: Any
+    master_device: Any
+    virtual_chassis: Any | None
+    members_by_position: dict[int, Any]
+    indexes_by_device_id: dict[
+        int,
+        tuple[dict[str, list[Any]], dict[tuple[str, str], list[Any]]],
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Cisco output parsing
 # ---------------------------------------------------------------------------
@@ -549,6 +563,183 @@ def resolve_device(nb: Any, collected: CollectedDevice) -> Any:
     return exact[0]
 
 
+def integer_value(value: Any) -> int | None:
+    try:
+        return int(value) if value not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
+def stack_member_number(interface_name: str) -> int | None:
+    """Return 2 for names such as Gi2/0/3; two-part names are standalone."""
+
+    cleaned = interface_name.strip().replace(" ", "")
+    match = re.match(
+        r"^(?:[A-Za-z-]+)?(?P<member>\d+)/\d+/\d+(?:\.\d+)?$",
+        cleaned,
+    )
+    return int(match.group("member")) if match else None
+
+
+def resolve_virtual_chassis(
+    nb: Any,
+    device: Any,
+    collected: CollectedDevice,
+) -> Any | None:
+    """Resolve the device's VC relation, then an exact VC hostname fallback."""
+
+    virtual_chassis_id = related_id(getattr(device, "virtual_chassis", None))
+    if virtual_chassis_id is not None:
+        virtual_chassis = nb.dcim.virtual_chassis.get(virtual_chassis_id)
+        if virtual_chassis is None:
+            raise LookupError(
+                f"device {device.name!r} references missing Virtual Chassis "
+                f"ID {virtual_chassis_id}"
+            )
+        return virtual_chassis
+
+    # This supports inventories named for the stack/VC while NetBox stores the
+    # physical master device under a member-specific name.
+    for name in {str(device.name), collected.inventory_name}:
+        candidates = list(nb.dcim.virtual_chassis.filter(name=name))
+        exact = [
+            chassis
+            for chassis in candidates
+            if str(chassis.name).casefold() == name.casefold()
+        ]
+        if len(exact) == 1:
+            return exact[0]
+        if len(exact) > 1:
+            raise LookupError(f"multiple Virtual Chassis records are named {name!r}")
+    return None
+
+
+def build_interface_search_scope(
+    nb: Any,
+    device: Any,
+    collected: CollectedDevice,
+) -> InterfaceSearchScope:
+    """Load interfaces from a device and all of its Virtual Chassis members."""
+
+    virtual_chassis = resolve_virtual_chassis(nb, device, collected)
+    master_device = device
+    members_by_position: dict[int, Any] = {}
+    devices: dict[int, Any] = {int(device.id): device}
+
+    if virtual_chassis is not None:
+        members = list(
+            nb.dcim.devices.filter(virtual_chassis_id=virtual_chassis.id)
+        )
+        for member in members:
+            devices[int(member.id)] = member
+            position = integer_value(getattr(member, "vc_position", None))
+            if position is None:
+                continue
+            if position in members_by_position:
+                raise LookupError(
+                    f"Virtual Chassis {virtual_chassis.name!r} has multiple "
+                    f"devices at position {position}"
+                )
+            members_by_position[position] = member
+
+        master_id = related_id(getattr(virtual_chassis, "master", None))
+        if master_id is not None:
+            master_device = devices.get(master_id) or nb.dcim.devices.get(master_id)
+            if master_device is None:
+                raise LookupError(
+                    f"Virtual Chassis {virtual_chassis.name!r} references "
+                    f"missing master device ID {master_id}"
+                )
+            devices[int(master_device.id)] = master_device
+
+        LOGGER.info(
+            "%s: Virtual Chassis %r has member position(s): %s",
+            collected.inventory_name,
+            virtual_chassis.name,
+            ", ".join(str(position) for position in sorted(members_by_position))
+            or "none",
+        )
+
+    indexes_by_device_id = {
+        device_id: interface_indexes(
+            nb.dcim.interfaces.filter(device_id=device_id)
+        )
+        for device_id in devices
+    }
+    return InterfaceSearchScope(
+        connected_device=device,
+        master_device=master_device,
+        virtual_chassis=virtual_chassis,
+        members_by_position=members_by_position,
+        indexes_by_device_id=indexes_by_device_id,
+    )
+
+
+def local_stack_aliases(interface_name: str) -> list[str]:
+    """Return common member-local forms of a stack interface name."""
+
+    cleaned = interface_name.strip().replace(" ", "")
+    match = re.match(
+        r"^(?P<prefix>[A-Za-z-]+)(?P<member>\d+)/(?P<remainder>\d+/\d+(?:\.\d+)?)$",
+        cleaned,
+    )
+    if not match:
+        return []
+    prefix = match.group("prefix")
+    remainder = match.group("remainder")
+    return [f"{prefix}1/{remainder}", f"{prefix}{remainder}"]
+
+
+def match_scoped_interface(
+    discovered_name: str,
+    scope: InterfaceSearchScope,
+) -> tuple[Any | None, Any | None, str | None]:
+    """Route a stack port to its VC member before matching its interface."""
+
+    position = stack_member_number(discovered_name)
+    owner = scope.master_device
+
+    if position is not None and scope.virtual_chassis is not None:
+        owner = scope.members_by_position.get(position)
+        if owner is None:
+            return None, None, (
+                f"{discovered_name}: Virtual Chassis {scope.virtual_chassis.name!r} "
+                f"has no member at position {position}"
+            )
+    elif position is not None and position > 1:
+        return None, None, (
+            f"{discovered_name}: stack member {position} requires a Virtual "
+            f"Chassis for {scope.connected_device.name!r}, but none exists"
+        )
+    elif position is not None:
+        owner = scope.connected_device
+
+    indexes = scope.indexes_by_device_id.get(int(owner.id))
+    if indexes is None:
+        return None, owner, f"no interfaces were loaded for device {owner.name!r}"
+
+    interface, error = match_interface(discovered_name, *indexes)
+    if interface is not None:
+        return interface, owner, None
+
+    # Device-type templates sometimes store each physical member's ports in a
+    # member-local form (Gi1/0/3 or Gi0/3), even when IOS reports Gi2/0/3.
+    alias_matches: dict[int, Any] = {}
+    for alias in local_stack_aliases(discovered_name):
+        alias_interface, _ = match_interface(alias, *indexes)
+        if alias_interface is not None:
+            alias_matches[int(alias_interface.id)] = alias_interface
+    if len(alias_matches) == 1:
+        return next(iter(alias_matches.values())), owner, None
+    if len(alias_matches) > 1:
+        names = ", ".join(sorted(str(item.name) for item in alias_matches.values()))
+        return None, owner, (
+            f"{discovered_name}: multiple member-local interfaces match on "
+            f"{owner.name!r}: {names}"
+        )
+    return None, owner, f"{discovered_name}: {error} on device {owner.name!r}"
+
+
 def current_interface_state(interface: Any) -> dict[str, Any]:
     return {
         "mode": choice_value(getattr(interface, "mode", None)),
@@ -604,20 +795,21 @@ def sync_device(
 
     device = resolve_device(nb, collected)
     summary = SyncSummary(device=str(device.name), dry_run=dry_run)
-    interfaces = list(nb.dcim.interfaces.filter(device_id=device.id))
-    by_name, by_signature = interface_indexes(interfaces)
+    scope = build_interface_search_scope(nb, device, collected)
 
     for discovered in collected.interfaces:
-        interface, error = match_interface(discovered.name, by_name, by_signature)
+        interface, owner, error = match_scoped_interface(discovered.name, scope)
         if error:
             summary.skipped += 1
             summary.errors.append(error)
             continue
 
-        desired, error = desired_netbox_state(discovered, device, vlan_cache)
+        desired, error = desired_netbox_state(discovered, owner, vlan_cache)
         if error:
             summary.skipped += 1
-            summary.errors.append(f"{discovered.name}: {error}")
+            summary.errors.append(
+                f"{owner.name}/{discovered.name}: {error}"
+            )
             continue
 
         current = current_interface_state(interface)
@@ -625,18 +817,31 @@ def sync_device(
             summary.unchanged += 1
             continue
 
-        change = f"{interface.name}: {current} -> {desired}"
+        change = f"{owner.name}/{interface.name}: {current} -> {desired}"
         if dry_run:
             summary.updated += 1
             summary.changes.append(f"DRY-RUN {change}")
             continue
 
         try:
+            LOGGER.info("Updating NetBox interface %s", change)
             interface.update(desired)
+            refreshed = nb.dcim.interfaces.get(interface.id)
+            if refreshed is None:
+                raise RuntimeError(
+                    "interface disappeared while verifying the update"
+                )
+            persisted = current_interface_state(refreshed)
+            if persisted != desired:
+                raise RuntimeError(
+                    f"verification failed; NetBox returned {persisted}"
+                )
             summary.updated += 1
-            summary.changes.append(change)
+            summary.changes.append(f"VERIFIED {change}")
         except Exception as exc:
-            summary.errors.append(f"{interface.name}: update failed: {exc}")
+            summary.errors.append(
+                f"{owner.name}/{interface.name}: update failed: {exc}"
+            )
 
     return summary
 
@@ -684,8 +889,9 @@ def find_collected_result(multi_result: Any) -> CollectedDevice | None:
 
 def print_sync_summary(summary: SyncSummary) -> None:
     label = "DRY-RUN" if summary.dry_run else "NETBOX"
+    update_label = "would_update" if summary.dry_run else "updated"
     print(
-        f"\n[{label}] {summary.device}: updated={summary.updated} "
+        f"\n[{label}] {summary.device}: {update_label}={summary.updated} "
         f"unchanged={summary.unchanged} skipped={summary.skipped} "
         f"errors={len(summary.errors)}"
     )
