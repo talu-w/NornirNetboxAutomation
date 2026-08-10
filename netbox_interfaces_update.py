@@ -1,26 +1,26 @@
 #!/usr/bin/env python3
 
-"""
-Collect Cisco VLAN, access-port, trunk, and switch-stack interface data.
+"""Synchronize Cisco interface VLAN assignments to NetBox.
 
-Commands collected:
-    show vlan brief
-    show interfaces trunk
+Workflow:
+    1. Load the NetBox-backed Nornir inventory.
+    2. Select devices carrying the requested NetBox tag.
+    3. Collect access and trunk VLAN state from those devices.
+    4. Compare that state with each NetBox interface.
+    5. Update only interfaces whose VLAN state differs.
 
-Output:
-    reports/vlan_trunk_inventory/<hostname>.json
+The script does not create VLANs or interfaces. Missing or ambiguous NetBox
+objects are reported and skipped so that partial assignments are never made.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import os
 import re
 from collections import defaultdict
-from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -32,791 +32,43 @@ from nornir_netmiko.tasks import netmiko_send_command
 from nornir_utils.plugins.functions import print_result
 
 
-REPORT_ROOT = Path("reports/vlan_trunk_inventory")
-
-SHOW_VLAN_COMMAND = "show vlan brief"
-SHOW_TRUNK_COMMAND = "show interfaces trunk"
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
+DEFAULT_TAG = "nornirtest"
+SHOW_VLAN = "show vlan brief"
+SHOW_TRUNKS = "show interfaces trunk"
 
 LOGGER = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Data models
+# Collected and synchronization state
 # ---------------------------------------------------------------------------
 
-@dataclass
-class InterfaceIdentity:
-    original_name: str
-    interface_type: str
-    stack_member: int | None
-    slot: int | None
-    port: int | None
-    subinterface: int | None = None
-    logical_interface: bool = False
+
+@dataclass(frozen=True)
+class InterfaceVlanState:
+    """NetBox-compatible VLAN state collected for one interface."""
+
+    name: str
+    mode: str
+    untagged_vlan: int | None = None
+    tagged_vlans: tuple[int, ...] = ()
 
 
 @dataclass
-class AccessInterface:
-    interface: str
-    interface_type: str
-    stack_member: int | None
-    slot: int | None
-    port: int | None
-    vlan_id: int
-    vlan_name: str
-    vlan_status: str
-
-
-@dataclass
-class TrunkInterface:
-    interface: str
-    interface_type: str
-    stack_member: int | None
-    slot: int | None
-    port: int | None
-
-    mode: str = ""
-    encapsulation: str = ""
-    status: str = ""
+class TrunkState:
+    name: str
     native_vlan: int | None = None
-
     allowed_vlans: list[int] = field(default_factory=list)
     active_vlans: list[int] = field(default_factory=list)
-    forwarding_vlans: list[int] = field(default_factory=list)
+    allows_all: bool = False
 
 
-# ---------------------------------------------------------------------------
-# Interface-name parsing
-# ---------------------------------------------------------------------------
+@dataclass
+class CollectedDevice:
+    inventory_name: str
+    netbox_device_id: int | None
+    interfaces: list[InterfaceVlanState]
 
-INTERFACE_TYPE_MAP = {
-    "fa": "FastEthernet",
-    "fastethernet": "FastEthernet",
-    "gi": "GigabitEthernet",
-    "gig": "GigabitEthernet",
-    "gigabitethernet": "GigabitEthernet",
-    "te": "TenGigabitEthernet",
-    "ten": "TenGigabitEthernet",
-    "tengigabitethernet": "TenGigabitEthernet",
-    "tw": "TwoGigabitEthernet",
-    "two": "TwoGigabitEthernet",
-    "twogigabitethernet": "TwoGigabitEthernet",
-    "fo": "FortyGigabitEthernet",
-    "fortygigabitethernet": "FortyGigabitEthernet",
-    "hu": "HundredGigabitEthernet",
-    "hundredgigabitethernet": "HundredGigabitEthernet",
-    "eth": "Ethernet",
-    "ethernet": "Ethernet",
-    "po": "Port-channel",
-    "port-channel": "Port-channel",
-    "portchannel": "Port-channel",
-    "vl": "Vlan",
-    "vlan": "Vlan",
-    "lo": "Loopback",
-    "loopback": "Loopback",
-}
-
-
-def parse_interface_name(interface_name: str) -> InterfaceIdentity:
-    """
-    Parse Cisco interface names and extract stack-member information.
-
-    Examples:
-        Gi1/0/48  -> member=1, slot=0, port=48
-        Tw2/0/1   -> member=2, slot=0, port=1
-        Te3/1/1   -> member=3, slot=1, port=1
-        Gi0/24    -> standalone interface; slot=0, port=24
-        Po10      -> logical interface
-    """
-
-    cleaned_name = interface_name.strip().replace(" ", "")
-
-    # Physical stack interface:
-    # Gi1/0/48
-    # Tw2/0/1
-    # Te3/1/1
-    stack_match = re.match(
-        r"^(?P<type>[A-Za-z-]+)"
-        r"(?P<member>\d+)/"
-        r"(?P<slot>\d+)/"
-        r"(?P<port>\d+)"
-        r"(?:\.(?P<subinterface>\d+))?$",
-        cleaned_name,
-    )
-
-    if stack_match:
-        interface_prefix = stack_match.group("type").lower()
-        interface_type = INTERFACE_TYPE_MAP.get(
-            interface_prefix,
-            stack_match.group("type"),
-        )
-
-        return InterfaceIdentity(
-            original_name=cleaned_name,
-            interface_type=interface_type,
-            stack_member=int(stack_match.group("member")),
-            slot=int(stack_match.group("slot")),
-            port=int(stack_match.group("port")),
-            subinterface=(
-                int(stack_match.group("subinterface"))
-                if stack_match.group("subinterface")
-                else None
-            ),
-            logical_interface=False,
-        )
-
-    # Standalone/modular two-number interface:
-    # Gi0/24
-    # Te1/1
-    standalone_match = re.match(
-        r"^(?P<type>[A-Za-z-]+)"
-        r"(?P<slot>\d+)/"
-        r"(?P<port>\d+)"
-        r"(?:\.(?P<subinterface>\d+))?$",
-        cleaned_name,
-    )
-
-    if standalone_match:
-        interface_prefix = standalone_match.group("type").lower()
-        interface_type = INTERFACE_TYPE_MAP.get(
-            interface_prefix,
-            standalone_match.group("type"),
-        )
-
-        return InterfaceIdentity(
-            original_name=cleaned_name,
-            interface_type=interface_type,
-            stack_member=None,
-            slot=int(standalone_match.group("slot")),
-            port=int(standalone_match.group("port")),
-            subinterface=(
-                int(standalone_match.group("subinterface"))
-                if standalone_match.group("subinterface")
-                else None
-            ),
-            logical_interface=False,
-        )
-
-    # Logical interfaces:
-    # Po1
-    # Vlan10
-    # Lo0
-    logical_match = re.match(
-        r"^(?P<type>[A-Za-z-]+)(?P<number>\d+)"
-        r"(?:\.(?P<subinterface>\d+))?$",
-        cleaned_name,
-    )
-
-    if logical_match:
-        interface_prefix = logical_match.group("type").lower()
-        interface_type = INTERFACE_TYPE_MAP.get(
-            interface_prefix,
-            logical_match.group("type"),
-        )
-
-        return InterfaceIdentity(
-            original_name=cleaned_name,
-            interface_type=interface_type,
-            stack_member=None,
-            slot=None,
-            port=int(logical_match.group("number")),
-            subinterface=(
-                int(logical_match.group("subinterface"))
-                if logical_match.group("subinterface")
-                else None
-            ),
-            logical_interface=True,
-        )
-
-    return InterfaceIdentity(
-        original_name=cleaned_name,
-        interface_type="Unknown",
-        stack_member=None,
-        slot=None,
-        port=None,
-        logical_interface=True,
-    )
-
-
-# ---------------------------------------------------------------------------
-# VLAN-list helpers
-# ---------------------------------------------------------------------------
-
-def expand_vlan_list(vlan_text: str) -> list[int]:
-    """
-    Expand Cisco VLAN expressions.
-
-    Examples:
-        "1,10,20-22" -> [1, 10, 20, 21, 22]
-        "none"       -> []
-        "all"        -> [1 ... 4094]
-    """
-
-    normalized = vlan_text.strip().lower()
-
-    if not normalized or normalized in {"none", "n/a", "--"}:
-        return []
-
-    if normalized == "all":
-        return list(range(1, 4095))
-
-    vlan_ids: set[int] = set()
-
-    for item in normalized.replace(" ", "").split(","):
-        if not item:
-            continue
-
-        if "-" in item:
-            start_text, end_text = item.split("-", maxsplit=1)
-
-            if not start_text.isdigit() or not end_text.isdigit():
-                continue
-
-            start_vlan = int(start_text)
-            end_vlan = int(end_text)
-
-            if start_vlan > end_vlan:
-                start_vlan, end_vlan = end_vlan, start_vlan
-
-            vlan_ids.update(range(start_vlan, end_vlan + 1))
-
-        elif item.isdigit():
-            vlan_ids.add(int(item))
-
-    return sorted(vlan_ids)
-
-
-def compress_vlan_list(vlan_ids: Iterable[int]) -> str:
-    """
-    Compress VLAN IDs for readable console output.
-
-    Example:
-        [1, 10, 20, 21, 22] -> "1,10,20-22"
-    """
-
-    sorted_vlans = sorted(set(vlan_ids))
-
-    if not sorted_vlans:
-        return "none"
-
-    ranges: list[str] = []
-    range_start = sorted_vlans[0]
-    previous_vlan = sorted_vlans[0]
-
-    for vlan_id in sorted_vlans[1:]:
-        if vlan_id == previous_vlan + 1:
-            previous_vlan = vlan_id
-            continue
-
-        if range_start == previous_vlan:
-            ranges.append(str(range_start))
-        else:
-            ranges.append(f"{range_start}-{previous_vlan}")
-
-        range_start = vlan_id
-        previous_vlan = vlan_id
-
-    if range_start == previous_vlan:
-        ranges.append(str(range_start))
-    else:
-        ranges.append(f"{range_start}-{previous_vlan}")
-
-    return ",".join(ranges)
-
-
-# ---------------------------------------------------------------------------
-# show vlan brief parser
-# ---------------------------------------------------------------------------
-
-def split_interface_list(interface_text: str) -> list[str]:
-    """Split the interface-list section of show vlan brief."""
-
-    return [
-        interface.strip()
-        for interface in interface_text.split(",")
-        if interface.strip()
-    ]
-
-
-def parse_show_vlan_brief(output: str) -> tuple[list[dict[str, Any]], list[AccessInterface]]:
-    """
-    Parse Cisco IOS/IOS-XE 'show vlan brief'.
-
-    Handles wrapped interface lines by retaining the current VLAN.
-    """
-
-    vlans: list[dict[str, Any]] = []
-    access_interfaces: list[AccessInterface] = []
-
-    current_vlan: dict[str, Any] | None = None
-
-    vlan_line_pattern = re.compile(
-        r"^\s*(?P<vlan_id>\d+)\s+"
-        r"(?P<vlan_name>\S+)\s+"
-        r"(?P<status>active|act/unsup|suspended|shutdown)"
-        r"(?:\s+(?P<ports>.*))?$",
-        re.IGNORECASE,
-    )
-
-    continuation_pattern = re.compile(
-        r"^\s+(?P<ports>"
-        r"(?:Fa|Gi|Te|Tw|Fo|Hu|Eth|Po)"
-        r"\S+.*)$",
-        re.IGNORECASE,
-    )
-
-    for raw_line in output.splitlines():
-        line = raw_line.rstrip()
-
-        if not line:
-            continue
-
-        if line.lower().startswith("vlan"):
-            continue
-
-        if set(line.strip()) <= {"-", " "}:
-            continue
-
-        vlan_match = vlan_line_pattern.match(line)
-
-        if vlan_match:
-            current_vlan = {
-                "vlan_id": int(vlan_match.group("vlan_id")),
-                "vlan_name": vlan_match.group("vlan_name"),
-                "status": vlan_match.group("status"),
-                "interfaces": [],
-            }
-
-            ports = vlan_match.group("ports") or ""
-            current_vlan["interfaces"].extend(split_interface_list(ports))
-            vlans.append(current_vlan)
-            continue
-
-        continuation_match = continuation_pattern.match(line)
-
-        if continuation_match and current_vlan is not None:
-            current_vlan["interfaces"].extend(
-                split_interface_list(
-                    continuation_match.group("ports")
-                )
-            )
-
-    for vlan in vlans:
-        for interface_name in vlan["interfaces"]:
-            identity = parse_interface_name(interface_name)
-
-            access_interfaces.append(
-                AccessInterface(
-                    interface=identity.original_name,
-                    interface_type=identity.interface_type,
-                    stack_member=identity.stack_member,
-                    slot=identity.slot,
-                    port=identity.port,
-                    vlan_id=vlan["vlan_id"],
-                    vlan_name=vlan["vlan_name"],
-                    vlan_status=vlan["status"],
-                )
-            )
-
-    return vlans, access_interfaces
-
-
-# ---------------------------------------------------------------------------
-# show interfaces trunk parser
-# ---------------------------------------------------------------------------
-
-TRUNK_SECTION_HEADERS = {
-    "allowed": "vlans allowed on trunk",
-    "active": "vlans allowed and active in management domain",
-    "forwarding": "vlans in spanning tree forwarding state and not pruned",
-}
-
-
-def parse_show_interfaces_trunk(output: str) -> list[TrunkInterface]:
-    """Parse Cisco IOS/IOS-XE 'show interfaces trunk' output."""
-
-    trunk_map: dict[str, TrunkInterface] = {}
-    current_section: str | None = None
-
-    operational_trunk_pattern = re.compile(
-        r"^\s*(?P<interface>\S+)\s+"
-        r"(?P<mode>\S+)\s+"
-        r"(?P<encapsulation>\S+)\s+"
-        r"(?P<status>\S+)\s+"
-        r"(?P<native_vlan>\d+|-)\s*$"
-    )
-
-    vlan_membership_pattern = re.compile(
-        r"^\s*(?P<interface>\S+)\s+"
-        r"(?P<vlans>(?:none|all|[\d,\-\s]+))\s*$",
-        re.IGNORECASE,
-    )
-
-    for raw_line in output.splitlines():
-        line = raw_line.rstrip()
-        lowered_line = line.strip().lower()
-
-        if not lowered_line:
-            continue
-
-        if lowered_line.startswith("port") and "native vlan" in lowered_line:
-            current_section = "operational"
-            continue
-
-        matched_section = False
-
-        for section_name, section_header in TRUNK_SECTION_HEADERS.items():
-            if section_header in lowered_line:
-                current_section = section_name
-                matched_section = True
-                break
-
-        if matched_section:
-            continue
-
-        if set(line.strip()) <= {"-", " "}:
-            continue
-
-        if current_section == "operational":
-            match = operational_trunk_pattern.match(line)
-
-            if not match:
-                continue
-
-            interface_name = match.group("interface")
-            identity = parse_interface_name(interface_name)
-
-            native_vlan_text = match.group("native_vlan")
-
-            trunk_map[interface_name] = TrunkInterface(
-                interface=identity.original_name,
-                interface_type=identity.interface_type,
-                stack_member=identity.stack_member,
-                slot=identity.slot,
-                port=identity.port,
-                mode=match.group("mode"),
-                encapsulation=match.group("encapsulation"),
-                status=match.group("status"),
-                native_vlan=(
-                    int(native_vlan_text)
-                    if native_vlan_text.isdigit()
-                    else None
-                ),
-            )
-
-            continue
-
-        if current_section in {"allowed", "active", "forwarding"}:
-            match = vlan_membership_pattern.match(line)
-
-            if not match:
-                continue
-
-            interface_name = match.group("interface")
-            vlan_ids = expand_vlan_list(match.group("vlans"))
-
-            if interface_name not in trunk_map:
-                identity = parse_interface_name(interface_name)
-
-                trunk_map[interface_name] = TrunkInterface(
-                    interface=identity.original_name,
-                    interface_type=identity.interface_type,
-                    stack_member=identity.stack_member,
-                    slot=identity.slot,
-                    port=identity.port,
-                )
-
-            trunk = trunk_map[interface_name]
-
-            if current_section == "allowed":
-                trunk.allowed_vlans = vlan_ids
-            elif current_section == "active":
-                trunk.active_vlans = vlan_ids
-            elif current_section == "forwarding":
-                trunk.forwarding_vlans = vlan_ids
-
-    return list(trunk_map.values())
-
-
-# ---------------------------------------------------------------------------
-# Stack-member organization
-# ---------------------------------------------------------------------------
-
-def interface_sort_key(interface_name: str) -> tuple[int, int, int, str]:
-    identity = parse_interface_name(interface_name)
-
-    member = identity.stack_member if identity.stack_member is not None else 9999
-    slot = identity.slot if identity.slot is not None else 9999
-    port = identity.port if identity.port is not None else 9999
-
-    return member, slot, port, interface_name
-
-
-def organize_by_stack_member(
-    access_interfaces: list[AccessInterface],
-    trunk_interfaces: list[TrunkInterface],
-) -> dict[str, dict[str, list[dict[str, Any]]]]:
-    """
-    Group access and trunk interfaces by stack member.
-
-    Physical three-number names are grouped as:
-        stack_member_1
-        stack_member_2
-        stack_member_3
-
-    Two-number standalone interfaces are grouped under:
-        standalone
-
-    Port-channels and other logical interfaces are grouped under:
-        logical
-    """
-
-    grouped: dict[str, dict[str, list[dict[str, Any]]]] = defaultdict(
-        lambda: {
-            "access_interfaces": [],
-            "trunk_interfaces": [],
-        }
-    )
-
-    def group_name(
-        stack_member: int | None,
-        interface_type: str,
-    ) -> str:
-        if stack_member is not None:
-            return f"stack_member_{stack_member}"
-
-        if interface_type in {"Port-channel", "Vlan", "Loopback", "Unknown"}:
-            return "logical"
-
-        return "standalone"
-
-    for interface in access_interfaces:
-        key = group_name(
-            interface.stack_member,
-            interface.interface_type,
-        )
-
-        grouped[key]["access_interfaces"].append(asdict(interface))
-
-    for interface in trunk_interfaces:
-        key = group_name(
-            interface.stack_member,
-            interface.interface_type,
-        )
-
-        grouped[key]["trunk_interfaces"].append(asdict(interface))
-
-    for member_data in grouped.values():
-        member_data["access_interfaces"].sort(
-            key=lambda item: interface_sort_key(item["interface"])
-        )
-        member_data["trunk_interfaces"].sort(
-            key=lambda item: interface_sort_key(item["interface"])
-        )
-
-    return dict(
-        sorted(
-            grouped.items(),
-            key=lambda item: stack_group_sort_key(item[0]),
-        )
-    )
-
-
-def stack_group_sort_key(group_name: str) -> tuple[int, int]:
-    if group_name.startswith("stack_member_"):
-        member_number = int(group_name.rsplit("_", maxsplit=1)[1])
-        return 0, member_number
-
-    if group_name == "standalone":
-        return 1, 0
-
-    return 2, 0
-
-
-# ---------------------------------------------------------------------------
-# Nornir task
-# ---------------------------------------------------------------------------
-
-def collect_vlan_and_trunk_data(task: Task) -> Result:
-    """Collect and parse VLAN/trunk data from one device."""
-
-    vlan_result = task.run(
-        task=netmiko_send_command,
-        name="Collecting VLAN information",
-        command_string=SHOW_VLAN_COMMAND,
-        read_timeout=60,
-    )
-
-    trunk_result = task.run(
-        task=netmiko_send_command,
-        name="Collecting trunk information",
-        command_string=SHOW_TRUNK_COMMAND,
-        read_timeout=60,
-    )
-
-    vlan_output = str(vlan_result.result)
-    trunk_output = str(trunk_result.result)
-
-    vlans, access_interfaces = parse_show_vlan_brief(vlan_output)
-    trunk_interfaces = parse_show_interfaces_trunk(trunk_output)
-
-    stack_members = organize_by_stack_member(
-        access_interfaces=access_interfaces,
-        trunk_interfaces=trunk_interfaces,
-    )
-
-    detected_members = sorted(
-        {
-            interface.stack_member
-            for interface in access_interfaces + trunk_interfaces
-            if interface.stack_member is not None
-        }
-    )
-
-    report = {
-        "hostname": task.host.name,
-        "management_address": task.host.hostname,
-        "platform": task.host.platform,
-        # Prefer an inventory-provided NetBox primary key when available. This
-        # is the safest mapping when a Nornir inventory name is not identical
-        # to the NetBox device name.
-        "netbox_device_id": (
-            task.host.get("netbox_device_id")
-            or task.host.get("device_id")
-        ),
-        "netbox_device_name": task.host.get("netbox_device_name"),
-        "collected_at": datetime.now().astimezone().isoformat(),
-        "commands": {
-            "vlan": SHOW_VLAN_COMMAND,
-            "trunk": SHOW_TRUNK_COMMAND,
-        },
-        "summary": {
-            "vlan_count": len(vlans),
-            "access_interface_count": len(access_interfaces),
-            "trunk_interface_count": len(trunk_interfaces),
-            "detected_stack_members": detected_members,
-            "detected_stack_member_count": len(detected_members),
-        },
-        "vlans": vlans,
-        "access_interfaces": [
-            asdict(interface)
-            for interface in sorted(
-                access_interfaces,
-                key=lambda item: interface_sort_key(item.interface),
-            )
-        ],
-        "trunk_interfaces": [
-            asdict(interface)
-            for interface in sorted(
-                trunk_interfaces,
-                key=lambda item: interface_sort_key(item.interface),
-            )
-        ],
-        "stack_members": stack_members,
-    }
-
-    report_file = save_report(
-        hostname=task.host.name,
-        report=report,
-    )
-
-    report["report_file"] = str(report_file)
-
-    return Result(
-        host=task.host,
-        result=report,
-        changed=False,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Report output
-# ---------------------------------------------------------------------------
-
-def save_report(hostname: str, report: dict[str, Any]) -> Path:
-    REPORT_ROOT.mkdir(parents=True, exist_ok=True)
-
-    safe_hostname = re.sub(
-        r"[^A-Za-z0-9_.-]",
-        "_",
-        hostname,
-    )
-
-    report_file = REPORT_ROOT / f"{safe_hostname}.json"
-
-    report_file.write_text(
-        json.dumps(report, indent=4),
-        encoding="utf-8",
-    )
-
-    return report_file
-
-
-def print_device_summary(hostname: str, report: dict[str, Any]) -> None:
-    summary = report["summary"]
-
-    print()
-    print("=" * 90)
-    print(f"DEVICE: {hostname}")
-    print("=" * 90)
-
-    detected_members = summary["detected_stack_members"]
-
-    if detected_members:
-        print(
-            "Detected stack members: "
-            + ", ".join(str(member) for member in detected_members)
-        )
-    else:
-        print("Detected stack members: none; device appears standalone")
-
-    print(f"Configured VLANs: {summary['vlan_count']}")
-    print(f"Access interfaces: {summary['access_interface_count']}")
-    print(f"Operational trunks: {summary['trunk_interface_count']}")
-    print(f"JSON report: {report['report_file']}")
-
-    for member_name, member_data in report["stack_members"].items():
-        print()
-        print(f"[{member_name}]")
-
-        access_interfaces = member_data["access_interfaces"]
-        trunk_interfaces = member_data["trunk_interfaces"]
-
-        if access_interfaces:
-            print("  Access interfaces:")
-
-            for interface in access_interfaces:
-                print(
-                    f"    {interface['interface']:<12} "
-                    f"VLAN {interface['vlan_id']:<4} "
-                    f"{interface['vlan_name']}"
-                )
-
-        if trunk_interfaces:
-            print("  Trunk interfaces:")
-
-            for interface in trunk_interfaces:
-                print(
-                    f"    {interface['interface']:<12} "
-                    f"native={interface['native_vlan']} "
-                    f"allowed={compress_vlan_list(interface['allowed_vlans'])} "
-                    f"active={compress_vlan_list(interface['active_vlans'])} "
-                    f"forwarding="
-                    f"{compress_vlan_list(interface['forwarding_vlans'])}"
-                )
-
-        if not access_interfaces and not trunk_interfaces:
-            print("  No interfaces discovered")
-
-
-# ---------------------------------------------------------------------------
-# NetBox synchronization
-# ---------------------------------------------------------------------------
 
 @dataclass
 class SyncSummary:
@@ -825,22 +77,385 @@ class SyncSummary:
     updated: int = 0
     unchanged: int = 0
     skipped: int = 0
-    errors: list[str] = field(default_factory=list)
     changes: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Cisco output parsing
+# ---------------------------------------------------------------------------
+
+
+def expand_vlan_list(value: str) -> list[int]:
+    """Expand a Cisco VLAN expression such as ``1,10,20-22``."""
+
+    value = value.strip().lower().replace(" ", "")
+    if not value or value in {"none", "n/a", "--"}:
+        return []
+    if value == "all":
+        return list(range(1, 4095))
+
+    vlan_ids: set[int] = set()
+    for item in value.split(","):
+        if not item:
+            continue
+        if "-" not in item:
+            if item.isdigit():
+                vlan_ids.add(int(item))
+            continue
+
+        start_text, end_text = item.split("-", maxsplit=1)
+        if not start_text.isdigit() or not end_text.isdigit():
+            continue
+        start, end = int(start_text), int(end_text)
+        if start > end:
+            start, end = end, start
+        vlan_ids.update(range(start, end + 1))
+
+    return sorted(vlan_ids)
+
+
+def parse_vlan_brief(output: str) -> dict[str, int]:
+    """Return access-interface to VLAN-ID mappings from ``show vlan brief``."""
+
+    access_ports: dict[str, int] = {}
+    current_vlan: int | None = None
+
+    vlan_line = re.compile(
+        r"^\s*(?P<vid>\d+)\s+\S+\s+"
+        r"(?:active|act/unsup|suspended|shutdown)"
+        r"(?:\s+(?P<ports>.*))?$",
+        re.IGNORECASE,
+    )
+    continuation = re.compile(
+        r"^\s+(?P<ports>(?:Fa|Gi|Te|Tw|Fo|Hu|Eth|Po)\S+.*)$",
+        re.IGNORECASE,
+    )
+
+    def add_ports(port_text: str, vlan_id: int) -> None:
+        for port_name in port_text.split(","):
+            port_name = port_name.strip()
+            if port_name:
+                access_ports[port_name] = vlan_id
+
+    for raw_line in output.splitlines():
+        match = vlan_line.match(raw_line.rstrip())
+        if match:
+            current_vlan = int(match.group("vid"))
+            add_ports(match.group("ports") or "", current_vlan)
+            continue
+
+        match = continuation.match(raw_line.rstrip())
+        if match and current_vlan is not None:
+            add_ports(match.group("ports"), current_vlan)
+
+    return access_ports
+
+
+def parse_trunks(output: str) -> dict[str, TrunkState]:
+    """Return operational trunk state from ``show interfaces trunk``."""
+
+    trunks: dict[str, TrunkState] = {}
+    section: str | None = None
+
+    operational_line = re.compile(
+        r"^\s*(?P<port>\S+)\s+\S+\s+\S+\s+\S+\s+"
+        r"(?P<native>\d+|-)\s*$"
+    )
+    vlan_line = re.compile(
+        r"^\s*(?P<port>\S+)\s+"
+        r"(?P<vlans>(?:none|all|[\d,\-\s]+))\s*$",
+        re.IGNORECASE,
+    )
+
+    for raw_line in output.splitlines():
+        line = raw_line.rstrip()
+        lowered = line.strip().lower()
+        if not lowered:
+            continue
+
+        if lowered.startswith("port") and "native vlan" in lowered:
+            section = "operational"
+            continue
+        if "vlans allowed on trunk" in lowered:
+            section = "allowed"
+            continue
+        if "vlans allowed and active in management domain" in lowered:
+            section = "active"
+            continue
+        if "vlans in spanning tree forwarding state and not pruned" in lowered:
+            section = "forwarding"
+            continue
+        if lowered.startswith("port") or set(line.strip()) <= {"-", " "}:
+            continue
+
+        if section == "operational":
+            match = operational_line.match(line)
+            if not match:
+                continue
+            port = match.group("port")
+            native = match.group("native")
+            trunks[port] = TrunkState(
+                name=port,
+                native_vlan=int(native) if native.isdigit() else None,
+            )
+            continue
+
+        if section not in {"allowed", "active", "forwarding"}:
+            continue
+        match = vlan_line.match(line)
+        if not match:
+            continue
+
+        port = match.group("port")
+        expression = match.group("vlans").strip().lower().replace(" ", "")
+        trunk = trunks.setdefault(port, TrunkState(name=port))
+        if section == "allowed":
+            trunk.allowed_vlans = expand_vlan_list(expression)
+            trunk.allows_all = expression in {"all", "1-4094"}
+        elif section == "active":
+            trunk.active_vlans = expand_vlan_list(expression)
+
+    return trunks
+
+
+def build_collected_state(vlan_output: str, trunk_output: str) -> list[InterfaceVlanState]:
+    """Combine command output into one desired state per discovered interface."""
+
+    desired: dict[str, InterfaceVlanState] = {}
+    for interface, vlan_id in parse_vlan_brief(vlan_output).items():
+        desired[interface.casefold()] = InterfaceVlanState(
+            name=interface,
+            mode="access",
+            untagged_vlan=vlan_id,
+        )
+
+    for interface, trunk in parse_trunks(trunk_output).items():
+        # An unrestricted Cisco trunk is reported as all/1-4094. Only VLANs
+        # active on this device are meaningful interface assignments in NetBox.
+        tagged = trunk.active_vlans if trunk.allows_all else trunk.allowed_vlans
+        tagged = sorted(set(tagged) - {trunk.native_vlan})
+        desired[interface.casefold()] = InterfaceVlanState(
+            name=interface,
+            mode="tagged",
+            untagged_vlan=trunk.native_vlan,
+            tagged_vlans=tuple(tagged),
+        )
+
+    return sorted(desired.values(), key=lambda item: interface_sort_key(item.name))
+
+
+def collect_device_state(task: Task) -> Result:
+    """Nornir task: collect and parse VLAN state from one device."""
+
+    vlan_result = task.run(
+        task=netmiko_send_command,
+        name=SHOW_VLAN,
+        command_string=SHOW_VLAN,
+        read_timeout=60,
+    )
+    trunk_result = task.run(
+        task=netmiko_send_command,
+        name=SHOW_TRUNKS,
+        command_string=SHOW_TRUNKS,
+        read_timeout=60,
+    )
+
+    collected = CollectedDevice(
+        inventory_name=task.host.name,
+        netbox_device_id=inventory_device_id(task.host),
+        interfaces=build_collected_state(
+            str(vlan_result.result),
+            str(trunk_result.result),
+        ),
+    )
+    return Result(host=task.host, result=collected, changed=False)
+
+
+# ---------------------------------------------------------------------------
+# Nornir inventory and NetBox connection
+# ---------------------------------------------------------------------------
+
+
+def load_inventory_options(config_file: str, token: str) -> dict[str, Any]:
+    """Load all inventory options and replace only the NetBox API token."""
+
+    config_path = Path(config_file).expanduser()
+    try:
+        options = dict(Config.from_file(str(config_path)).inventory.options)
+    except Exception as exc:
+        raise RuntimeError(f"Unable to load Nornir config {config_path}: {exc}") from exc
+
+    netbox_url = str(options.get("nb_url") or "").strip().rstrip("/")
+    if not netbox_url.startswith(("http://", "https://")):
+        raise ValueError(
+            f"inventory.options.nb_url in {config_path} must start with "
+            "http:// or https://"
+        )
+
+    options["nb_url"] = netbox_url
+    options["nb_token"] = token
+    return options
+
+
+def ssl_verify_setting(value: Any) -> bool | str:
+    """Normalize YAML/string SSL verification settings for Requests."""
+
+    if not isinstance(value, str):
+        return bool(value)
+    normalized = value.strip().casefold()
+    if normalized in {"false", "no", "0", "off"}:
+        return False
+    if normalized in {"true", "yes", "1", "on"}:
+        return True
+    return value  # A Requests-compatible CA bundle path.
+
+
+def create_netbox_client(
+    netbox_url: str,
+    token: str,
+    inventory_options: dict[str, Any],
+) -> Any:
+    """Create the pynetbox client using the inventory's SSL policy."""
+
+    nb = pynetbox.api(netbox_url, token=token)
+    verify = ssl_verify_setting(inventory_options.get("ssl_verify", True))
+    nb.http_session.verify = verify
+    if verify is False:
+        LOGGER.warning("SSL certificate verification is disabled for NetBox")
+    return nb
+
+
+def inventory_device_id(host: Any) -> int | None:
+    """Get the NetBox device ID exposed by common inventory plugin versions."""
+
+    value = host.get("netbox_device_id") or host.get("device_id") or host.get("id")
+    try:
+        return int(value) if value not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
+def match_inventory_host(host: Any, devices: Iterable[Any]) -> Any | None:
+    """Match a Nornir host to exactly one tagged NetBox device."""
+
+    device_list = list(devices)
+    host_id = inventory_device_id(host)
+    if host_id is not None:
+        matches = [device for device in device_list if int(device.id) == host_id]
+        return matches[0] if len(matches) == 1 else None
+
+    host_name = str(host.get("netbox_device_name") or host.name).casefold()
+    matches = [
+        device for device in device_list if str(device.name).casefold() == host_name
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def select_tagged_inventory(nr: Any, tagged_devices: list[Any]) -> Any:
+    """Limit Nornir to tagged devices and attach their authoritative IDs."""
+
+    selected = nr.filter(
+        filter_func=lambda host: match_inventory_host(host, tagged_devices) is not None
+    )
+    for host in selected.inventory.hosts.values():
+        device = match_inventory_host(host, tagged_devices)
+        if device is not None:
+            host.data["netbox_device_id"] = int(device.id)
+            host.data["netbox_device_name"] = str(device.name)
+    return selected
+
+
+# ---------------------------------------------------------------------------
+# NetBox object matching and comparison
+# ---------------------------------------------------------------------------
+
+
+INTERFACE_PREFIXES = {
+    "fa": "fa",
+    "fastethernet": "fa",
+    "gi": "gi",
+    "gig": "gi",
+    "gigabitethernet": "gi",
+    "te": "te",
+    "ten": "te",
+    "tengige": "te",
+    "tengigabitethernet": "te",
+    "tw": "tw",
+    "twogigabitethernet": "tw",
+    "fo": "fo",
+    "fortygige": "fo",
+    "fortygigabitethernet": "fo",
+    "hu": "hu",
+    "hundredgige": "hu",
+    "hundredgigabitethernet": "hu",
+    "eth": "eth",
+    "ethernet": "eth",
+    "po": "po",
+    "port-channel": "po",
+    "portchannel": "po",
+}
+
+
+def interface_signature(name: str) -> tuple[str, str]:
+    """Normalize short and long Cisco interface names for safe matching."""
+
+    cleaned = name.strip().replace(" ", "")
+    match = re.match(r"^(?P<prefix>[A-Za-z-]+)(?P<number>.+)$", cleaned)
+    if not match:
+        return "", cleaned.casefold()
+    prefix = match.group("prefix").casefold()
+    return INTERFACE_PREFIXES.get(prefix, prefix), match.group("number").casefold()
+
+
+def interface_sort_key(name: str) -> tuple[str, tuple[int, ...], str]:
+    prefix, number = interface_signature(name)
+    numeric_parts = tuple(int(part) for part in re.findall(r"\d+", number))
+    return prefix, numeric_parts, number
+
+
+def interface_indexes(
+    interfaces: Iterable[Any],
+) -> tuple[dict[str, list[Any]], dict[tuple[str, str], list[Any]]]:
+    by_name: dict[str, list[Any]] = defaultdict(list)
+    by_signature: dict[tuple[str, str], list[Any]] = defaultdict(list)
+    for interface in interfaces:
+        name = str(interface.name).strip()
+        by_name[name.casefold()].append(interface)
+        by_signature[interface_signature(name)].append(interface)
+    return dict(by_name), dict(by_signature)
+
+
+def match_interface(
+    name: str,
+    by_name: dict[str, list[Any]],
+    by_signature: dict[tuple[str, str], list[Any]],
+) -> tuple[Any | None, str | None]:
+    exact = by_name.get(name.strip().casefold(), [])
+    if len(exact) == 1:
+        return exact[0], None
+    if len(exact) > 1:
+        return None, f"ambiguous exact interface name {name!r}"
+
+    canonical = by_signature.get(interface_signature(name), [])
+    if len(canonical) == 1:
+        return canonical[0], None
+    if len(canonical) > 1:
+        names = ", ".join(sorted(str(item.name) for item in canonical))
+        return None, f"ambiguous interface match for {name!r}: {names}"
+    return None, f"interface {name!r} does not exist on this NetBox device"
 
 
 def related_id(value: Any) -> int | None:
-    """Return an object's numeric ID from pynetbox's possible representations."""
-
     if value is None:
         return None
     if isinstance(value, int):
         return value
     if isinstance(value, dict):
-        object_id = value.get("id")
+        value = value.get("id")
     else:
-        object_id = getattr(value, "id", None)
-    return int(object_id) if object_id is not None else None
+        value = getattr(value, "id", None)
+    return int(value) if value is not None else None
 
 
 def related_ids(values: Any) -> list[int]:
@@ -852,95 +467,22 @@ def related_ids(values: Any) -> list[int]:
 
 
 def choice_value(value: Any) -> str | None:
-    """Normalize pynetbox Choice/dict/string values (such as interface.mode)."""
-
-    if value is None:
-        return None
-    if isinstance(value, str):
+    if value is None or isinstance(value, str):
         return value
     if isinstance(value, dict):
         return value.get("value")
     return getattr(value, "value", str(value))
 
 
-def interface_signature(interface_name: str) -> tuple[str, int | None, int | None, int | None, int | None]:
-    """Canonical signature used to match short and long Cisco interface names."""
-
-    identity = parse_interface_name(interface_name)
-    return (
-        identity.interface_type.casefold(),
-        identity.stack_member,
-        identity.slot,
-        identity.port,
-        identity.subinterface,
-    )
-
-
-def build_interface_indexes(
-    interfaces: Iterable[Any],
-) -> tuple[dict[str, list[Any]], dict[tuple[Any, ...], list[Any]]]:
-    by_name: dict[str, list[Any]] = defaultdict(list)
-    by_signature: dict[tuple[Any, ...], list[Any]] = defaultdict(list)
-
-    for interface in interfaces:
-        name = str(interface.name).strip()
-        by_name[name.casefold()].append(interface)
-        by_signature[interface_signature(name)].append(interface)
-
-    return dict(by_name), dict(by_signature)
-
-
-def match_interface(
-    discovered_name: str,
-    by_name: dict[str, list[Any]],
-    by_signature: dict[tuple[Any, ...], list[Any]],
-) -> tuple[Any | None, str | None]:
-    """Match only within the already-resolved device; never cross devices."""
-
-    exact = by_name.get(discovered_name.strip().casefold(), [])
-    if len(exact) == 1:
-        return exact[0], None
-    if len(exact) > 1:
-        return None, f"ambiguous exact interface name {discovered_name!r}"
-
-    signature_matches = by_signature.get(interface_signature(discovered_name), [])
-    if len(signature_matches) == 1:
-        return signature_matches[0], None
-    if len(signature_matches) > 1:
-        names = ", ".join(sorted(str(item.name) for item in signature_matches))
-        return None, f"ambiguous canonical match for {discovered_name!r}: {names}"
-    return None, f"interface {discovered_name!r} not found on this device"
-
-
-def resolve_device(nb: Any, report: dict[str, Any]) -> Any:
-    """Resolve a device by inventory PK, then by an explicit/exact name."""
-
-    device_id = report.get("netbox_device_id")
-    if device_id not in (None, ""):
-        device = nb.dcim.devices.get(int(device_id))
-        if device is None:
-            raise LookupError(f"NetBox device ID {device_id} was not found")
-        return device
-
-    name = report.get("netbox_device_name") or report["hostname"]
-    matches = list(nb.dcim.devices.filter(name=name))
-    exact = [item for item in matches if str(item.name).casefold() == str(name).casefold()]
-    if len(exact) != 1:
-        raise LookupError(
-            f"expected one exact NetBox device named {name!r}; found {len(exact)}. "
-            "Set netbox_device_id in Nornir host data to disambiguate."
-        )
-    return exact[0]
-
-
 def vlan_scope_id(vlan: Any) -> int | None:
-    """Support both legacy site-scoped and current generic-scope VLAN records."""
+    """Support both site-scoped and generic-scope NetBox VLAN records."""
 
-    direct_scope = related_id(getattr(vlan, "scope", None)) or related_id(
-        getattr(vlan, "site", None)
-    )
-    if direct_scope is not None:
-        return direct_scope
+    scope_id = related_id(getattr(vlan, "scope", None))
+    if scope_id is not None:
+        return scope_id
+    site_id = related_id(getattr(vlan, "site", None))
+    if site_id is not None:
+        return site_id
 
     group = getattr(vlan, "group", None)
     if group is None:
@@ -958,11 +500,11 @@ def build_vlan_cache(nb: Any) -> dict[int, list[Any]]:
 
 
 def resolve_vlan(
-    vlan_cache: dict[int, list[Any]],
+    cache: dict[int, list[Any]],
     vlan_id: int,
     device: Any,
 ) -> tuple[Any | None, str | None]:
-    candidates = vlan_cache.get(vlan_id, [])
+    candidates = cache.get(vlan_id, [])
     if not candidates:
         return None, f"VLAN {vlan_id} does not exist in NetBox"
     if len(candidates) == 1:
@@ -970,15 +512,41 @@ def resolve_vlan(
 
     site_id = related_id(getattr(device, "site", None))
     if site_id is not None:
-        scoped = [item for item in candidates if vlan_scope_id(item) == site_id]
-        if len(scoped) == 1:
-            return scoped[0], None
+        site_candidates = [
+            vlan for vlan in candidates if vlan_scope_id(vlan) == site_id
+        ]
+        if len(site_candidates) == 1:
+            return site_candidates[0], None
 
-    candidate_ids = ", ".join(str(item.id) for item in candidates)
-    return None, (
-        f"VLAN {vlan_id} is ambiguous for device {device.name!r}; "
-        f"candidate NetBox IDs: {candidate_ids}"
-    )
+    global_candidates = [vlan for vlan in candidates if vlan_scope_id(vlan) is None]
+    if len(global_candidates) == 1:
+        return global_candidates[0], None
+
+    ids = ", ".join(str(vlan.id) for vlan in candidates)
+    return None, f"VLAN {vlan_id} is ambiguous; candidate NetBox IDs: {ids}"
+
+
+def resolve_device(nb: Any, collected: CollectedDevice) -> Any:
+    if collected.netbox_device_id is not None:
+        device = nb.dcim.devices.get(collected.netbox_device_id)
+        if device is not None:
+            return device
+        raise LookupError(
+            f"NetBox device ID {collected.netbox_device_id} was not found"
+        )
+
+    candidates = list(nb.dcim.devices.filter(name=collected.inventory_name))
+    exact = [
+        device
+        for device in candidates
+        if str(device.name).casefold() == collected.inventory_name.casefold()
+    ]
+    if len(exact) != 1:
+        raise LookupError(
+            f"expected one NetBox device named {collected.inventory_name!r}; "
+            f"found {len(exact)}"
+        )
+    return exact[0]
 
 
 def current_interface_state(interface: Any) -> dict[str, Any]:
@@ -989,119 +557,135 @@ def current_interface_state(interface: Any) -> dict[str, Any]:
     }
 
 
-def sync_report_to_netbox(
+def desired_netbox_state(
+    discovered: InterfaceVlanState,
+    device: Any,
+    vlan_cache: dict[int, list[Any]],
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Translate collected VLAN IDs to unambiguous NetBox object IDs."""
+
+    required_vids = set(discovered.tagged_vlans)
+    if discovered.untagged_vlan is not None:
+        required_vids.add(discovered.untagged_vlan)
+
+    resolved: dict[int, Any] = {}
+    errors: list[str] = []
+    for vlan_id in sorted(required_vids):
+        vlan, error = resolve_vlan(vlan_cache, vlan_id, device)
+        if error:
+            errors.append(error)
+        elif vlan is not None:
+            resolved[vlan_id] = vlan
+
+    if errors:
+        return None, "; ".join(errors)
+
+    untagged = (
+        resolved[discovered.untagged_vlan]
+        if discovered.untagged_vlan is not None
+        else None
+    )
+    return {
+        "mode": discovered.mode,
+        "untagged_vlan": related_id(untagged),
+        "tagged_vlans": sorted(
+            int(resolved[vlan_id].id) for vlan_id in discovered.tagged_vlans
+        ),
+    }, None
+
+
+def sync_device(
     nb: Any,
-    report: dict[str, Any],
+    collected: CollectedDevice,
     vlan_cache: dict[int, list[Any]],
     dry_run: bool,
 ) -> SyncSummary:
-    """Synchronize one collected device report to its NetBox interfaces."""
+    """Compare one device and apply only the necessary interface updates."""
 
-    device = resolve_device(nb, report)
+    device = resolve_device(nb, collected)
     summary = SyncSummary(device=str(device.name), dry_run=dry_run)
     interfaces = list(nb.dcim.interfaces.filter(device_id=device.id))
-    by_name, by_signature = build_interface_indexes(interfaces)
+    by_name, by_signature = interface_indexes(interfaces)
 
-    desired_interfaces: list[tuple[str, str, int | None, list[int]]] = []
-    for access in report["access_interfaces"]:
-        desired_interfaces.append(
-            (access["interface"], "access", int(access["vlan_id"]), [])
-        )
-    for trunk in report["trunk_interfaces"]:
-        native_vlan = (
-            int(trunk["native_vlan"])
-            if trunk.get("native_vlan") is not None
-            else None
-        )
-        allowed_vlans = [int(vlan_id) for vlan_id in trunk.get("allowed_vlans", [])]
-        # IOS renders an unrestricted trunk as "all" (1-4094). Assigning all
-        # 4094 IDs would make the update fail for every VLAN not represented in
-        # NetBox, so use the device's active VLAN set in that case.
-        if len(allowed_vlans) == 4094:
-            allowed_vlans = [
-                int(vlan_id) for vlan_id in trunk.get("active_vlans", [])
-            ]
-
-        desired_interfaces.append(
-            (
-                trunk["interface"],
-                "tagged",
-                native_vlan,
-                [
-                    int(vlan_id)
-                    for vlan_id in allowed_vlans
-                    # NetBox represents the native VLAN only as untagged; do
-                    # not also assign it to tagged_vlans.
-                    if int(vlan_id) != native_vlan
-                ],
-            )
-        )
-
-    for discovered_name, mode, untagged_vid, tagged_vids in desired_interfaces:
-        interface, match_error = match_interface(discovered_name, by_name, by_signature)
-        if match_error:
+    for discovered in collected.interfaces:
+        interface, error = match_interface(discovered.name, by_name, by_signature)
+        if error:
             summary.skipped += 1
-            summary.errors.append(match_error)
+            summary.errors.append(error)
             continue
 
-        untagged_vlan = None
-        if untagged_vid is not None:
-            untagged_vlan, vlan_error = resolve_vlan(vlan_cache, untagged_vid, device)
-            if vlan_error:
-                summary.skipped += 1
-                summary.errors.append(f"{discovered_name}: {vlan_error}")
-                continue
-
-        tagged_vlan_objects: list[Any] = []
-        tagged_errors: list[str] = []
-        for vlan_id in sorted(set(tagged_vids)):
-            vlan, vlan_error = resolve_vlan(vlan_cache, vlan_id, device)
-            if vlan_error:
-                tagged_errors.append(vlan_error)
-            elif vlan is not None:
-                tagged_vlan_objects.append(vlan)
-
-        if tagged_errors:
+        desired, error = desired_netbox_state(discovered, device, vlan_cache)
+        if error:
             summary.skipped += 1
-            summary.errors.append(
-                f"{discovered_name}: refusing partial trunk update: "
-                + "; ".join(tagged_errors)
-            )
+            summary.errors.append(f"{discovered.name}: {error}")
             continue
 
-        desired = {
-            "mode": mode,
-            "untagged_vlan": related_id(untagged_vlan),
-            "tagged_vlans": sorted(int(vlan.id) for vlan in tagged_vlan_objects),
-        }
         current = current_interface_state(interface)
         if current == desired:
             summary.unchanged += 1
             continue
 
-        description = (
-            f"{interface.name}: {current} -> {desired}"
-        )
+        change = f"{interface.name}: {current} -> {desired}"
         if dry_run:
             summary.updated += 1
-            summary.changes.append(f"DRY-RUN {description}")
+            summary.changes.append(f"DRY-RUN {change}")
             continue
 
         try:
             interface.update(desired)
             summary.updated += 1
-            summary.changes.append(description)
-        except Exception as exc:  # report API validation/transport errors per interface
-            summary.errors.append(f"{interface.name}: NetBox update failed: {exc}")
+            summary.changes.append(change)
+        except Exception as exc:
+            summary.errors.append(f"{interface.name}: update failed: {exc}")
 
     return summary
 
 
+# ---------------------------------------------------------------------------
+# CLI orchestration
+# ---------------------------------------------------------------------------
+
+
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Synchronize Cisco interface VLAN assignments to NetBox."
+    )
+    parser.add_argument("--config", default="config.yaml", help="Nornir config file")
+    parser.add_argument(
+        "--tag",
+        default=DEFAULT_TAG,
+        help=f"NetBox device tag (default: {DEFAULT_TAG})",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show differences without updating NetBox",
+    )
+    return parser.parse_args()
+
+
+def required_environment() -> tuple[str, str, str]:
+    names = ("NB_TOKEN", "NORNIR_USERNAME", "NORNIR_PASSWORD")
+    values = tuple(os.getenv(name) or "" for name in names)
+    missing = [name for name, value in zip(names, values) if not value]
+    if missing:
+        raise RuntimeError(
+            "Required environment variable(s) are missing: " + ", ".join(missing)
+        )
+    return values  # type: ignore[return-value]
+
+
+def find_collected_result(multi_result: Any) -> CollectedDevice | None:
+    for item in multi_result:
+        if isinstance(item.result, CollectedDevice):
+            return item.result
+    return None
+
+
 def print_sync_summary(summary: SyncSummary) -> None:
     label = "DRY-RUN" if summary.dry_run else "NETBOX"
-    print()
     print(
-        f"[{label}] {summary.device}: updated={summary.updated} "
+        f"\n[{label}] {summary.device}: updated={summary.updated} "
         f"unchanged={summary.unchanged} skipped={summary.skipped} "
         f"errors={len(summary.errors)}"
     )
@@ -1111,217 +695,107 @@ def print_sync_summary(summary: SyncSummary) -> None:
         print(f"  ERROR: {error}")
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-def parse_arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Collect Cisco interface VLAN state and synchronize it to NetBox."
-    )
-    parser.add_argument("--config", default="config.yaml", help="Nornir config file")
-    parser.add_argument(
-        "--tag",
-        default="nornirtest",
-        help="Only process NetBox devices with this tag (default: nornirtest)",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Read NetBox and show changes without writing them",
-    )
-    parser.add_argument(
-        "--collect-only",
-        action="store_true",
-        help="Create JSON reports without connecting to NetBox",
-    )
-    return parser.parse_args()
-
-
-def inventory_device_id(host: Any) -> int | None:
-    """Return a NetBox device ID supplied by the inventory plugin, if present."""
-
-    value = host.get("netbox_device_id") or host.get("device_id") or host.get("id")
-    try:
-        return int(value) if value not in (None, "") else None
-    except (TypeError, ValueError):
-        return None
-
-
-def select_tagged_hosts(nr: Any, tagged_devices: Iterable[Any]) -> Any:
-    """Match NetBox's tagged-device result to the loaded Nornir inventory."""
-
-    device_ids = {int(device.id) for device in tagged_devices}
-    device_names = {str(device.name).casefold() for device in tagged_devices}
-
-    def is_tagged(host: Any) -> bool:
-        host_device_id = inventory_device_id(host)
-        inventory_name = str(host.get("netbox_device_name") or host.name).casefold()
-        return (
-            host_device_id in device_ids
-            if host_device_id is not None
-            else inventory_name in device_names
-        )
-
-    return nr.filter(filter_func=is_tagged)
-
-
-def load_netbox_inventory_options(config_file: str, netbox_token: str) -> dict[str, Any]:
-    """Load inventory options without discarding nb_url or plugin settings."""
-
-    config_path = Path(config_file).expanduser()
-    try:
-        inventory_options = dict(
-            Config.from_file(config_file=str(config_path)).inventory.options
-        )
-    except Exception as exc:
-        raise SystemExit(
-            f"Unable to load Nornir config {config_path}: {exc}"
-        ) from exc
-    netbox_url = str(inventory_options.get("nb_url") or "").strip().rstrip("/")
-    if not netbox_url:
-        raise SystemExit(
-            f"NetBox URL is missing from {config_path}. Set "
-            "inventory.options.nb_url in the Nornir configuration."
-        )
-    if not netbox_url.startswith(("http://", "https://")):
-        raise SystemExit(
-            f"Invalid inventory.options.nb_url in {config_path}: {netbox_url!r}. "
-            "Include http:// or https://."
-        )
-
-    inventory_options["nb_url"] = netbox_url
-    inventory_options["nb_token"] = netbox_token
-    return inventory_options
-
-
-def configure_pynetbox_session(nb: Any, inventory_options: dict[str, Any]) -> None:
-    """Apply the Nornir NetBox SSL setting to pynetbox's separate session."""
-
-    ssl_verify = inventory_options.get("ssl_verify", True)
-    if isinstance(ssl_verify, str):
-        ssl_verify = ssl_verify.strip().casefold() not in {"false", "no", "0", "off"}
-
-    nb.http_session.verify = ssl_verify
-    if ssl_verify is False:
-        LOGGER.warning(
-            "SSL certificate verification is disabled for the pynetbox session"
-        )
-
-
 def main() -> int:
     args = parse_arguments()
-    netbox_token = os.getenv("NB_TOKEN")
-    nornir_username = os.getenv("NORNIR_USERNAME")
-    nornir_password = os.getenv("NORNIR_PASSWORD")
-    if not netbox_token:
-        raise SystemExit(
-            "NB_TOKEN is not set. Export the NetBox API token first: "
-            "export NB_TOKEN='your-token'"
-        )
-    if not nornir_username or not nornir_password:
-        raise SystemExit(
-            "NORNIR_USERNAME and NORNIR_PASSWORD must both be set before "
-            "connecting to network devices."
-        )
+    try:
+        token, username, password = required_environment()
+        inventory_options = load_inventory_options(args.config, token)
+    except (RuntimeError, ValueError) as exc:
+        LOGGER.error("%s", exc)
+        return 1
 
-    # Preserve every configured inventory option while replacing only the API
-    # token. Passing just {"nb_token": ...} can replace the options mapping and
-    # make NetBoxInventory2 fall back to http://localhost:8080.
-    inventory_options = load_netbox_inventory_options(args.config, netbox_token)
     netbox_url = inventory_options["nb_url"]
-    LOGGER.info("Using NetBox API URL from %s: %s", args.config, netbox_url)
+    LOGGER.info("Using NetBox API URL: %s", netbox_url)
 
-    nr = InitNornir(
-        config_file=args.config,
-        inventory={"options": inventory_options},
-    )
-    # NetBox supplies the hosts and management addresses; device login
-    # credentials come from the same environment variables used by the other
-    # Nornir scripts in this project. Inventory defaults are inherited by each
-    # host when Netmiko opens its Paramiko-backed SSH connection.
-    nr.inventory.defaults.username = nornir_username
-    nr.inventory.defaults.password = nornir_password
+    try:
+        nr = InitNornir(
+            config_file=args.config,
+            inventory={"options": inventory_options},
+        )
+    except Exception as exc:
+        LOGGER.error("Unable to initialize Nornir inventory: %s", exc)
+        return 1
 
+    nr.inventory.defaults.username = username
+    nr.inventory.defaults.password = password
+    nb = create_netbox_client(netbox_url, token, inventory_options)
     exit_code = 0
 
     try:
-        nb = pynetbox.api(netbox_url, token=netbox_token)
-        configure_pynetbox_session(nb, inventory_options)
         tagged_devices = list(nb.dcim.devices.filter(tag=args.tag))
-        switches = select_tagged_hosts(nr, tagged_devices)
+        if not tagged_devices:
+            LOGGER.warning("No NetBox devices have tag %r", args.tag)
+            return 0
 
+        selected = select_tagged_inventory(nr, tagged_devices)
+        selected_count = len(selected.inventory.hosts)
         LOGGER.info(
-            "NetBox tag %r selected %d device(s); %d matched the Nornir inventory",
+            "Tag %r: %d NetBox device(s), %d Nornir inventory match(es)",
             args.tag,
             len(tagged_devices),
-            len(switches.inventory.hosts),
+            selected_count,
         )
-        if not tagged_devices:
-            LOGGER.warning("No NetBox devices have the tag %r; nothing to do", args.tag)
-            return 0
-        if not switches.inventory.hosts:
-            LOGGER.error(
-                "Devices with tag %r were found, but none matched the Nornir inventory",
-                args.tag,
-            )
+        if not selected_count:
+            LOGGER.error("No tagged devices matched the Nornir inventory")
             return 1
 
-        results = switches.run(
-            task=collect_vlan_and_trunk_data,
-            name="Collecting VLAN and switch-stack information",
+        results = selected.run(
+            task=collect_device_state,
+            name="Collect interface VLAN state",
         )
-
-        successful_reports: list[dict[str, Any]] = []
-        for hostname, multi_result in results.items():
+        collected_devices: list[CollectedDevice] = []
+        for host_name, multi_result in results.items():
             if multi_result.failed:
                 exit_code = 1
-                print()
-                print(f"[FAILED] {hostname}")
+                print(f"\n[COLLECTION FAILED] {host_name}")
                 print_result(multi_result)
                 continue
 
-            # The parent task is normally the first result.
-            report = multi_result[0].result
-
-            if not isinstance(report, dict):
-                print(f"[FAILED] No structured report returned for {hostname}")
+            collected = find_collected_result(multi_result)
+            if collected is None:
+                exit_code = 1
+                LOGGER.error("%s returned no collected interface state", host_name)
                 continue
+            LOGGER.info(
+                "%s: collected VLAN state for %d interface(s)",
+                host_name,
+                len(collected.interfaces),
+            )
+            collected_devices.append(collected)
 
-            print_device_summary(hostname, report)
-            successful_reports.append(report)
-
-        if not args.collect_only:
-            vlan_cache = build_vlan_cache(nb)
-
-            # Deliberately synchronize sequentially: a pynetbox API/session is
-            # not shared among Nornir worker threads.
-            for report in successful_reports:
-                try:
-                    sync_summary = sync_report_to_netbox(
-                        nb=nb,
-                        report=report,
-                        vlan_cache=vlan_cache,
-                        dry_run=args.dry_run,
-                    )
-                    report["netbox_sync"] = asdict(sync_summary)
-                    save_report(report["hostname"], report)
-                    print_sync_summary(sync_summary)
-                    if sync_summary.errors:
-                        exit_code = 1
-                except Exception as exc:
+        vlan_cache = build_vlan_cache(nb)
+        for collected in collected_devices:
+            try:
+                summary = sync_device(
+                    nb=nb,
+                    collected=collected,
+                    vlan_cache=vlan_cache,
+                    dry_run=args.dry_run,
+                )
+                print_sync_summary(summary)
+                if summary.errors:
                     exit_code = 1
-                    LOGGER.exception(
-                        "NetBox synchronization failed for %s: %s",
-                        report["hostname"],
-                        exc,
-                    )
+            except Exception as exc:
+                exit_code = 1
+                LOGGER.exception(
+                    "Unable to synchronize %s: %s",
+                    collected.inventory_name,
+                    exc,
+                )
 
+    except Exception as exc:
+        LOGGER.exception("Synchronization failed: %s", exc)
+        exit_code = 1
     finally:
         nr.close_connections()
+        nb.http_session.close()
 
     return exit_code
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+    )
     raise SystemExit(main())
