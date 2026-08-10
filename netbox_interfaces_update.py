@@ -26,6 +26,7 @@ from typing import Any, Iterable
 
 import pynetbox
 from nornir import InitNornir
+from nornir.core.configuration import Config
 from nornir.core.task import Result, Task
 from nornir_netmiko.tasks import netmiko_send_command
 from nornir_utils.plugins.functions import print_result
@@ -1165,6 +1166,35 @@ def select_tagged_hosts(nr: Any, tagged_devices: Iterable[Any]) -> Any:
     return nr.filter(filter_func=is_tagged)
 
 
+def load_netbox_inventory_options(config_file: str, netbox_token: str) -> dict[str, Any]:
+    """Load inventory options without discarding nb_url or plugin settings."""
+
+    config_path = Path(config_file).expanduser()
+    try:
+        inventory_options = dict(
+            Config.load(config_file=str(config_path)).inventory.options
+        )
+    except Exception as exc:
+        raise SystemExit(
+            f"Unable to load Nornir config {config_path}: {exc}"
+        ) from exc
+    netbox_url = str(inventory_options.get("nb_url") or "").strip().rstrip("/")
+    if not netbox_url:
+        raise SystemExit(
+            f"NetBox URL is missing from {config_path}. Set "
+            "inventory.options.nb_url in the Nornir configuration."
+        )
+    if not netbox_url.startswith(("http://", "https://")):
+        raise SystemExit(
+            f"Invalid inventory.options.nb_url in {config_path}: {netbox_url!r}. "
+            "Include http:// or https://."
+        )
+
+    inventory_options["nb_url"] = netbox_url
+    inventory_options["nb_token"] = netbox_token
+    return inventory_options
+
+
 def main() -> int:
     args = parse_arguments()
     netbox_token = os.getenv("NB_TOKEN")
@@ -1174,23 +1204,17 @@ def main() -> int:
             "export NB_TOKEN='your-token'"
         )
 
-    # Override only the token declared under inventory.options in config.yaml.
-    # The URL and all other NetBoxInventory2 settings remain sourced from the
-    # configuration file. This also ensures the inventory plugin uses the same
-    # exported token as the later pynetbox synchronization phase.
+    # Preserve every configured inventory option while replacing only the API
+    # token. Passing just {"nb_token": ...} can replace the options mapping and
+    # make NetBoxInventory2 fall back to http://localhost:8080.
+    inventory_options = load_netbox_inventory_options(args.config, netbox_token)
+    netbox_url = inventory_options["nb_url"]
+    LOGGER.info("Using NetBox API URL from %s: %s", args.config, netbox_url)
+
     nr = InitNornir(
         config_file=args.config,
-        inventory={"options": {"nb_token": netbox_token}},
+        inventory={"options": inventory_options},
     )
-
-    inventory_options = nr.config.inventory.options
-    netbox_url = inventory_options.get("nb_url")
-    if not netbox_url:
-        nr.close_connections()
-        raise SystemExit(
-            f"NetBox URL is missing from {args.config}. Set "
-            "inventory.options.nb_url in the Nornir configuration."
-        )
 
     exit_code = 0
 
