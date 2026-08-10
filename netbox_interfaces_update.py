@@ -1172,7 +1172,7 @@ def load_netbox_inventory_options(config_file: str, netbox_token: str) -> dict[s
     config_path = Path(config_file).expanduser()
     try:
         inventory_options = dict(
-            Config.load(config_file=str(config_path)).inventory.options
+            Config.from_file(config_file=str(config_path)).inventory.options
         )
     except Exception as exc:
         raise SystemExit(
