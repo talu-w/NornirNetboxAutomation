@@ -1195,6 +1195,20 @@ def load_netbox_inventory_options(config_file: str, netbox_token: str) -> dict[s
     return inventory_options
 
 
+def configure_pynetbox_session(nb: Any, inventory_options: dict[str, Any]) -> None:
+    """Apply the Nornir NetBox SSL setting to pynetbox's separate session."""
+
+    ssl_verify = inventory_options.get("ssl_verify", True)
+    if isinstance(ssl_verify, str):
+        ssl_verify = ssl_verify.strip().casefold() not in {"false", "no", "0", "off"}
+
+    nb.http_session.verify = ssl_verify
+    if ssl_verify is False:
+        LOGGER.warning(
+            "SSL certificate verification is disabled for the pynetbox session"
+        )
+
+
 def main() -> int:
     args = parse_arguments()
     netbox_token = os.getenv("NB_TOKEN")
@@ -1220,6 +1234,7 @@ def main() -> int:
 
     try:
         nb = pynetbox.api(netbox_url, token=netbox_token)
+        configure_pynetbox_session(nb, inventory_options)
         tagged_devices = list(nb.dcim.devices.filter(tag=args.tag))
         switches = select_tagged_hosts(nr, tagged_devices)
 
