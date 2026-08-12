@@ -20,7 +20,8 @@ from nornir_netmiko.tasks import netmiko_send_command
 
 
 LOGGER = logging.getLogger(__name__)
-DEFAULT_CONFIG = Path(__file__).resolve().with_name("config.yaml")
+DEFAULT_CONFIG = "config.yaml"
+DEFAULT_TAG = "nornirtest"
 
 TYPE_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"^(?:lo|loopback)", re.I), "virtual"),
@@ -45,15 +46,27 @@ class DiscoveredInterface:
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Use the Nornir inventory to discover one device's interfaces and "
-            "create the missing interface objects in NetBox."
+            "Use the Nornir inventory to discover interfaces on NetBox-tagged "
+            "devices and create the missing interface objects in NetBox."
         )
     )
-    parser.add_argument("device", help="Nornir inventory/NetBox device name")
+    parser.add_argument(
+        "device",
+        nargs="?",
+        help=(
+            "Optional Nornir inventory/NetBox device name. The device must also "
+            "carry the selected NetBox tag."
+        ),
+    )
     parser.add_argument(
         "--config",
-        default=str(DEFAULT_CONFIG),
-        help="Nornir configuration file (default: config.yaml beside this script)",
+        default=DEFAULT_CONFIG,
+        help="Nornir configuration file (default: config.yaml)",
+    )
+    parser.add_argument(
+        "--tag",
+        default=DEFAULT_TAG,
+        help=f"NetBox device tag used to select targets (default: {DEFAULT_TAG})",
     )
     parser.add_argument(
         "--apply",
@@ -198,23 +211,51 @@ def find_discovered_result(multi_result: Any) -> list[DiscoveredInterface] | Non
     return None
 
 
-def find_inventory_host(nr: Any, requested_name: str) -> Any:
+def result_error(multi_result: Any) -> str:
+    for item in reversed(multi_result):
+        if getattr(item, "exception", None) is not None:
+            return str(item.exception)
+    return "interface collection failed"
+
+
+def inventory_device_id(host: Any) -> int | None:
+    value = host.get("netbox_device_id") or host.get("device_id") or host.get("id")
+    try:
+        return int(value) if value not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
+def match_inventory_host(host: Any, devices: Iterable[Any]) -> Any | None:
+    """Match a Nornir host to exactly one authoritative NetBox device."""
+    device_list = list(devices)
+    host_id = inventory_device_id(host)
+    if host_id is not None:
+        matches = [device for device in device_list if int(device.id) == host_id]
+        return matches[0] if len(matches) == 1 else None
+
+    host_name = str(host.get("netbox_device_name") or host.name).casefold()
     matches = [
-        host
-        for host in nr.inventory.hosts.values()
-        if host.name.casefold() == requested_name.casefold()
-        or str(host.get("netbox_device_name") or "").casefold()
-        == requested_name.casefold()
+        device for device in device_list if str(device.name).casefold() == host_name
     ]
-    if not matches:
-        raise RuntimeError(f"Device {requested_name!r} is not in the Nornir inventory")
-    if len(matches) > 1:
-        raise RuntimeError(f"Device name {requested_name!r} matched multiple inventory hosts")
-    return matches[0]
+    return matches[0] if len(matches) == 1 else None
+
+
+def select_tagged_inventory(nr: Any, tagged_devices: list[Any]) -> Any:
+    """Select tagged inventory hosts and attach their authoritative NetBox IDs."""
+    selected = nr.filter(
+        filter_func=lambda host: match_inventory_host(host, tagged_devices) is not None
+    )
+    for host in selected.inventory.hosts.values():
+        device = match_inventory_host(host, tagged_devices)
+        if device is not None:
+            host.data["netbox_device_id"] = int(device.id)
+            host.data["netbox_device_name"] = str(device.name)
+    return selected
 
 
 def get_netbox_device(netbox: Any, host: Any) -> Any:
-    device_id = host.get("netbox_device_id") or host.get("device_id") or host.get("id")
+    device_id = inventory_device_id(host)
     device = netbox.dcim.devices.get(device_id) if device_id else None
     if device is None:
         device = netbox.dcim.devices.get(name=host.name)
@@ -267,51 +308,103 @@ def main() -> int:
         nr.inventory.defaults.username = username
         nr.inventory.defaults.password = password
 
-        host = find_inventory_host(nr, args.device)
-        selected = nr.filter(filter_func=lambda candidate: candidate is host)
+        netbox = create_netbox_client(options, token)
+        tagged_devices = list(netbox.dcim.devices.filter(tag=args.tag))
+        if not tagged_devices:
+            LOGGER.warning("No NetBox devices have tag %r", args.tag)
+            return 0
+
+        if args.device:
+            requested_name = args.device.casefold()
+            tagged_devices = [
+                device
+                for device in tagged_devices
+                if str(device.name).casefold() == requested_name
+            ]
+            if not tagged_devices:
+                raise RuntimeError(
+                    f"Device {args.device!r} was not found with NetBox tag {args.tag!r}"
+                )
+
+        selected = select_tagged_inventory(nr, tagged_devices)
+        selected_count = len(selected.inventory.hosts)
         LOGGER.info(
-            "Collecting %s (%s), platform=%s",
-            host.name,
-            host.hostname,
-            host.platform,
+            "Tag %r: %d NetBox device(s), %d Nornir inventory match(es)",
+            args.tag,
+            len(tagged_devices),
+            selected_count,
         )
+        if not selected_count:
+            raise RuntimeError("No tagged NetBox devices matched the Nornir inventory")
+
+        for host in selected.inventory.hosts.values():
+            LOGGER.info(
+                "Selected %s (%s), platform=%s",
+                host.name,
+                host.hostname,
+                host.platform,
+            )
+
         results = selected.run(
             task=collect_interfaces,
             name="Collect interfaces for NetBox comparison",
             include_virtual=args.include_virtual,
         )
-        host_result = results[host.name]
-        if host_result.failed:
-            error = host_result.exception or "interface collection failed"
-            raise RuntimeError(f"{host.name}: {error}")
-        discovered = find_discovered_result(host_result)
-        if discovered is None:
-            raise RuntimeError(f"{host.name}: collection returned no interface list")
+        exit_code = 0
+        for host_name, host_result in results.items():
+            print(f"\n========== {host_name} ==========")
+            if host_result.failed:
+                LOGGER.error("%s: %s", host_name, result_error(host_result))
+                exit_code = 1
+                continue
 
-        netbox = create_netbox_client(options, token)
-        device = get_netbox_device(netbox, host)
-        existing = existing_interfaces(netbox, int(device.id))
-        missing = [item for item in discovered if normalize_name(item.name) not in existing]
+            discovered = find_discovered_result(host_result)
+            if discovered is None:
+                LOGGER.error("%s: collection returned no interface list", host_name)
+                exit_code = 1
+                continue
 
-        LOGGER.info(
-            "%s: discovered=%d already_present=%d missing=%d",
-            device.name,
-            len(discovered),
-            len(discovered) - len(missing),
-            len(missing),
-        )
-        for interface in missing:
-            action = "CREATE" if args.apply else "WOULD CREATE"
-            print(f"{action}  {interface.name}  ({interface_type(interface.name)})")
+            try:
+                host = selected.inventory.hosts[host_name]
+                device = get_netbox_device(netbox, host)
+                existing = existing_interfaces(netbox, int(device.id))
+                missing = [
+                    item
+                    for item in discovered
+                    if normalize_name(item.name) not in existing
+                ]
 
-        if not missing:
-            print("NetBox already contains every discovered interface.")
-        elif args.apply:
-            count = create_missing(netbox, int(device.id), missing)
-            print(f"Created {count} interface(s) on NetBox device {device.name}.")
-        else:
-            print("Dry-run only; rerun with --apply to create the missing interfaces.")
-        return 0
+                LOGGER.info(
+                    "%s: discovered=%d already_present=%d missing=%d",
+                    device.name,
+                    len(discovered),
+                    len(discovered) - len(missing),
+                    len(missing),
+                )
+                for interface in missing:
+                    action = "CREATE" if args.apply else "WOULD CREATE"
+                    print(
+                        f"{action}  {interface.name}  "
+                        f"({interface_type(interface.name)})"
+                    )
+
+                if not missing:
+                    print("NetBox already contains every discovered interface.")
+                elif args.apply:
+                    count = create_missing(netbox, int(device.id), missing)
+                    print(
+                        f"Created {count} interface(s) on NetBox device {device.name}."
+                    )
+                else:
+                    print(
+                        "Dry-run only; rerun with --apply to create the missing "
+                        "interfaces."
+                    )
+            except (RuntimeError, pynetbox.core.query.RequestError) as exc:
+                LOGGER.error("%s: NetBox synchronization failed: %s", host_name, exc)
+                exit_code = 1
+
+        return exit_code
     except (RuntimeError, ValueError, pynetbox.core.query.RequestError) as exc:
         LOGGER.error("%s", exc)
         return 1
