@@ -5,11 +5,11 @@
 Workflow:
     1. Load the NetBox-backed Nornir inventory.
     2. Select devices carrying the requested NetBox tag.
-    3. Collect access, voice, and trunk VLAN state from those devices.
+    3. Collect access, voice, trunk, link-state, and description data.
     4. Resolve duplicate voice VLAN IDs using each VLAN SVI address and the
        prefixes assigned to candidate VLANs in NetBox.
     5. Compare that state with each NetBox interface.
-    6. Update only interfaces whose VLAN state differs.
+    6. Update only interfaces whose VLAN or metadata state differs.
 
 The script does not create VLANs or interfaces. Missing or ambiguous NetBox
 objects are reported and skipped so that partial assignments are never made.
@@ -39,6 +39,8 @@ DEFAULT_TAG = "nornirtest"
 SHOW_VLAN = "show vlan brief"
 SHOW_TRUNKS = "show interfaces trunk"
 SHOW_SWITCHPORTS = "show interfaces switchport"
+SHOW_INTERFACE_STATUS = "show interfaces status"
+SHOW_INTERFACE_DESCRIPTIONS = "show interfaces description"
 
 LOGGER = logging.getLogger(__name__)
 
@@ -70,6 +72,16 @@ class SwitchportState:
     voice_vlan: int | None = None
 
 
+@dataclass(frozen=True)
+class InterfaceMetadataState:
+    """Operational state and configured description for one interface."""
+
+    name: str
+    enabled: bool | None = None
+    description: str | None = None
+    device_status: str = ""
+
+
 @dataclass
 class TrunkState:
     name: str
@@ -86,6 +98,7 @@ class CollectedDevice:
     inventory_name: str
     netbox_device_id: int | None
     interfaces: list[InterfaceVlanState]
+    interface_metadata: list[InterfaceMetadataState] = field(default_factory=list)
     vlan_svi_addresses: dict[int, tuple[str, ...]] = field(default_factory=dict)
 
 
@@ -350,6 +363,163 @@ def parse_switchports(output: str) -> dict[str, SwitchportState]:
     return switchports
 
 
+def table_column_starts(
+    header: str,
+    column_names: tuple[str, ...],
+) -> tuple[int, ...] | None:
+    """Locate fixed-width Cisco table columns in their expected order."""
+
+    lowered = header.casefold()
+    starts: list[int] = []
+    search_from = 0
+    for column_name in column_names:
+        position = lowered.find(column_name.casefold(), search_from)
+        if position < 0:
+            return None
+        starts.append(position)
+        search_from = position + len(column_name)
+    return tuple(starts)
+
+
+def parse_interface_status(output: str) -> dict[str, InterfaceMetadataState]:
+    """Parse exact connected/notconnect state from ``show interfaces status``."""
+
+    lines = output.splitlines()
+    starts: tuple[int, ...] | None = None
+    header_index = -1
+    for index, line in enumerate(lines):
+        starts = table_column_starts(line, ("Port", "Name", "Status", "Vlan"))
+        if starts is not None:
+            header_index = index
+            break
+    if starts is None:
+        return {}
+
+    port_start, name_start, status_start, vlan_start = starts
+    metadata: dict[str, InterfaceMetadataState] = {}
+    for line in lines[header_index + 1 :]:
+        if len(line) <= port_start:
+            continue
+        port = line[port_start:name_start].strip()
+        if not port or set(port) <= {"-"}:
+            continue
+
+        name = line[name_start:status_start].strip()
+        status = line[status_start:vlan_start].strip().casefold()
+        enabled: bool | None = None
+        if status == "connected":
+            enabled = True
+        elif status == "notconnect":
+            enabled = False
+
+        # The Name column is Cisco's interface description, but it may be
+        # truncated. It is retained only as a fallback for platforms that do
+        # not return a description-table entry.
+        metadata[port.casefold()] = InterfaceMetadataState(
+            name=port,
+            enabled=enabled,
+            description=name or None,
+            device_status=status,
+        )
+    return metadata
+
+
+def parse_interface_descriptions(output: str) -> dict[str, str]:
+    """Parse descriptions from ``show interfaces description``."""
+
+    lines = output.splitlines()
+    header_index = -1
+    for index, line in enumerate(lines):
+        starts = table_column_starts(
+            line,
+            ("Interface", "Status", "Protocol", "Description"),
+        )
+        if starts is not None:
+            header_index = index
+            break
+    if header_index < 0:
+        return {}
+
+    row_pattern = re.compile(
+        r"^\s*(?P<interface>\S+)\s{2,}"
+        r"(?P<status>.*?)\s{2,}"
+        r"(?P<protocol>\S+)"
+        r"(?:\s{2,}(?P<description>.*))?\s*$"
+    )
+    descriptions: dict[str, str] = {}
+    for line in lines[header_index + 1 :]:
+        match = row_pattern.match(line)
+        if not match:
+            continue
+        interface = match.group("interface")
+        descriptions[interface.casefold()] = (
+            match.group("description") or ""
+        ).strip()
+    return descriptions
+
+
+def build_interface_metadata(
+    status_output: str,
+    description_output: str,
+) -> list[InterfaceMetadataState]:
+    """Merge live port status with authoritative interface descriptions."""
+
+    status_by_name = parse_interface_status(status_output)
+    descriptions = parse_interface_descriptions(description_output)
+    status_by_signature = {
+        interface_signature(state.name): state
+        for state in status_by_name.values()
+    }
+    descriptions_by_signature: dict[
+        tuple[str, str],
+        list[tuple[str, str]],
+    ] = defaultdict(list)
+    for name, description in descriptions.items():
+        descriptions_by_signature[interface_signature(name)].append(
+            (name, description)
+        )
+
+    signatures = set(status_by_signature) | set(descriptions_by_signature)
+    merged: list[InterfaceMetadataState] = []
+    for signature in signatures:
+        status_state = status_by_signature.get(signature)
+        description_entries = descriptions_by_signature.get(signature, [])
+        nonempty_descriptions = {
+            description
+            for _name, description in description_entries
+            if description
+        }
+        if len(nonempty_descriptions) > 1:
+            LOGGER.warning(
+                "Conflicting descriptions found for interface signature %s: %s; "
+                "using the longest value",
+                signature,
+                sorted(nonempty_descriptions),
+            )
+        if description_entries:
+            # A blank description-table row means the device has no configured
+            # description; never replace it with the potentially truncated
+            # Name column from show interfaces status.
+            description = max(nonempty_descriptions, key=len, default=None)
+        else:
+            description = status_state.description if status_state else None
+
+        name = (
+            status_state.name
+            if status_state is not None
+            else description_entries[0][0]
+        )
+        merged.append(
+            InterfaceMetadataState(
+                name=name,
+                enabled=status_state.enabled if status_state else None,
+                description=description or None,
+                device_status=status_state.device_status if status_state else "",
+            )
+        )
+    return sorted(merged, key=lambda item: interface_sort_key(item.name))
+
+
 def parse_svi_addresses(output: str) -> tuple[str, ...]:
     """Return routed addresses shown for a Cisco VLAN interface."""
 
@@ -453,6 +623,18 @@ def collect_device_state(task: Task, ambiguous_vlan_ids: set[int]) -> Result:
         command_string=SHOW_SWITCHPORTS,
         read_timeout=90,
     )
+    status_result = task.run(
+        task=netmiko_send_command,
+        name=SHOW_INTERFACE_STATUS,
+        command_string=SHOW_INTERFACE_STATUS,
+        read_timeout=60,
+    )
+    description_result = task.run(
+        task=netmiko_send_command,
+        name=SHOW_INTERFACE_DESCRIPTIONS,
+        command_string=SHOW_INTERFACE_DESCRIPTIONS,
+        read_timeout=60,
+    )
 
     switchport_output = str(switchport_result.result)
     voice_vlan_ids = {
@@ -478,6 +660,10 @@ def collect_device_state(task: Task, ambiguous_vlan_ids: set[int]) -> Result:
             str(vlan_result.result),
             str(trunk_result.result),
             switchport_output,
+        ),
+        interface_metadata=build_interface_metadata(
+            str(status_result.result),
+            str(description_result.result),
         ),
         vlan_svi_addresses=vlan_svi_addresses,
     )
@@ -1192,6 +1378,15 @@ def current_interface_state(interface: Any) -> dict[str, Any]:
     }
 
 
+def current_interface_metadata(interface: Any) -> dict[str, Any]:
+    """Return NetBox fields managed by live interface metadata collection."""
+
+    return {
+        "enabled": bool(getattr(interface, "enabled", False)),
+        "description": str(getattr(interface, "description", "") or ""),
+    }
+
+
 def desired_netbox_state(
     discovered: InterfaceVlanState,
     current: dict[str, Any],
@@ -1345,6 +1540,68 @@ def sync_device(
         except Exception as exc:
             summary.errors.append(
                 f"{owner.name}/{interface.name}: update failed: {exc}"
+            )
+
+    # Synchronize status and descriptions independently from VLAN state. This
+    # ensures a VLAN ambiguity cannot prevent an otherwise safe metadata
+    # update, and includes routed or unused ports absent from VLAN output.
+    for discovered in collected.interface_metadata:
+        interface, owner, error = match_scoped_interface(discovered.name, scope)
+        if error:
+            summary.skipped += 1
+            summary.errors.append(error)
+            continue
+
+        desired_metadata: dict[str, Any] = {}
+        if discovered.enabled is not None:
+            desired_metadata["enabled"] = discovered.enabled
+        if discovered.description is not None:
+            desired_metadata["description"] = discovered.description
+        if not desired_metadata:
+            continue
+
+        current_metadata = current_interface_metadata(interface)
+        current_subset = {
+            field_name: current_metadata[field_name]
+            for field_name in desired_metadata
+        }
+        if current_subset == desired_metadata:
+            summary.unchanged += 1
+            continue
+
+        change = (
+            f"{owner.name}/{interface.name} metadata "
+            f"(device_status={discovered.device_status or 'unknown'}): "
+            f"{current_subset} -> {desired_metadata}"
+        )
+        if dry_run:
+            summary.updated += 1
+            summary.changes.append(f"DRY-RUN {change}")
+            continue
+
+        try:
+            LOGGER.info("Updating NetBox interface %s", change)
+            interface.update(desired_metadata)
+            refreshed = nb.dcim.interfaces.get(interface.id)
+            if refreshed is None:
+                raise RuntimeError(
+                    "interface disappeared while verifying the metadata update"
+                )
+            persisted = current_interface_metadata(refreshed)
+            persisted_subset = {
+                field_name: persisted[field_name]
+                for field_name in desired_metadata
+            }
+            if persisted_subset != desired_metadata:
+                raise RuntimeError(
+                    f"metadata verification failed; NetBox returned "
+                    f"{persisted_subset}"
+                )
+            summary.updated += 1
+            summary.changes.append(f"VERIFIED {change}")
+        except Exception as exc:
+            summary.errors.append(
+                f"{owner.name}/{interface.name}: metadata update failed: {exc}"
             )
 
     return summary
