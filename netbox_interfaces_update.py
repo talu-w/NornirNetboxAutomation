@@ -614,6 +614,10 @@ INTERFACE_PREFIXES = {
     "po": "po",
     "port-channel": "po",
     "portchannel": "po",
+    "fi":"fi",
+    "fivegigabitethernet":"fi",
+    "ap":"ap",
+    "appgigabitethernet":"ap",
 }
 
 
