@@ -61,6 +61,8 @@ class TrunkState:
     allowed_vlans: list[int] = field(default_factory=list)
     active_vlans: list[int] = field(default_factory=list)
     allows_all: bool = False
+    allowed_seen: bool = False
+    active_seen: bool = False
 
 
 @dataclass
@@ -78,6 +80,7 @@ class SyncSummary:
     unchanged: int = 0
     skipped: int = 0
     changes: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
 
@@ -93,6 +96,22 @@ class InterfaceSearchScope:
         int,
         tuple[dict[str, list[Any]], dict[tuple[str, str], list[Any]]],
     ]
+
+
+@dataclass
+class VlanCache:
+    """VLANs plus their full VLAN-group records, indexed for resolution."""
+
+    by_vid: dict[int, list[Any]]
+    by_id: dict[int, Any]
+    groups_by_id: dict[int, Any]
+
+
+@dataclass
+class DeviceScopeContext:
+    """NetBox scopes applicable to one physical device, with specificity."""
+
+    ranks: dict[tuple[str, int], int]
 
 
 # ---------------------------------------------------------------------------
@@ -142,8 +161,10 @@ def parse_vlan_brief(output: str) -> dict[str, int]:
         re.IGNORECASE,
     )
     continuation = re.compile(
-        r"^\s+(?P<ports>(?:Fa|Gi|Te|Tw|Fo|Hu|Eth|Po)\S+.*)$",
-        re.IGNORECASE,
+        r"^\s+(?P<ports>"
+        r"[A-Za-z][A-Za-z-]*\d\S*"
+        r"(?:\s*,\s*[A-Za-z][A-Za-z-]*\d\S*)*"
+        r")\s*$"
     )
 
     def add_ports(port_text: str, vlan_id: int) -> None:
@@ -171,6 +192,7 @@ def parse_trunks(output: str) -> dict[str, TrunkState]:
 
     trunks: dict[str, TrunkState] = {}
     section: str | None = None
+    last_port_by_section: dict[str, str] = {}
 
     operational_line = re.compile(
         r"^\s*(?P<port>\S+)\s+\S+\s+\S+\s+\S+\s+"
@@ -181,6 +203,25 @@ def parse_trunks(output: str) -> dict[str, TrunkState]:
         r"(?P<vlans>(?:none|all|[\d,\-\s]+))\s*$",
         re.IGNORECASE,
     )
+    vlan_continuation = re.compile(
+        r"^\s+(?P<vlans>[\d,\-\s]+)\s*$",
+        re.IGNORECASE,
+    )
+
+    def add_vlan_expression(
+        trunk: TrunkState,
+        current_section: str,
+        expression: str,
+    ) -> None:
+        normalized = expression.strip().lower().replace(" ", "")
+        vlan_ids = expand_vlan_list(normalized)
+        if current_section == "allowed":
+            trunk.allowed_seen = True
+            trunk.allowed_vlans = sorted(set(trunk.allowed_vlans) | set(vlan_ids))
+            trunk.allows_all = trunk.allows_all or normalized in {"all", "1-4094"}
+        elif current_section == "active":
+            trunk.active_seen = True
+            trunk.active_vlans = sorted(set(trunk.active_vlans) | set(vlan_ids))
 
     for raw_line in output.splitlines():
         line = raw_line.rstrip()
@@ -218,17 +259,20 @@ def parse_trunks(output: str) -> dict[str, TrunkState]:
         if section not in {"allowed", "active", "forwarding"}:
             continue
         match = vlan_line.match(line)
-        if not match:
+        if match:
+            port = match.group("port")
+            last_port_by_section[section] = port
+            trunk = trunks.setdefault(port, TrunkState(name=port))
+            add_vlan_expression(trunk, section, match.group("vlans"))
             continue
 
-        port = match.group("port")
-        expression = match.group("vlans").strip().lower().replace(" ", "")
-        trunk = trunks.setdefault(port, TrunkState(name=port))
-        if section == "allowed":
-            trunk.allowed_vlans = expand_vlan_list(expression)
-            trunk.allows_all = expression in {"all", "1-4094"}
-        elif section == "active":
-            trunk.active_vlans = expand_vlan_list(expression)
+        # Some platforms wrap long VLAN expressions onto an indented line
+        # without repeating the interface name.
+        continuation_match = vlan_continuation.match(line)
+        previous_port = last_port_by_section.get(section)
+        if continuation_match and previous_port is not None:
+            trunk = trunks.setdefault(previous_port, TrunkState(name=previous_port))
+            add_vlan_expression(trunk, section, continuation_match.group("vlans"))
 
     return trunks
 
@@ -245,6 +289,13 @@ def build_collected_state(vlan_output: str, trunk_output: str) -> list[Interface
         )
 
     for interface, trunk in parse_trunks(trunk_output).items():
+        if not trunk.allowed_seen:
+            LOGGER.warning(
+                "%s: trunk was detected but its allowed-VLAN list was not "
+                "parsed; leaving this interface unchanged",
+                interface,
+            )
+            continue
         # An unrestricted Cisco trunk is reported as all/1-4094. Only VLANs
         # active on this device are meaningful interface assignments in NetBox.
         tagged = trunk.active_vlans if trunk.allows_all else trunk.allowed_vlans
@@ -396,13 +447,21 @@ INTERFACE_PREFIXES = {
     "tengige": "te",
     "tengigabitethernet": "te",
     "tw": "tw",
+    "two": "tw",
+    "twogige": "tw",
     "twogigabitethernet": "tw",
+    "twe": "twe",
+    "twentyfivegige": "twe",
+    "twentyfivegigabitethernet": "twe",
     "fo": "fo",
     "fortygige": "fo",
     "fortygigabitethernet": "fo",
     "hu": "hu",
     "hundredgige": "hu",
     "hundredgigabitethernet": "hu",
+    "fou": "fou",
+    "fourhundredgige": "fou",
+    "fourhundredgigabitethernet": "fou",
     "eth": "eth",
     "ethernet": "eth",
     "po": "po",
@@ -488,56 +547,178 @@ def choice_value(value: Any) -> str | None:
     return getattr(value, "value", str(value))
 
 
-def vlan_scope_id(vlan: Any) -> int | None:
-    """Support both site-scoped and generic-scope NetBox VLAN records."""
+def object_type_value(value: Any) -> str | None:
+    """Normalize a NetBox generic-relation object type to ``app.model``."""
 
-    scope_id = related_id(getattr(vlan, "scope", None))
-    if scope_id is not None:
-        return scope_id
-    site_id = related_id(getattr(vlan, "site", None))
-    if site_id is not None:
-        return site_id
+    if value is None or isinstance(value, str):
+        return value.casefold() if isinstance(value, str) else None
+    if isinstance(value, dict):
+        direct = value.get("value")
+        app_label = value.get("app_label")
+        model = value.get("model")
+    else:
+        direct = getattr(value, "value", None)
+        app_label = getattr(value, "app_label", None)
+        model = getattr(value, "model", None)
+    if direct:
+        return str(direct).casefold()
+    if app_label and model:
+        return f"{app_label}.{model}".casefold()
+    return None
 
-    group = getattr(vlan, "group", None)
-    if group is None:
-        return None
-    return related_id(getattr(group, "scope", None)) or related_id(
-        getattr(group, "site", None)
+
+def build_vlan_cache(nb: Any) -> VlanCache:
+    by_vid: dict[int, list[Any]] = defaultdict(list)
+    by_id: dict[int, Any] = {}
+    for vlan in nb.ipam.vlans.all():
+        by_vid[int(vlan.vid)].append(vlan)
+        by_id[int(vlan.id)] = vlan
+
+    groups_by_id = {
+        int(group.id): group for group in nb.ipam.vlan_groups.all()
+    }
+    return VlanCache(
+        by_vid=dict(by_vid),
+        by_id=by_id,
+        groups_by_id=groups_by_id,
     )
 
 
-def build_vlan_cache(nb: Any) -> dict[int, list[Any]]:
-    cache: dict[int, list[Any]] = defaultdict(list)
-    for vlan in nb.ipam.vlans.all():
-        cache[int(vlan.vid)].append(vlan)
-    return dict(cache)
+def vlan_scope_key(
+    vlan: Any,
+    cache: VlanCache,
+) -> tuple[tuple[str, int] | None, str]:
+    """Return the typed scope key and a useful diagnostic label for a VLAN."""
+
+    # Direct site assignment is retained for older/current NetBox versions,
+    # although NetBox now recommends VLAN groups instead.
+    site_id = related_id(getattr(vlan, "site", None))
+    if site_id is not None:
+        return ("dcim.site", site_id), f"site:{site_id}"
+
+    group_id = related_id(getattr(vlan, "group", None))
+    if group_id is None:
+        return None, "global"
+    group = cache.groups_by_id.get(group_id)
+    if group is None:
+        return None, f"group:{group_id} (scope unavailable)"
+
+    scope_type = object_type_value(getattr(group, "scope_type", None))
+    scope_id = related_id(getattr(group, "scope", None)) or integer_value(
+        getattr(group, "scope_id", None)
+    )
+    if scope_type is None or scope_id is None:
+        return None, f"group:{group_id} global"
+    return (scope_type, scope_id), f"group:{group_id} {scope_type}:{scope_id}"
+
+
+def add_scope_chain(
+    endpoint: Any,
+    initial: Any,
+    scope_type: str,
+    starting_rank: int,
+    ranks: dict[tuple[str, int], int],
+) -> None:
+    """Add an object and its parent chain, highest specificity first."""
+
+    object_id = related_id(initial)
+    seen: set[int] = set()
+    rank = starting_rank
+    while object_id is not None and object_id not in seen:
+        seen.add(object_id)
+        key = (scope_type, object_id)
+        ranks[key] = max(rank, ranks.get(key, -1))
+        record = endpoint.get(object_id)
+        if record is None:
+            break
+        object_id = related_id(getattr(record, "parent", None))
+        rank -= 1
+
+
+def build_device_scope_context(nb: Any, device: Any) -> DeviceScopeContext:
+    """Build all VLAN-group scopes which can apply to a physical device."""
+
+    ranks: dict[tuple[str, int], int] = {}
+    site = getattr(device, "site", None)
+    site_id = related_id(site)
+    if site_id is not None:
+        ranks[("dcim.site", site_id)] = 60
+        full_site = nb.dcim.sites.get(site_id)
+        if full_site is not None:
+            add_scope_chain(
+                nb.dcim.site_groups,
+                getattr(full_site, "group", None),
+                "dcim.sitegroup",
+                50,
+                ranks,
+            )
+            add_scope_chain(
+                nb.dcim.regions,
+                getattr(full_site, "region", None),
+                "dcim.region",
+                40,
+                ranks,
+            )
+
+    add_scope_chain(
+        nb.dcim.locations,
+        getattr(device, "location", None),
+        "dcim.location",
+        70,
+        ranks,
+    )
+
+    rack = getattr(device, "rack", None)
+    rack_id = related_id(rack)
+    if rack_id is not None:
+        ranks[("dcim.rack", rack_id)] = 80
+        full_rack = nb.dcim.racks.get(rack_id)
+        rack_group = getattr(full_rack, "group", None) if full_rack else None
+        rack_group_id = related_id(rack_group)
+        if rack_group_id is not None:
+            ranks[("dcim.rackgroup", rack_group_id)] = 75
+
+    return DeviceScopeContext(ranks=ranks)
 
 
 def resolve_vlan(
-    cache: dict[int, list[Any]],
+    cache: VlanCache,
     vlan_id: int,
-    device: Any,
+    context: DeviceScopeContext,
+    preferred_ids: set[int] | None = None,
 ) -> tuple[Any | None, str | None]:
-    candidates = cache.get(vlan_id, [])
+    candidates = cache.by_vid.get(vlan_id, [])
     if not candidates:
         return None, f"VLAN {vlan_id} does not exist in NetBox"
+
+    preferred = [
+        vlan
+        for vlan in candidates
+        if preferred_ids and int(vlan.id) in preferred_ids
+    ]
+    if len(preferred) == 1:
+        return preferred[0], None
     if len(candidates) == 1:
         return candidates[0], None
 
-    site_id = related_id(getattr(device, "site", None))
-    if site_id is not None:
-        site_candidates = [
-            vlan for vlan in candidates if vlan_scope_id(vlan) == site_id
-        ]
-        if len(site_candidates) == 1:
-            return site_candidates[0], None
+    ranked: list[tuple[int, Any, str]] = []
+    for vlan in candidates:
+        scope_key, scope_label = vlan_scope_key(vlan, cache)
+        rank = 0 if scope_key is None else context.ranks.get(scope_key, -1)
+        if rank >= 0:
+            ranked.append((rank, vlan, scope_label))
 
-    global_candidates = [vlan for vlan in candidates if vlan_scope_id(vlan) is None]
-    if len(global_candidates) == 1:
-        return global_candidates[0], None
+    if ranked:
+        best_rank = max(item[0] for item in ranked)
+        best = [item for item in ranked if item[0] == best_rank]
+        if len(best) == 1:
+            return best[0][1], None
 
-    ids = ", ".join(str(vlan.id) for vlan in candidates)
-    return None, f"VLAN {vlan_id} is ambiguous; candidate NetBox IDs: {ids}"
+    details = ", ".join(
+        f"ID {vlan.id} ({vlan_scope_key(vlan, cache)[1]})"
+        for vlan in candidates
+    )
+    return None, f"VLAN {vlan_id} is ambiguous or out of scope: {details}"
 
 
 def resolve_device(nb: Any, collected: CollectedDevice) -> Any:
@@ -694,10 +875,23 @@ def match_scoped_interface(
     discovered_name: str,
     scope: InterfaceSearchScope,
 ) -> tuple[Any | None, Any | None, str | None]:
-    """Route a stack port to its VC member before matching its interface."""
+    """Match a port on either a single-device stack or a Virtual Chassis.
+
+    Some NetBox installations model a Cisco stack as one device containing
+    every IOS interface name (Gi1/0/1, Gi2/0/1, and so on). Others model each
+    member as a separate device in a Virtual Chassis. Always try the exact
+    interface on the connected device first; only route by VC position when
+    that direct match does not exist.
+    """
 
     position = stack_member_number(discovered_name)
-    owner = scope.master_device
+    connected_indexes = scope.indexes_by_device_id.get(
+        int(scope.connected_device.id)
+    )
+    if connected_indexes is not None:
+        interface, _ = match_interface(discovered_name, *connected_indexes)
+        if interface is not None:
+            return interface, scope.connected_device, None
 
     if position is not None and scope.virtual_chassis is not None:
         owner = scope.members_by_position.get(position)
@@ -706,13 +900,13 @@ def match_scoped_interface(
                 f"{discovered_name}: Virtual Chassis {scope.virtual_chassis.name!r} "
                 f"has no member at position {position}"
             )
-    elif position is not None and position > 1:
-        return None, None, (
-            f"{discovered_name}: stack member {position} requires a Virtual "
-            f"Chassis for {scope.connected_device.name!r}, but none exists"
-        )
     elif position is not None:
+        # A non-VC stack can still be represented by one NetBox device. The
+        # direct lookup above is authoritative; do not alias member 2 to a
+        # member-1 interface because that could update the wrong physical port.
         owner = scope.connected_device
+    else:
+        owner = scope.master_device
 
     indexes = scope.indexes_by_device_id.get(int(owner.id))
     if indexes is None:
@@ -722,7 +916,14 @@ def match_scoped_interface(
     if interface is not None:
         return interface, owner, None
 
-    # Device-type templates sometimes store each physical member's ports in a
+    if position is not None and scope.virtual_chassis is None:
+        return None, owner, (
+            f"{discovered_name}: no exact/canonical interface exists on "
+            f"single-device stack {owner.name!r}; a Virtual Chassis is "
+            "required only when stack members are separate NetBox devices"
+        )
+
+    # Device-type templates sometimes store a VC member's ports in a
     # member-local form (Gi1/0/3 or Gi0/3), even when IOS reports Gi2/0/3.
     alias_matches: dict[int, Any] = {}
     for alias in local_stack_aliases(discovered_name):
@@ -750,45 +951,80 @@ def current_interface_state(interface: Any) -> dict[str, Any]:
 
 def desired_netbox_state(
     discovered: InterfaceVlanState,
-    device: Any,
-    vlan_cache: dict[int, list[Any]],
-) -> tuple[dict[str, Any] | None, str | None]:
+    current: dict[str, Any],
+    context: DeviceScopeContext,
+    vlan_cache: VlanCache,
+) -> tuple[dict[str, Any] | None, str | None, list[str]]:
     """Translate collected VLAN IDs to unambiguous NetBox object IDs."""
 
-    required_vids = set(discovered.tagged_vlans)
-    if discovered.untagged_vlan is not None:
-        required_vids.add(discovered.untagged_vlan)
-
     resolved: dict[int, Any] = {}
-    errors: list[str] = []
-    for vlan_id in sorted(required_vids):
-        vlan, error = resolve_vlan(vlan_cache, vlan_id, device)
+    preferred_ids = set(current["tagged_vlans"])
+    if current["untagged_vlan"] is not None:
+        preferred_ids.add(current["untagged_vlan"])
+
+    fatal_errors: list[str] = []
+    tagged_errors: list[str] = []
+
+    if discovered.untagged_vlan is not None:
+        vlan, error = resolve_vlan(
+            vlan_cache,
+            discovered.untagged_vlan,
+            context,
+            preferred_ids,
+        )
         if error:
-            errors.append(error)
+            fatal_errors.append(error)
+        elif vlan is not None:
+            resolved[discovered.untagged_vlan] = vlan
+
+    for vlan_id in discovered.tagged_vlans:
+        vlan, error = resolve_vlan(
+            vlan_cache,
+            vlan_id,
+            context,
+            preferred_ids,
+        )
+        if error:
+            tagged_errors.append(error)
         elif vlan is not None:
             resolved[vlan_id] = vlan
 
-    if errors:
-        return None, "; ".join(errors)
+    if fatal_errors:
+        return None, "; ".join(fatal_errors), []
 
     untagged = (
         resolved[discovered.untagged_vlan]
         if discovered.untagged_vlan is not None
         else None
     )
+    tagged_ids = {
+        int(resolved[vlan_id].id)
+        for vlan_id in discovered.tagged_vlans
+        if vlan_id in resolved
+    }
+    warnings: list[str] = []
+    if tagged_errors:
+        # Do not reject the entire trunk because one permitted VLAN is absent
+        # or ambiguous. Add every VLAN we can resolve, but preserve all current
+        # tagged assignments so incomplete source data cannot remove anything.
+        tagged_ids.update(current["tagged_vlans"])
+        warnings.append(
+            "some tagged VLANs could not be resolved; resolvable VLANs were "
+            "applied and existing tagged assignments were preserved: "
+            + "; ".join(tagged_errors)
+        )
+
     return {
         "mode": discovered.mode,
         "untagged_vlan": related_id(untagged),
-        "tagged_vlans": sorted(
-            int(resolved[vlan_id].id) for vlan_id in discovered.tagged_vlans
-        ),
-    }, None
+        "tagged_vlans": sorted(tagged_ids),
+    }, None, warnings
 
 
 def sync_device(
     nb: Any,
     collected: CollectedDevice,
-    vlan_cache: dict[int, list[Any]],
+    vlan_cache: VlanCache,
     dry_run: bool,
 ) -> SyncSummary:
     """Compare one device and apply only the necessary interface updates."""
@@ -796,6 +1032,7 @@ def sync_device(
     device = resolve_device(nb, collected)
     summary = SyncSummary(device=str(device.name), dry_run=dry_run)
     scope = build_interface_search_scope(nb, device, collected)
+    contexts_by_device_id: dict[int, DeviceScopeContext] = {}
 
     for discovered in collected.interfaces:
         interface, owner, error = match_scoped_interface(discovered.name, scope)
@@ -804,15 +1041,30 @@ def sync_device(
             summary.errors.append(error)
             continue
 
-        desired, error = desired_netbox_state(discovered, owner, vlan_cache)
+        current = current_interface_state(interface)
+        owner_id = int(owner.id)
+        context = contexts_by_device_id.get(owner_id)
+        if context is None:
+            context = build_device_scope_context(nb, owner)
+            contexts_by_device_id[owner_id] = context
+
+        desired, error, warnings = desired_netbox_state(
+            discovered,
+            current,
+            context,
+            vlan_cache,
+        )
         if error:
             summary.skipped += 1
             summary.errors.append(
                 f"{owner.name}/{discovered.name}: {error}"
             )
             continue
+        summary.warnings.extend(
+            f"{owner.name}/{discovered.name}: {warning}"
+            for warning in warnings
+        )
 
-        current = current_interface_state(interface)
         if current == desired:
             summary.unchanged += 1
             continue
@@ -893,10 +1145,12 @@ def print_sync_summary(summary: SyncSummary) -> None:
     print(
         f"\n[{label}] {summary.device}: {update_label}={summary.updated} "
         f"unchanged={summary.unchanged} skipped={summary.skipped} "
-        f"errors={len(summary.errors)}"
+        f"warnings={len(summary.warnings)} errors={len(summary.errors)}"
     )
     for change in summary.changes:
         print(f"  CHANGE: {change}")
+    for warning in summary.warnings:
+        print(f"  WARNING: {warning}")
     for error in summary.errors:
         print(f"  ERROR: {error}")
 
