@@ -5,9 +5,11 @@
 Workflow:
     1. Load the NetBox-backed Nornir inventory.
     2. Select devices carrying the requested NetBox tag.
-    3. Collect access and trunk VLAN state from those devices.
-    4. Compare that state with each NetBox interface.
-    5. Update only interfaces whose VLAN state differs.
+    3. Collect access, voice, and trunk VLAN state from those devices.
+    4. Resolve duplicate voice VLAN IDs using each VLAN SVI address and the
+       prefixes assigned to candidate VLANs in NetBox.
+    5. Compare that state with each NetBox interface.
+    6. Update only interfaces whose VLAN state differs.
 
 The script does not create VLANs or interfaces. Missing or ambiguous NetBox
 objects are reported and skipped so that partial assignments are never made.
@@ -16,6 +18,7 @@ objects are reported and skipped so that partial assignments are never made.
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import logging
 import os
 import re
@@ -35,6 +38,7 @@ from nornir_utils.plugins.functions import print_result
 DEFAULT_TAG = "nornirtest"
 SHOW_VLAN = "show vlan brief"
 SHOW_TRUNKS = "show interfaces trunk"
+SHOW_SWITCHPORTS = "show interfaces switchport"
 
 LOGGER = logging.getLogger(__name__)
 
@@ -52,6 +56,18 @@ class InterfaceVlanState:
     mode: str
     untagged_vlan: int | None = None
     tagged_vlans: tuple[int, ...] = ()
+    voice_vlan: int | None = None
+
+
+@dataclass
+class SwitchportState:
+    """Access and auxiliary voice VLANs reported for one switchport."""
+
+    name: str
+    administrative_mode: str = ""
+    operational_mode: str = ""
+    access_vlan: int | None = None
+    voice_vlan: int | None = None
 
 
 @dataclass
@@ -70,6 +86,7 @@ class CollectedDevice:
     inventory_name: str
     netbox_device_id: int | None
     interfaces: list[InterfaceVlanState]
+    vlan_svi_addresses: dict[int, tuple[str, ...]] = field(default_factory=dict)
 
 
 @dataclass
@@ -105,6 +122,7 @@ class VlanCache:
     by_vid: dict[int, list[Any]]
     by_id: dict[int, Any]
     groups_by_id: dict[int, Any]
+    prefixes_by_vlan_id: dict[int, list[Any]] = field(default_factory=dict)
 
 
 @dataclass
@@ -277,7 +295,83 @@ def parse_trunks(output: str) -> dict[str, TrunkState]:
     return trunks
 
 
-def build_collected_state(vlan_output: str, trunk_output: str) -> list[InterfaceVlanState]:
+def parse_switchports(output: str) -> dict[str, SwitchportState]:
+    """Parse access and voice VLANs from ``show interfaces switchport``."""
+
+    switchports: dict[str, SwitchportState] = {}
+    current: SwitchportState | None = None
+
+    name_line = re.compile(r"^\s*Name:\s*(?P<name>\S+)\s*$", re.IGNORECASE)
+    mode_line = re.compile(
+        r"^\s*Operational Mode:\s*(?P<mode>.+?)\s*$",
+        re.IGNORECASE,
+    )
+    administrative_mode_line = re.compile(
+        r"^\s*Administrative Mode:\s*(?P<mode>.+?)\s*$",
+        re.IGNORECASE,
+    )
+    access_line = re.compile(
+        r"^\s*Access Mode VLAN:\s*(?P<vid>\d+|\S+)",
+        re.IGNORECASE,
+    )
+    voice_line = re.compile(
+        r"^\s*Voice VLAN:\s*(?P<vid>\d+|\S+)",
+        re.IGNORECASE,
+    )
+
+    for raw_line in output.splitlines():
+        match = name_line.match(raw_line)
+        if match:
+            name = match.group("name")
+            current = SwitchportState(name=name)
+            switchports[name.casefold()] = current
+            continue
+        if current is None:
+            continue
+
+        match = administrative_mode_line.match(raw_line)
+        if match:
+            current.administrative_mode = match.group("mode").strip()
+            continue
+        match = mode_line.match(raw_line)
+        if match:
+            current.operational_mode = match.group("mode").strip()
+            continue
+        match = access_line.match(raw_line)
+        if match:
+            value = match.group("vid")
+            current.access_vlan = int(value) if value.isdigit() else None
+            continue
+        match = voice_line.match(raw_line)
+        if match:
+            value = match.group("vid")
+            current.voice_vlan = int(value) if value.isdigit() else None
+
+    return switchports
+
+
+def parse_svi_addresses(output: str) -> tuple[str, ...]:
+    """Return routed addresses shown for a Cisco VLAN interface."""
+
+    address_pattern = re.compile(
+        r"(?:Internet address is|Secondary address(?: is)?)\s+"
+        r"(?P<address>(?:\d{1,3}\.){3}\d{1,3}/\d{1,2})",
+        re.IGNORECASE,
+    )
+    addresses: set[str] = set()
+    for match in address_pattern.finditer(output):
+        try:
+            addresses.add(str(ipaddress.ip_interface(match.group("address"))))
+        except ValueError:
+            LOGGER.warning("Ignoring invalid SVI address %r", match.group("address"))
+    return tuple(sorted(addresses))
+
+
+def build_collected_state(
+    vlan_output: str,
+    trunk_output: str,
+    switchport_output: str,
+) -> list[InterfaceVlanState]:
     """Combine command output into one desired state per discovered interface."""
 
     desired: dict[str, InterfaceVlanState] = {}
@@ -286,6 +380,33 @@ def build_collected_state(vlan_output: str, trunk_output: str) -> list[Interface
             name=interface,
             mode="access",
             untagged_vlan=vlan_id,
+        )
+
+    # show vlan brief can list a phone port under both its data and voice
+    # VLANs, making a dict-based parse dependent on row order. The switchport
+    # output is authoritative because it labels both roles explicitly.
+    for switchport in parse_switchports(switchport_output).values():
+        if "trunk" in (
+            switchport.administrative_mode + " " + switchport.operational_mode
+        ).casefold():
+            continue
+        if switchport.access_vlan is None and switchport.voice_vlan is None:
+            continue
+
+        tagged = (
+            (switchport.voice_vlan,)
+            if switchport.voice_vlan is not None
+            and switchport.voice_vlan != switchport.access_vlan
+            else ()
+        )
+        desired[switchport.name.casefold()] = InterfaceVlanState(
+            name=switchport.name,
+            # A data+voice port carries the data VLAN untagged and the voice
+            # VLAN tagged, which NetBox represents with mode="tagged".
+            mode="tagged" if tagged else "access",
+            untagged_vlan=switchport.access_vlan,
+            tagged_vlans=tagged,
+            voice_vlan=switchport.voice_vlan,
         )
 
     for interface, trunk in parse_trunks(trunk_output).items():
@@ -305,12 +426,13 @@ def build_collected_state(vlan_output: str, trunk_output: str) -> list[Interface
             mode="tagged",
             untagged_vlan=trunk.native_vlan,
             tagged_vlans=tuple(tagged),
+            voice_vlan=None,
         )
 
     return sorted(desired.values(), key=lambda item: interface_sort_key(item.name))
 
 
-def collect_device_state(task: Task) -> Result:
+def collect_device_state(task: Task, ambiguous_vlan_ids: set[int]) -> Result:
     """Nornir task: collect and parse VLAN state from one device."""
 
     vlan_result = task.run(
@@ -325,6 +447,29 @@ def collect_device_state(task: Task) -> Result:
         command_string=SHOW_TRUNKS,
         read_timeout=60,
     )
+    switchport_result = task.run(
+        task=netmiko_send_command,
+        name=SHOW_SWITCHPORTS,
+        command_string=SHOW_SWITCHPORTS,
+        read_timeout=90,
+    )
+
+    switchport_output = str(switchport_result.result)
+    voice_vlan_ids = {
+        switchport.voice_vlan
+        for switchport in parse_switchports(switchport_output).values()
+        if switchport.voice_vlan is not None
+    }
+    vlan_svi_addresses: dict[int, tuple[str, ...]] = {}
+    for vlan_id in sorted(voice_vlan_ids & ambiguous_vlan_ids):
+        command = f"show interfaces vlan {vlan_id}"
+        svi_result = task.run(
+            task=netmiko_send_command,
+            name=command,
+            command_string=command,
+            read_timeout=60,
+        )
+        vlan_svi_addresses[vlan_id] = parse_svi_addresses(str(svi_result.result))
 
     collected = CollectedDevice(
         inventory_name=task.host.name,
@@ -332,7 +477,9 @@ def collect_device_state(task: Task) -> Result:
         interfaces=build_collected_state(
             str(vlan_result.result),
             str(trunk_result.result),
+            switchport_output,
         ),
+        vlan_svi_addresses=vlan_svi_addresses,
     )
     return Result(host=task.host, result=collected, changed=False)
 
@@ -584,6 +731,91 @@ def build_vlan_cache(nb: Any) -> VlanCache:
     )
 
 
+def load_vlan_prefixes(
+    nb: Any,
+    cache: VlanCache,
+    vlan_ids: Iterable[int],
+) -> None:
+    """Cache NetBox prefixes for duplicate VLAN candidates used by SVI matching."""
+
+    candidate_object_ids = {
+        int(vlan.id)
+        for vid in set(vlan_ids)
+        for vlan in cache.by_vid.get(vid, [])
+        if len(cache.by_vid.get(vid, [])) > 1
+    }
+    for object_id in sorted(candidate_object_ids):
+        if object_id in cache.prefixes_by_vlan_id:
+            continue
+        cache.prefixes_by_vlan_id[object_id] = list(
+            nb.ipam.prefixes.filter(vlan_id=object_id)
+        )
+
+
+def resolve_vlan_from_svi(
+    cache: VlanCache,
+    vlan_id: int,
+    candidates: list[Any],
+    svi_addresses: tuple[str, ...],
+) -> tuple[Any | None, str | None]:
+    """Resolve a duplicate VID using the SVI address and VLAN-linked prefixes."""
+
+    if not svi_addresses:
+        return None, (
+            f"VLAN {vlan_id} is ambiguous and show interfaces vlan {vlan_id} "
+            "returned no routed IP address"
+        )
+
+    parsed_addresses: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
+    for value in svi_addresses:
+        try:
+            parsed_addresses.append(ipaddress.ip_interface(value).ip)
+        except ValueError:
+            continue
+
+    matches: list[Any] = []
+    candidate_details: list[str] = []
+    for vlan in candidates:
+        prefixes = cache.prefixes_by_vlan_id.get(int(vlan.id), [])
+        prefix_values = [str(prefix.prefix) for prefix in prefixes]
+        candidate_details.append(
+            f"ID {vlan.id} prefixes={prefix_values or ['none']}"
+        )
+        matched = False
+        for prefix_value in prefix_values:
+            try:
+                network = ipaddress.ip_network(prefix_value, strict=False)
+            except ValueError:
+                continue
+            if any(
+                address.version == network.version and address in network
+                for address in parsed_addresses
+            ):
+                matched = True
+                break
+        if matched:
+            matches.append(vlan)
+
+    if len(matches) == 1:
+        LOGGER.info(
+            "Resolved duplicate voice VLAN %d to NetBox VLAN ID %s using SVI %s",
+            vlan_id,
+            matches[0].id,
+            ", ".join(svi_addresses),
+        )
+        return matches[0], None
+
+    outcome = "no candidates matched" if not matches else (
+        "multiple candidates matched: "
+        + ", ".join(str(vlan.id) for vlan in matches)
+    )
+    return None, (
+        f"VLAN {vlan_id} remains ambiguous after SVI lookup "
+        f"({', '.join(svi_addresses)}): {outcome}; "
+        + "; ".join(candidate_details)
+    )
+
+
 def vlan_scope_key(
     vlan: Any,
     cache: VlanCache,
@@ -686,10 +918,17 @@ def resolve_vlan(
     vlan_id: int,
     context: DeviceScopeContext,
     preferred_ids: set[int] | None = None,
+    svi_addresses: tuple[str, ...] | None = None,
 ) -> tuple[Any | None, str | None]:
     candidates = cache.by_vid.get(vlan_id, [])
     if not candidates:
         return None, f"VLAN {vlan_id} does not exist in NetBox"
+
+    # Voice VLANs with duplicate VIDs are resolved from live SVI addressing,
+    # even if an existing interface assignment or broad scope could otherwise
+    # hide an incorrect choice.
+    if len(candidates) > 1 and svi_addresses is not None:
+        return resolve_vlan_from_svi(cache, vlan_id, candidates, svi_addresses)
 
     preferred = [
         vlan
@@ -954,6 +1193,7 @@ def desired_netbox_state(
     current: dict[str, Any],
     context: DeviceScopeContext,
     vlan_cache: VlanCache,
+    vlan_svi_addresses: dict[int, tuple[str, ...]],
 ) -> tuple[dict[str, Any] | None, str | None, list[str]]:
     """Translate collected VLAN IDs to unambiguous NetBox object IDs."""
 
@@ -978,14 +1218,21 @@ def desired_netbox_state(
             resolved[discovered.untagged_vlan] = vlan
 
     for vlan_id in discovered.tagged_vlans:
+        is_voice_vlan = vlan_id == discovered.voice_vlan
         vlan, error = resolve_vlan(
             vlan_cache,
             vlan_id,
             context,
             preferred_ids,
+            # An empty tuple is intentional: for an ambiguous voice VID it
+            # causes a hard error stating that the SVI had no routed address.
+            vlan_svi_addresses.get(vlan_id, ()) if is_voice_vlan else None,
         )
         if error:
-            tagged_errors.append(error)
+            if is_voice_vlan:
+                fatal_errors.append(error)
+            else:
+                tagged_errors.append(error)
         elif vlan is not None:
             resolved[vlan_id] = vlan
 
@@ -1053,6 +1300,7 @@ def sync_device(
             current,
             context,
             vlan_cache,
+            collected.vlan_svi_addresses,
         )
         if error:
             summary.skipped += 1
@@ -1199,9 +1447,16 @@ def main() -> int:
             LOGGER.error("No tagged devices matched the Nornir inventory")
             return 1
 
+        vlan_cache = build_vlan_cache(nb)
+        ambiguous_vlan_ids = {
+            vlan_id
+            for vlan_id, candidates in vlan_cache.by_vid.items()
+            if len(candidates) > 1
+        }
         results = selected.run(
             task=collect_device_state,
             name="Collect interface VLAN state",
+            ambiguous_vlan_ids=ambiguous_vlan_ids,
         )
         collected_devices: list[CollectedDevice] = []
         for host_name, multi_result in results.items():
@@ -1223,7 +1478,12 @@ def main() -> int:
             )
             collected_devices.append(collected)
 
-        vlan_cache = build_vlan_cache(nb)
+        voice_vlan_ids = {
+            vlan_id
+            for collected in collected_devices
+            for vlan_id in collected.vlan_svi_addresses
+        }
+        load_vlan_prefixes(nb, vlan_cache, voice_vlan_ids)
         for collected in collected_devices:
             try:
                 summary = sync_device(
