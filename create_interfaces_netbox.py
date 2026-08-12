@@ -1,35 +1,37 @@
 #!/usr/bin/env python3
-"""Discover a device's interfaces and create missing NetBox interface objects."""
+"""Discover interfaces with Nornir and create missing NetBox interfaces."""
 
 from __future__ import annotations
 
 import argparse
-import getpass
 import logging
 import os
 import re
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Iterable
 
 import pynetbox
-from netmiko import ConnectHandler
+from nornir import InitNornir
+from nornir.core.configuration import Config
+from nornir.core.task import Result, Task
+from nornir_netmiko.tasks import netmiko_send_command
 
 
-LOG = logging.getLogger("sync_device_interfaces")
+LOGGER = logging.getLogger(__name__)
+DEFAULT_CONFIG = Path(__file__).resolve().with_name("config.yaml")
 
-# NetBox interface types. The mapping is intentionally conservative; unknown
-# names are created as "other" rather than assigned a potentially wrong type.
 TYPE_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"^(?:lo|loopback)", re.I), "virtual"),
     (re.compile(r"^(?:vlan|bdi|irb|tunnel|tun|port-channel|po)", re.I), "virtual"),
     (re.compile(r"^(?:fa|fastethernet)", re.I), "100base-tx"),
+    (re.compile(r"^(?:fi|fivegigabitethernet)", re.I), "5gbase-t"),
     (re.compile(r"^(?:gi|gigabitethernet)", re.I), "1000base-t"),
-    (re.compile(r"^(?:te|tengigabitethernet|ten-gigabitethernet)", re.I), "10gbase-x-sfpp"),
-    (re.compile(r"^(?:tw|twentyfivegige|twentyfivegigabitethernet)", re.I), "25gbase-x-sfp28"),
-    (re.compile(r"^(?:fo|fortygigabitethernet)", re.I), "40gbase-x-qsfpp"),
+    (re.compile(r"^(?:te|tengigabitethernet)", re.I), "10gbase-x-sfpp"),
+    (re.compile(r"^(?:tw|twe|twentyfivegige|twentyfivegigabitethernet)", re.I), "25gbase-x-sfp28"),
+    (re.compile(r"^(?:fo|fortygige|fortygigabitethernet)", re.I), "40gbase-x-qsfpp"),
     (re.compile(r"^(?:hu|hundredgige|hundredgigabitethernet)", re.I), "100gbase-x-qsfp28"),
-    (re.compile(r"^(?:eth|ethernet)", re.I), "other"),
 )
 
 
@@ -40,82 +42,95 @@ class DiscoveredInterface:
     enabled: bool = True
 
 
-def parse_args() -> argparse.Namespace:
+def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Create interfaces in NetBox that exist on a network device but not in NetBox."
+        description=(
+            "Use the Nornir inventory to discover one device's interfaces and "
+            "create the missing interface objects in NetBox."
+        )
     )
-    parser.add_argument("device", help="Existing NetBox device name")
-    parser.add_argument("--apply", action="store_true", help="Create missing interfaces (default is dry-run)")
-    parser.add_argument("--username", default=os.getenv("DEVICE_USERNAME"), help="SSH username")
-    parser.add_argument("--password", default=os.getenv("DEVICE_PASSWORD"), help="SSH password")
-    parser.add_argument("--secret", default=os.getenv("DEVICE_SECRET"), help="Optional enable secret")
-    parser.add_argument("--address", help="Override the device's NetBox primary IP/DNS name")
-    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    parser.add_argument("--netmiko-type", help="Override Netmiko device_type derived from NetBox platform")
-    parser.add_argument("--include-virtual", action="store_true", help="Include loopbacks, VLANs, tunnels, etc.")
-    parser.add_argument("--no-verify-tls", action="store_true", help="Disable NetBox TLS certificate verification")
+    parser.add_argument("device", help="Nornir inventory/NetBox device name")
+    parser.add_argument(
+        "--config",
+        default=str(DEFAULT_CONFIG),
+        help="Nornir configuration file (default: config.yaml beside this script)",
+    )
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Create missing interfaces; the default is a dry run",
+    )
+    parser.add_argument(
+        "--include-virtual",
+        action="store_true",
+        help="Include loopbacks, VLANs, tunnels, and port-channels",
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
     return parser.parse_args()
 
 
-def required_env(name: str) -> str:
-    value = os.getenv(name)
-    if not value:
-        raise ValueError(f"Required environment variable {name} is not set")
+def required_environment() -> tuple[str, str, str]:
+    names = ("NB_TOKEN", "NORNIR_USERNAME", "NORNIR_PASSWORD")
+    values = tuple(os.getenv(name) or "" for name in names)
+    missing = [name for name, value in zip(names, values) if not value]
+    if missing:
+        raise RuntimeError(
+            "Required environment variable(s) are missing: " + ", ".join(missing)
+        )
+    return values  # type: ignore[return-value]
+
+
+def load_inventory_options(config_file: str, token: str) -> dict[str, Any]:
+    """Read NetBox settings from the Nornir config and inject the API token."""
+    config_path = Path(config_file).expanduser().resolve()
+    try:
+        options = dict(Config.from_file(str(config_path)).inventory.options)
+    except Exception as exc:
+        raise RuntimeError(f"Unable to load Nornir config {config_path}: {exc}") from exc
+
+    netbox_url = str(options.get("nb_url") or "").strip().rstrip("/")
+    if not netbox_url.startswith(("http://", "https://")):
+        raise RuntimeError(
+            f"inventory.options.nb_url in {config_path} must start with http:// or https://"
+        )
+    options["nb_url"] = netbox_url
+    options["nb_token"] = token
+    return options
+
+
+def ssl_verify_setting(value: Any) -> bool | str:
+    if not isinstance(value, str):
+        return bool(value)
+    normalized = value.strip().casefold()
+    if normalized in {"false", "no", "0", "off"}:
+        return False
+    if normalized in {"true", "yes", "1", "on"}:
+        return True
     return value
 
 
-def record_value(value: Any, attribute: str = "value") -> Any:
-    """Read a field from pynetbox Record, dict, or primitive values."""
-    if value is None:
-        return None
-    if isinstance(value, dict):
-        return value.get(attribute)
-    return getattr(value, attribute, value)
-
-
-def device_address(device: Any, override: str | None) -> str:
-    if override:
-        return override
-    primary_ip = getattr(device, "primary_ip", None)
-    address = record_value(primary_ip, "address")
-    if address:
-        return str(address).split("/", maxsplit=1)[0]
-    if getattr(device, "name", None):
-        return str(device.name)
-    raise ValueError("The device has no primary IP or usable name; supply --address")
-
-
-def netmiko_device_type(device: Any, override: str | None) -> str:
-    if override:
-        return override
-    platform = getattr(device, "platform", None)
-    slug = record_value(platform, "slug")
-    if not slug:
-        raise ValueError("The NetBox device has no platform; supply --netmiko-type")
-    aliases = {
-        "ios": "cisco_ios",
-        "ios-xe": "cisco_xe",
-        "iosxe": "cisco_xe",
-        "nx-os": "cisco_nxos",
-        "nxos": "cisco_nxos",
-        "eos": "arista_eos",
-        "junos": "juniper_junos",
-    }
-    return aliases.get(str(slug).lower(), str(slug))
+def create_netbox_client(options: dict[str, Any], token: str) -> Any:
+    netbox = pynetbox.api(options["nb_url"], token=token)
+    netbox.http_session.verify = ssl_verify_setting(options.get("ssl_verify", True))
+    return netbox
 
 
 def normalize_name(name: str) -> str:
-    """Normalize common long/short interface prefixes for comparison."""
     compact = re.sub(r"\s+", "", name).casefold()
     prefixes = {
         "hundredgigabitethernet": "hu",
+        "hundredgige": "hu",
         "fortygigabitethernet": "fo",
-        "twentyfivegigabitethernet": "tw",
+        "fortygige": "fo",
+        "twentyfivegigabitethernet": "twe",
+        "twentyfivegige": "twe",
         "tengigabitethernet": "te",
+        "tengige": "te",
         "gigabitethernet": "gi",
         "fastethernet": "fa",
+        "fivegigabitethernet": "fi",
         "port-channel": "po",
+        "portchannel": "po",
         "loopback": "lo",
         "ethernet": "eth",
     }
@@ -132,15 +147,11 @@ def interface_type(name: str) -> str:
     return "other"
 
 
-def is_virtual(name: str) -> bool:
-    return interface_type(name) == "virtual"
-
-
 def parse_interfaces(rows: Any, include_virtual: bool) -> list[DiscoveredInterface]:
     if not isinstance(rows, list):
         raise ValueError(
-            "Netmiko did not return structured data. Install ntc-templates and ensure "
-            "the platform supports the 'show interfaces' TextFSM template."
+            "The command did not return structured TextFSM data. Verify that "
+            "ntc-templates supports 'show interfaces' for this Netmiko platform."
         )
 
     discovered: dict[str, DiscoveredInterface] = {}
@@ -148,20 +159,68 @@ def parse_interfaces(rows: Any, include_virtual: bool) -> list[DiscoveredInterfa
         if not isinstance(row, dict):
             continue
         name = str(row.get("interface") or row.get("port") or "").strip()
-        if not name or (is_virtual(name) and not include_virtual):
+        if not name:
             continue
-        description = str(row.get("description") or "").strip()
-        link_status = str(row.get("link_status") or row.get("status") or "").casefold()
-        enabled = link_status not in {"administratively down", "admin down", "disabled"}
-        discovered.setdefault(normalize_name(name), DiscoveredInterface(name, description, enabled))
+        netbox_type = interface_type(name)
+        if netbox_type == "virtual" and not include_virtual:
+            continue
+        status = str(row.get("link_status") or row.get("status") or "").casefold()
+        discovered.setdefault(
+            normalize_name(name),
+            DiscoveredInterface(
+                name=name,
+                description=str(row.get("description") or "").strip(),
+                enabled=status not in {"administratively down", "admin down", "disabled"},
+            ),
+        )
     return sorted(discovered.values(), key=lambda item: normalize_name(item.name))
 
 
-def discover_interfaces(connection: dict[str, Any], include_virtual: bool) -> list[DiscoveredInterface]:
-    LOG.info("Connecting to %s", connection["host"])
-    with ConnectHandler(**connection) as session:
-        rows = session.send_command("show interfaces", use_textfsm=True)
-    return parse_interfaces(rows, include_virtual)
+def collect_interfaces(task: Task, include_virtual: bool) -> Result:
+    command_result = task.run(
+        task=netmiko_send_command,
+        name="Discover device interfaces",
+        command_string="show interfaces",
+        use_textfsm=True,
+        read_timeout=120,
+    )
+    interfaces = parse_interfaces(command_result.result, include_virtual)
+    return Result(host=task.host, result=interfaces, changed=False)
+
+
+def find_discovered_result(multi_result: Any) -> list[DiscoveredInterface] | None:
+    for item in multi_result:
+        if (
+            isinstance(item.result, list)
+            and all(isinstance(value, DiscoveredInterface) for value in item.result)
+        ):
+            return item.result
+    return None
+
+
+def find_inventory_host(nr: Any, requested_name: str) -> Any:
+    matches = [
+        host
+        for host in nr.inventory.hosts.values()
+        if host.name.casefold() == requested_name.casefold()
+        or str(host.get("netbox_device_name") or "").casefold()
+        == requested_name.casefold()
+    ]
+    if not matches:
+        raise RuntimeError(f"Device {requested_name!r} is not in the Nornir inventory")
+    if len(matches) > 1:
+        raise RuntimeError(f"Device name {requested_name!r} matched multiple inventory hosts")
+    return matches[0]
+
+
+def get_netbox_device(netbox: Any, host: Any) -> Any:
+    device_id = host.get("netbox_device_id") or host.get("device_id") or host.get("id")
+    device = netbox.dcim.devices.get(device_id) if device_id else None
+    if device is None:
+        device = netbox.dcim.devices.get(name=host.name)
+    if device is None:
+        raise RuntimeError(f"No NetBox device object matched Nornir host {host.name!r}")
+    return device
 
 
 def existing_interfaces(netbox: Any, device_id: int) -> dict[str, Any]:
@@ -171,10 +230,12 @@ def existing_interfaces(netbox: Any, device_id: int) -> dict[str, Any]:
     }
 
 
-def create_missing(netbox: Any, device: Any, interfaces: Iterable[DiscoveredInterface]) -> int:
+def create_missing(
+    netbox: Any, device_id: int, interfaces: Iterable[DiscoveredInterface]
+) -> int:
     payload = [
         {
-            "device": device.id,
+            "device": device_id,
             "name": interface.name,
             "type": interface_type(interface.name),
             "enabled": interface.enabled,
@@ -184,70 +245,82 @@ def create_missing(netbox: Any, device: Any, interfaces: Iterable[DiscoveredInte
     ]
     if not payload:
         return 0
-
-    # A single REST bulk request avoids leaving a partially-created set when
-    # NetBox rejects one of the records.
     created = netbox.dcim.interfaces.create(payload)
     return len(created) if isinstance(created, list) else 1
 
 
 def main() -> int:
-    args = parse_args()
+    args = parse_arguments()
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(levelname)s: %(message)s",
     )
 
+    nr = None
     try:
-        netbox = pynetbox.api(required_env("NETBOX_URL"), token=required_env("NETBOX_TOKEN"))
-        netbox.http_session.verify = not args.no_verify_tls
-        device = netbox.dcim.devices.get(name=args.device)
-        if device is None:
-            raise ValueError(f"No NetBox device named {args.device!r} was found")
+        token, username, password = required_environment()
+        options = load_inventory_options(args.config, token)
+        nr = InitNornir(
+            config_file=args.config,
+            inventory={"options": options},
+        )
+        nr.inventory.defaults.username = username
+        nr.inventory.defaults.password = password
 
-        username = args.username or input("Device username: ").strip()
-        password = args.password or getpass.getpass("Device password: ")
-        if not username or not password:
-            raise ValueError("Device username and password are required")
+        host = find_inventory_host(nr, args.device)
+        selected = nr.filter(filter_func=lambda candidate: candidate is host)
+        LOGGER.info(
+            "Collecting %s (%s), platform=%s",
+            host.name,
+            host.hostname,
+            host.platform,
+        )
+        results = selected.run(
+            task=collect_interfaces,
+            name="Collect interfaces for NetBox comparison",
+            include_virtual=args.include_virtual,
+        )
+        host_result = results[host.name]
+        if host_result.failed:
+            error = host_result.exception or "interface collection failed"
+            raise RuntimeError(f"{host.name}: {error}")
+        discovered = find_discovered_result(host_result)
+        if discovered is None:
+            raise RuntimeError(f"{host.name}: collection returned no interface list")
 
-        connection: dict[str, Any] = {
-            "device_type": netmiko_device_type(device, args.netmiko_type),
-            "host": device_address(device, args.address),
-            "username": username,
-            "password": password,
-            "port": args.port,
-        }
-        if args.secret:
-            connection["secret"] = args.secret
-
-        discovered = discover_interfaces(connection, args.include_virtual)
-        existing = existing_interfaces(netbox, device.id)
+        netbox = create_netbox_client(options, token)
+        device = get_netbox_device(netbox, host)
+        existing = existing_interfaces(netbox, int(device.id))
         missing = [item for item in discovered if normalize_name(item.name) not in existing]
 
-        LOG.info(
-            "%s: discovered=%d, already_in_netbox=%d, missing=%d",
+        LOGGER.info(
+            "%s: discovered=%d already_present=%d missing=%d",
             device.name,
             len(discovered),
             len(discovered) - len(missing),
             len(missing),
         )
         for interface in missing:
-            print(f"{'CREATE' if args.apply else 'WOULD CREATE'}  {interface.name}  ({interface_type(interface.name)})")
+            action = "CREATE" if args.apply else "WOULD CREATE"
+            print(f"{action}  {interface.name}  ({interface_type(interface.name)})")
 
         if not missing:
             print("NetBox already contains every discovered interface.")
         elif args.apply:
-            count = create_missing(netbox, device, missing)
+            count = create_missing(netbox, int(device.id), missing)
             print(f"Created {count} interface(s) on NetBox device {device.name}.")
         else:
             print("Dry-run only; rerun with --apply to create the missing interfaces.")
         return 0
-    except (ValueError, pynetbox.core.query.RequestError) as exc:
-        LOG.error("%s", exc)
-        return 2
+    except (RuntimeError, ValueError, pynetbox.core.query.RequestError) as exc:
+        LOGGER.error("%s", exc)
+        return 1
     except KeyboardInterrupt:
-        LOG.error("Cancelled")
+        LOGGER.error("Cancelled")
         return 130
+    finally:
+        if nr is not None:
+            nr.close_connections()
 
 
 if __name__ == "__main__":
