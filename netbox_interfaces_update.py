@@ -75,6 +75,7 @@ class SwitchportState:
     trunk_allowed_vlans: list[int] = field(default_factory=list)
     trunk_allows_all: bool = False
     trunk_allowed_seen: bool = False
+    native_vlan_tagged: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -344,6 +345,11 @@ def parse_switchports(output: str) -> dict[str, SwitchportState]:
         r"^\s*Trunking VLANs Enabled:\s*(?P<vlans>.+?)\s*$",
         re.IGNORECASE,
     )
+    native_tagging_line = re.compile(
+        r"^\s*(?:Administrative )?Native VLAN tagging:\s*"
+        r"(?P<state>enabled|disabled)\s*$",
+        re.IGNORECASE,
+    )
 
     for raw_line in output.splitlines():
         match = name_line.match(raw_line)
@@ -384,6 +390,12 @@ def parse_switchports(output: str) -> dict[str, SwitchportState]:
             current.trunk_allowed_seen = True
             current.trunk_allows_all = expression in {"all", "1-4094"}
             current.trunk_allowed_vlans = expand_vlan_list(expression)
+            continue
+        match = native_tagging_line.match(raw_line)
+        if match:
+            current.native_vlan_tagged = (
+                match.group("state").casefold() == "enabled"
+            )
 
     return switchports
 
@@ -567,6 +579,7 @@ def build_collected_state(
     trunk_output: str,
     switchport_output: str,
     voice_vlan_model: str = "access",
+    access_vlan_placement: str = "clear",
 ) -> list[InterfaceVlanState]:
     """Combine Cisco output into one NetBox VLAN state per interface.
 
@@ -574,14 +587,18 @@ def build_collected_state(
     port remains NetBox access and only its untagged data VLAN is assigned.
     ``voice_vlan_model=tagged`` models data+voice framing instead, using NetBox
     tagged mode so the auxiliary voice VLAN can also be assigned.
+    ``access_vlan_placement=clear`` explicitly removes NetBox's untagged VLAN
+    from access-mode ports; ``untagged`` records Cisco's access VLAN there.
     """
 
-    desired: dict[str, InterfaceVlanState] = {}
+    desired: dict[tuple[str, str], InterfaceVlanState] = {}
     for interface, vlan_id in parse_vlan_brief(vlan_output).items():
-        desired[interface.casefold()] = InterfaceVlanState(
+        desired[interface_signature(interface)] = InterfaceVlanState(
             name=interface,
             mode="access",
-            untagged_vlan=vlan_id,
+            untagged_vlan=(
+                vlan_id if access_vlan_placement == "untagged" else None
+            ),
         )
 
     trunks = parse_trunks(trunk_output)
@@ -602,7 +619,7 @@ def build_collected_state(
         ).casefold()
 
         if is_trunk:
-            native_vlan = (
+            configured_native_vlan = (
                 trunk.native_vlan
                 if trunk is not None and trunk.native_vlan is not None
                 else switchport.trunk_native_vlan
@@ -626,9 +643,17 @@ def build_collected_state(
                 tagged: list[int] = []
             else:
                 mode = "tagged"
-                tagged = sorted(set(allowed_vlans) - {native_vlan})
+                tagged = sorted(set(allowed_vlans))
 
-            desired[switchport.name.casefold()] = InterfaceVlanState(
+            if switchport.native_vlan_tagged is True:
+                # vlan dot1q tag native: the configured native VLAN is carried
+                # tagged and must never be sent as NetBox untagged_vlan.
+                native_vlan = None
+            else:
+                native_vlan = configured_native_vlan
+                tagged = sorted(set(tagged) - {native_vlan})
+
+            desired[signature] = InterfaceVlanState(
                 name=switchport.name,
                 mode=mode,
                 untagged_vlan=native_vlan,
@@ -648,13 +673,17 @@ def build_collected_state(
             and switchport.voice_vlan != switchport.access_vlan
             else ()
         )
-        desired[switchport.name.casefold()] = InterfaceVlanState(
+        desired[signature] = InterfaceVlanState(
             name=switchport.name,
             # Access is the default because it matches Cisco's switchport mode.
             # NetBox cannot accept tagged_vlans while mode is access, so the
             # optional tagged policy is required to model a voice VLAN here.
             mode="tagged" if voice_tagged else "access",
-            untagged_vlan=switchport.access_vlan,
+            untagged_vlan=(
+                switchport.access_vlan
+                if access_vlan_placement == "untagged"
+                else None
+            ),
             tagged_vlans=voice_tagged,
             voice_vlan=switchport.voice_vlan,
         )
@@ -676,7 +705,7 @@ def build_collected_state(
         else:
             mode = "tagged"
             tagged = sorted(set(trunk.allowed_vlans) - {trunk.native_vlan})
-        desired[interface.casefold()] = InterfaceVlanState(
+        desired[interface_signature(interface)] = InterfaceVlanState(
             name=interface,
             mode=mode,
             untagged_vlan=trunk.native_vlan,
@@ -691,6 +720,7 @@ def collect_device_state(
     task: Task,
     ambiguous_vlan_ids: set[int],
     voice_vlan_model: str,
+    access_vlan_placement: str,
 ) -> Result:
     """Nornir task: collect and parse VLAN state from one device."""
 
@@ -755,6 +785,7 @@ def collect_device_state(
             str(trunk_result.result),
             switchport_output,
             voice_vlan_model=voice_vlan_model,
+            access_vlan_placement=access_vlan_placement,
         ),
         interface_metadata=build_interface_metadata(
             str(status_result.result),
@@ -1729,7 +1760,18 @@ def parse_arguments() -> argparse.Namespace:
         help=(
             "How to model Cisco access ports with a voice VLAN: 'access' "
             "keeps NetBox mode access and omits the tagged voice VLAN "
-            "(default); 'tagged' assigns both data and voice VLANs"
+            "(default); 'tagged' records the voice VLAN in tagged_vlans and "
+            "uses --access-vlan-placement for the data VLAN"
+        ),
+    )
+    parser.add_argument(
+        "--access-vlan-placement",
+        choices=("clear", "untagged"),
+        default="clear",
+        help=(
+            "How to handle Cisco access VLANs in NetBox: 'clear' removes "
+            "untagged_vlan from access ports (default); 'untagged' records "
+            "the Cisco access VLAN as NetBox untagged_vlan"
         ),
     )
     return parser.parse_args()
@@ -1786,6 +1828,13 @@ def main() -> int:
             "access ports; auxiliary tagged voice VLANs are not assigned "
             "because NetBox permits tagged_vlans only in tagged mode"
         )
+    LOGGER.info(
+        "Access VLAN placement is %r%s",
+        args.access_vlan_placement,
+        ": NetBox untagged_vlan will be explicitly cleared on access ports"
+        if args.access_vlan_placement == "clear"
+        else "",
+    )
 
     try:
         nr = InitNornir(
@@ -1830,6 +1879,7 @@ def main() -> int:
             name="Collect interface VLAN state",
             ambiguous_vlan_ids=ambiguous_vlan_ids,
             voice_vlan_model=args.voice_vlan_model,
+            access_vlan_placement=args.access_vlan_placement,
         )
         collected_devices: list[CollectedDevice] = []
         for host_name, multi_result in results.items():
