@@ -584,7 +584,8 @@ def build_collected_state(
     """Combine Cisco output into one NetBox VLAN state per interface.
 
     ``voice_vlan_model=tagged`` models data+voice framing instead, using NetBox
-    tagged mode so the auxiliary voice VLAN is assigned to ``tagged_vlans``.
+    tagged mode. With the default ``access_vlan_placement=clear``, both the
+    access/data VLAN and auxiliary voice VLAN are assigned to ``tagged_vlans``.
     This is the default because NetBox does not permit tagged VLAN assignments
     while an interface's 802.1Q mode is access. ``voice_vlan_model=access`` is
     retained as an opt-in compatibility policy which omits the voice VLAN.
@@ -667,25 +668,36 @@ def build_collected_state(
         if switchport.access_vlan is None and switchport.voice_vlan is None:
             continue
 
-        voice_tagged = (
-            (switchport.voice_vlan,)
-            if voice_vlan_model == "tagged"
-            and switchport.voice_vlan is not None
-            and switchport.voice_vlan != switchport.access_vlan
-            else ()
+        tagged_vlans: set[int] = set()
+        if voice_vlan_model == "tagged" and switchport.voice_vlan is not None:
+            tagged_vlans.add(switchport.voice_vlan)
+            if (
+                access_vlan_placement == "clear"
+                and switchport.access_vlan is not None
+            ):
+                # The requested NetBox model has no untagged VLAN on hybrid
+                # access/voice ports, so retain the data VLAN by assigning it
+                # alongside the voice VLAN in tagged_vlans.
+                tagged_vlans.add(switchport.access_vlan)
+
+        untagged_vlan = (
+            switchport.access_vlan
+            if access_vlan_placement == "untagged"
+            else None
         )
+        if untagged_vlan is not None:
+            # A NetBox VLAN cannot be both tagged and untagged on one port.
+            tagged_vlans.discard(untagged_vlan)
+
+        tagged = tuple(sorted(tagged_vlans))
         desired[signature] = InterfaceVlanState(
             name=switchport.name,
             # Access is the default because it matches Cisco's switchport mode.
             # NetBox cannot accept tagged_vlans while mode is access, so the
             # optional tagged policy is required to model a voice VLAN here.
-            mode="tagged" if voice_tagged else "access",
-            untagged_vlan=(
-                switchport.access_vlan
-                if access_vlan_placement == "untagged"
-                else None
-            ),
-            tagged_vlans=voice_tagged,
+            mode="tagged" if tagged else "access",
+            untagged_vlan=untagged_vlan,
+            tagged_vlans=tagged,
             voice_vlan=switchport.voice_vlan,
         )
 
@@ -1760,8 +1772,9 @@ def parse_arguments() -> argparse.Namespace:
         default="tagged",
         help=(
             "How to model Cisco access ports with a voice VLAN: 'tagged' "
-            "records the voice VLAN in tagged_vlans (default); 'access' "
-            "keeps NetBox mode access but must omit the tagged voice VLAN"
+            "records both access and voice VLANs in tagged_vlans when access "
+            "placement is clear (default); 'access' keeps NetBox mode access "
+            "but must omit the tagged voice VLAN"
         ),
     )
     parser.add_argument(
@@ -1831,8 +1844,8 @@ def main() -> int:
     else:
         LOGGER.info(
             "Voice VLAN policy is 'tagged': Cisco access ports with a voice "
-            "VLAN are modeled as NetBox tagged interfaces so the voice VLAN "
-            "is assigned to tagged_vlans"
+            "VLAN are modeled as NetBox tagged interfaces so their access "
+            "and voice VLANs are assigned to tagged_vlans"
         )
     LOGGER.info(
         "Access VLAN placement is %r%s",
