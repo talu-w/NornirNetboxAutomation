@@ -40,6 +40,7 @@ DEFAULT_TAG = "nornirtest"
 SHOW_VLAN = "show vlan brief"
 SHOW_TRUNKS = "show interfaces trunk"
 SHOW_SWITCHPORTS = "show interfaces switchport"
+SHOW_ETHERCHANNEL_SUMMARY = "show etherchannel summary"
 SHOW_INTERFACE_STATUS = "show interfaces status"
 SHOW_INTERFACE_DESCRIPTIONS = "show interfaces description"
 
@@ -128,6 +129,7 @@ class InterfaceSearchScope:
     master_device: Any
     virtual_chassis: Any | None
     members_by_position: dict[int, Any]
+    devices_by_id: dict[int, Any]
     indexes_by_device_id: dict[
         int,
         tuple[dict[str, list[Any]], dict[tuple[str, str], list[Any]]],
@@ -404,6 +406,25 @@ def parse_switchports(output: str) -> dict[str, SwitchportState]:
             )
 
     return switchports
+
+
+def parse_etherchannel_port_channels(output: str) -> list[str]:
+    """Return aggregate interface names from ``show etherchannel summary``."""
+
+    port_channels: dict[tuple[str, str], str] = {}
+    row_pattern = re.compile(
+        r"^\s*\d+\s+"
+        r"(?P<name>(?:Po|Port-?channel)\s*\d+)"
+        r"(?:\([^)]*\))?(?:\s|$)",
+        re.IGNORECASE,
+    )
+    for line in output.splitlines():
+        match = row_pattern.match(line)
+        if not match:
+            continue
+        name = match.group("name").replace(" ", "")
+        port_channels[interface_signature(name)] = name
+    return sorted(port_channels.values(), key=interface_sort_key)
 
 
 def table_column_starts(
@@ -761,6 +782,12 @@ def collect_device_state(
         command_string=SHOW_SWITCHPORTS,
         read_timeout=90,
     )
+    etherchannel_result = task.run(
+        task=netmiko_send_command,
+        name=SHOW_ETHERCHANNEL_SUMMARY,
+        command_string=SHOW_ETHERCHANNEL_SUMMARY,
+        read_timeout=60,
+    )
     status_result = task.run(
         task=netmiko_send_command,
         name=SHOW_INTERFACE_STATUS,
@@ -775,6 +802,45 @@ def collect_device_state(
     )
 
     switchport_output = str(switchport_result.result)
+    port_channel_names = parse_etherchannel_port_channels(
+        str(etherchannel_result.result)
+    )
+    global_switchports = {
+        interface_signature(switchport.name): switchport
+        for switchport in parse_switchports(switchport_output).values()
+    }
+    targeted_switchport_outputs: list[str] = []
+    for port_channel_name in port_channel_names:
+        global_state = global_switchports.get(interface_signature(port_channel_name))
+        global_mode = (
+            global_state.administrative_mode + " " + global_state.operational_mode
+            if global_state is not None
+            else ""
+        ).casefold()
+        global_state_is_complete = global_state is not None and (
+            global_state.trunk_allowed_seen
+            or ("trunk" not in global_mode and global_state.access_vlan is not None)
+        )
+        if global_state_is_complete:
+            continue
+        command = f"show interfaces {port_channel_name} switchport"
+        LOGGER.info(
+            "%s: querying switchport state for Port-Channel %s because it "
+            "was absent from the global switchport output",
+            task.host.name,
+            port_channel_name,
+        )
+        port_channel_result = task.run(
+            task=netmiko_send_command,
+            name=command,
+            command_string=command,
+            read_timeout=60,
+        )
+        targeted_switchport_outputs.append(str(port_channel_result.result))
+    if targeted_switchport_outputs:
+        switchport_output = "\n".join(
+            [switchport_output, *targeted_switchport_outputs]
+        )
     voice_vlan_ids = {
         switchport.voice_vlan
         for switchport in parse_switchports(switchport_output).values()
@@ -796,16 +862,41 @@ def collect_device_state(
         )
         vlan_svi_addresses[vlan_id] = parse_svi_addresses(str(svi_result.result))
 
+    interfaces = build_collected_state(
+        str(vlan_result.result),
+        str(trunk_result.result),
+        switchport_output,
+        voice_vlan_model=voice_vlan_model,
+        access_vlan_placement=access_vlan_placement,
+    )
+    collected_by_signature = {
+        interface_signature(interface.name): interface
+        for interface in interfaces
+    }
+    for port_channel_name in port_channel_names:
+        state = collected_by_signature.get(interface_signature(port_channel_name))
+        if state is None:
+            LOGGER.warning(
+                "%s/%s: EtherChannel exists but no Layer-2 VLAN state was "
+                "parsed; verify that the Port-Channel is a switchport",
+                task.host.name,
+                port_channel_name,
+            )
+            continue
+        LOGGER.info(
+            "%s/%s: collected Port-Channel VLAN state mode=%s untagged=%s "
+            "tagged=%s",
+            task.host.name,
+            port_channel_name,
+            state.mode,
+            state.untagged_vlan,
+            list(state.tagged_vlans),
+        )
+
     collected = CollectedDevice(
         inventory_name=task.host.name,
         netbox_device_id=inventory_device_id(task.host),
-        interfaces=build_collected_state(
-            str(vlan_result.result),
-            str(trunk_result.result),
-            switchport_output,
-            voice_vlan_model=voice_vlan_model,
-            access_vlan_placement=access_vlan_placement,
-        ),
+        interfaces=interfaces,
         interface_metadata=build_interface_metadata(
             str(status_result.result),
             str(description_result.result),
@@ -1426,6 +1517,7 @@ def build_interface_search_scope(
         master_device=master_device,
         virtual_chassis=virtual_chassis,
         members_by_position=members_by_position,
+        devices_by_id=devices,
         indexes_by_device_id=indexes_by_device_id,
     )
 
@@ -1489,6 +1581,42 @@ def match_scoped_interface(
     interface, error = match_interface(discovered_name, *indexes)
     if interface is not None:
         return interface, owner, None
+
+    # A stack-wide Port-Channel has no member number in its name. NetBox
+    # commonly stores the LAG on the VC master, but some installations attach
+    # it to another member. Search the remaining VC members and accept only a
+    # unique match so a LAG can never be attributed to the wrong device.
+    if position is None and interface_signature(discovered_name)[0] == "po":
+        lag_matches: dict[int, tuple[Any, Any]] = {}
+        for device_id, candidate_indexes in scope.indexes_by_device_id.items():
+            if device_id in {
+                int(scope.connected_device.id),
+                int(owner.id),
+            }:
+                continue
+            candidate, _ = match_interface(
+                discovered_name,
+                *candidate_indexes,
+            )
+            if candidate is not None:
+                lag_matches[int(candidate.id)] = (
+                    candidate,
+                    scope.devices_by_id[device_id],
+                )
+        if len(lag_matches) == 1:
+            candidate, candidate_owner = next(iter(lag_matches.values()))
+            return candidate, candidate_owner, None
+        if len(lag_matches) > 1:
+            locations = ", ".join(
+                sorted(
+                    f"{candidate_owner.name}/{candidate.name}"
+                    for candidate, candidate_owner in lag_matches.values()
+                )
+            )
+            return None, owner, (
+                f"{discovered_name}: multiple Virtual Chassis LAG interfaces "
+                f"match: {locations}"
+            )
 
     if position is not None and scope.virtual_chassis is None:
         return None, owner, (
