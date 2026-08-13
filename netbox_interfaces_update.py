@@ -427,6 +427,95 @@ def parse_etherchannel_port_channels(output: str) -> list[str]:
     return sorted(port_channels.values(), key=interface_sort_key)
 
 
+def parse_port_channel_running_config(output: str) -> dict[str, SwitchportState]:
+    """Parse Layer-2 VLAN settings from Port-Channel config blocks."""
+
+    configured: dict[str, SwitchportState] = {}
+    current: SwitchportState | None = None
+    interface_line = re.compile(
+        r"^\s*interface\s+"
+        r"(?P<name>(?:Po|Port-?channel)\s*\d+)\s*$",
+        re.IGNORECASE,
+    )
+    mode_line = re.compile(
+        r"^switchport\s+mode\s+(?P<mode>access|trunk)\s*$",
+        re.IGNORECASE,
+    )
+    access_line = re.compile(
+        r"^switchport\s+access\s+vlan\s+(?P<vid>\d+)\s*$",
+        re.IGNORECASE,
+    )
+    voice_line = re.compile(
+        r"^switchport\s+voice\s+vlan\s+(?P<vid>\d+)\s*$",
+        re.IGNORECASE,
+    )
+    native_line = re.compile(
+        r"^switchport\s+trunk\s+native\s+vlan\s+(?P<vid>\d+)\s*$",
+        re.IGNORECASE,
+    )
+    allowed_line = re.compile(
+        r"^switchport\s+trunk\s+allowed\s+vlan\s+"
+        r"(?:(?P<operation>add)\s+)?(?P<vlans>.+?)\s*$",
+        re.IGNORECASE,
+    )
+
+    for raw_line in output.splitlines():
+        stripped = raw_line.strip()
+        match = interface_line.match(stripped)
+        if match:
+            name = match.group("name").replace(" ", "")
+            current = SwitchportState(name=name)
+            configured[name.casefold()] = current
+            continue
+        if current is None or not stripped or stripped in {"!", "end"}:
+            continue
+        if stripped.casefold() == "no switchport":
+            current.administrative_mode = "routed"
+            current.operational_mode = "routed"
+            current.access_vlan = None
+            current.voice_vlan = None
+            current.trunk_native_vlan = None
+            current.trunk_allowed_seen = False
+            current.trunk_allowed_vlans = []
+            continue
+
+        match = mode_line.match(stripped)
+        if match:
+            current.administrative_mode = match.group("mode").casefold()
+            continue
+        match = access_line.match(stripped)
+        if match:
+            current.access_vlan = int(match.group("vid"))
+            continue
+        match = voice_line.match(stripped)
+        if match:
+            current.voice_vlan = int(match.group("vid"))
+            continue
+        match = native_line.match(stripped)
+        if match:
+            current.trunk_native_vlan = int(match.group("vid"))
+            continue
+        match = allowed_line.match(stripped)
+        if match:
+            expression = match.group("vlans").strip().lower().replace(" ", "")
+            vlan_ids = expand_vlan_list(expression)
+            current.trunk_allowed_seen = True
+            current.trunk_allows_all = expression in {"all", "1-4094"}
+            if match.group("operation"):
+                current.trunk_allowed_vlans = sorted(
+                    set(current.trunk_allowed_vlans) | set(vlan_ids)
+                )
+            else:
+                current.trunk_allowed_vlans = vlan_ids
+
+    # Cisco's default access VLAN is VLAN 1 when mode access is explicit but
+    # no switchport access VLAN line is present.
+    for state in configured.values():
+        if state.administrative_mode == "access" and state.access_vlan is None:
+            state.access_vlan = 1
+    return configured
+
+
 def table_column_starts(
     header: str,
     column_names: tuple[str, ...],
@@ -607,6 +696,7 @@ def build_collected_state(
     switchport_output: str,
     voice_vlan_model: str = "tagged",
     access_vlan_placement: str = "clear",
+    port_channel_config_output: str = "",
 ) -> list[InterfaceVlanState]:
     """Combine Cisco output into one NetBox VLAN state per interface.
 
@@ -637,10 +727,39 @@ def build_collected_state(
     }
     processed_trunks: set[tuple[str, str]] = set()
 
+    switchports_by_signature = {
+        interface_signature(switchport.name): switchport
+        for switchport in parse_switchports(switchport_output).values()
+    }
+    for configured in parse_port_channel_running_config(
+        port_channel_config_output
+    ).values():
+        signature = interface_signature(configured.name)
+        switchport = switchports_by_signature.get(signature)
+        if switchport is None:
+            switchports_by_signature[signature] = configured
+            continue
+
+        # The running configuration is authoritative for explicitly
+        # configured administrative mode and access VLAN. Live switchport
+        # output still supplies operational mode and native-tagging state.
+        if configured.administrative_mode:
+            switchport.administrative_mode = configured.administrative_mode
+        if configured.access_vlan is not None:
+            switchport.access_vlan = configured.access_vlan
+        if configured.voice_vlan is not None:
+            switchport.voice_vlan = configured.voice_vlan
+        if configured.trunk_native_vlan is not None:
+            switchport.trunk_native_vlan = configured.trunk_native_vlan
+        if configured.trunk_allowed_seen and not switchport.trunk_allowed_seen:
+            switchport.trunk_allowed_seen = True
+            switchport.trunk_allows_all = configured.trunk_allows_all
+            switchport.trunk_allowed_vlans = configured.trunk_allowed_vlans
+
     # show vlan brief can list a phone port under both its data and voice
     # VLANs, making a dict-based parse dependent on row order. The switchport
     # output is authoritative because it labels both roles explicitly.
-    for switchport in parse_switchports(switchport_output).values():
+    for switchport in switchports_by_signature.values():
         signature = interface_signature(switchport.name)
         trunk = trunks_by_signature.get(signature)
         is_trunk = trunk is not None or "trunk" in (
@@ -707,9 +826,11 @@ def build_collected_state(
                 # alongside the voice VLAN in tagged_vlans.
                 tagged_vlans.add(switchport.access_vlan)
 
+        is_port_channel = signature[0] == "po"
         untagged_vlan = (
             switchport.access_vlan
             if access_vlan_placement == "untagged"
+            or (is_port_channel and switchport.voice_vlan is None)
             else None
         )
         if untagged_vlan is not None:
@@ -810,7 +931,20 @@ def collect_device_state(
         for switchport in parse_switchports(switchport_output).values()
     }
     targeted_switchport_outputs: list[str] = []
+    port_channel_config_outputs: list[str] = []
     for port_channel_name in port_channel_names:
+        _prefix, channel_number = interface_signature(port_channel_name)
+        config_command = (
+            f"show running-config interface port-channel {channel_number}"
+        )
+        config_result = task.run(
+            task=netmiko_send_command,
+            name=config_command,
+            command_string=config_command,
+            read_timeout=60,
+        )
+        port_channel_config_outputs.append(str(config_result.result))
+
         global_state = global_switchports.get(interface_signature(port_channel_name))
         global_mode = (
             global_state.administrative_mode + " " + global_state.operational_mode
@@ -868,6 +1002,7 @@ def collect_device_state(
         switchport_output,
         voice_vlan_model=voice_vlan_model,
         access_vlan_placement=access_vlan_placement,
+        port_channel_config_output="\n".join(port_channel_config_outputs),
     )
     collected_by_signature = {
         interface_signature(interface.name): interface
