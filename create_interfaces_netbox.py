@@ -24,8 +24,12 @@ DEFAULT_CONFIG = "config.yaml"
 DEFAULT_TAG = "nornirtest"
 
 TYPE_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
+    # NetBox uses "lag" for logical aggregation interfaces. This rule must
+    # precede the generic virtual-interface rules so Port-Channels are always
+    # included and created with the correct interface type.
+    (re.compile(r"^(?:port-?channel|po)(?=\d|[./:]|$)", re.I), "lag"),
     (re.compile(r"^(?:lo|loopback)", re.I), "virtual"),
-    (re.compile(r"^(?:vlan|bdi|irb|tunnel|tun|port-channel|po)", re.I), "virtual"),
+    (re.compile(r"^(?:vlan|bdi|irb|tunnel|tun)", re.I), "virtual"),
     (re.compile(r"^(?:fa|fastethernet)", re.I), "100base-tx"),
     (re.compile(r"^(?:fi|fivegigabitethernet)", re.I), "5gbase-t"),
     (re.compile(r"^(?:gi|gigabitethernet)", re.I), "1000base-t"),
@@ -76,7 +80,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--include-virtual",
         action="store_true",
-        help="Include loopbacks, VLANs, tunnels, and port-channels",
+        help="Include loopbacks, VLANs, and tunnels (Port-Channels are always included)",
     )
     parser.add_argument("-v", "--verbose", action="store_true")
     return parser.parse_args()
