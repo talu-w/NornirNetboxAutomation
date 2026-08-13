@@ -266,7 +266,13 @@ def parse_trunks(output: str) -> dict[str, TrunkState]:
         if not lowered:
             continue
 
-        if lowered.startswith("port") and "native vlan" in lowered:
+        # Cisco may render an EtherChannel as either ``Po1`` or
+        # ``Port-channel1``. Match the standalone ``Port`` table heading only;
+        # startswith("port") would incorrectly discard every full-name
+        # Port-channel data row below.
+        is_port_header = bool(re.match(r"^port(?:\s|$)", lowered))
+
+        if is_port_header and "native vlan" in lowered:
             section = "operational"
             continue
         if "vlans allowed on trunk" in lowered:
@@ -278,7 +284,7 @@ def parse_trunks(output: str) -> dict[str, TrunkState]:
         if "vlans in spanning tree forwarding state and not pruned" in lowered:
             section = "forwarding"
             continue
-        if lowered.startswith("port") or set(line.strip()) <= {"-", " "}:
+        if is_port_header or set(line.strip()) <= {"-", " "}:
             continue
 
         if section == "operational":
