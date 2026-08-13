@@ -11,13 +11,12 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
-import urllib3
 import pynetbox
 from nornir import InitNornir
 from nornir.core.configuration import Config
 from nornir.core.task import Result, Task
 from nornir_netmiko.tasks import netmiko_send_command
-
+import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 LOGGER = logging.getLogger(__name__)

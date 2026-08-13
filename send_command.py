@@ -16,6 +16,8 @@ from nornir.core.task import Task
 from nornir_netmiko.tasks import netmiko_send_command
 from nornir_utils.plugins.functions import print_result
 from nornir.core.inventory import ConnectionOptions
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 USERNETWORKCOMMAND = input('Please input the network command:')
 

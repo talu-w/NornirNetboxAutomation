@@ -49,7 +49,8 @@ except ImportError as exc:
         "ERROR: This script requires Rich. Install it with: pip install rich"
     ) from exc
 
-
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 TARGET_TAG = "networking-active"  #Tag used on Objects within Netbox.
 BACKUP_ROOT = Path("./config_backups")  #Dir path for configuration backups
