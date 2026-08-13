@@ -578,15 +578,16 @@ def build_collected_state(
     vlan_output: str,
     trunk_output: str,
     switchport_output: str,
-    voice_vlan_model: str = "access",
+    voice_vlan_model: str = "tagged",
     access_vlan_placement: str = "clear",
 ) -> list[InterfaceVlanState]:
     """Combine Cisco output into one NetBox VLAN state per interface.
 
-    ``voice_vlan_model=access`` honors Cisco's switchport mode: a static access
-    port remains NetBox access and only its untagged data VLAN is assigned.
     ``voice_vlan_model=tagged`` models data+voice framing instead, using NetBox
-    tagged mode so the auxiliary voice VLAN can also be assigned.
+    tagged mode so the auxiliary voice VLAN is assigned to ``tagged_vlans``.
+    This is the default because NetBox does not permit tagged VLAN assignments
+    while an interface's 802.1Q mode is access. ``voice_vlan_model=access`` is
+    retained as an opt-in compatibility policy which omits the voice VLAN.
     ``access_vlan_placement=clear`` explicitly removes NetBox's untagged VLAN
     from access-mode ports; ``untagged`` records Cisco's access VLAN there.
     """
@@ -1756,12 +1757,11 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--voice-vlan-model",
         choices=("access", "tagged"),
-        default="access",
+        default="tagged",
         help=(
-            "How to model Cisco access ports with a voice VLAN: 'access' "
-            "keeps NetBox mode access and omits the tagged voice VLAN "
-            "(default); 'tagged' records the voice VLAN in tagged_vlans and "
-            "uses --access-vlan-placement for the data VLAN"
+            "How to model Cisco access ports with a voice VLAN: 'tagged' "
+            "records the voice VLAN in tagged_vlans (default); 'access' "
+            "keeps NetBox mode access but must omit the tagged voice VLAN"
         ),
     )
     parser.add_argument(
@@ -1827,6 +1827,12 @@ def main() -> int:
             "Voice VLAN policy is 'access': Cisco access ports remain NetBox "
             "access ports; auxiliary tagged voice VLANs are not assigned "
             "because NetBox permits tagged_vlans only in tagged mode"
+        )
+    else:
+        LOGGER.info(
+            "Voice VLAN policy is 'tagged': Cisco access ports with a voice "
+            "VLAN are modeled as NetBox tagged interfaces so the voice VLAN "
+            "is assigned to tagged_vlans"
         )
     LOGGER.info(
         "Access VLAN placement is %r%s",
