@@ -95,13 +95,11 @@ class DeviceHealth:
     netbox_status: str = ""
     primary_ip: str = ""
     serial_number: str = ""
-    asset_tag: str = ""
     firmware: str = ""
     connected_interfaces: int | None = None
     not_connected_interfaces: int | None = None
     total_interfaces: int | None = None
     cpu_pct: float | None = None
-    memory_pct: float | None = None
     environment_alerts: int | None = None
     err_disabled_interfaces: int | None = None
     reachable: bool = False
@@ -203,7 +201,6 @@ def netbox_metadata(host: Host) -> dict[str, str]:
         )
         or str(host.hostname or ""),
         "serial_number": _display_value(_nested_value(data, "serial", "serial_number")),
-        "asset_tag": _display_value(_nested_value(data, "asset_tag")),
     }
 
 
@@ -252,7 +249,6 @@ def command_profile(platform: str) -> dict[str, list[str]]:
         "version": ["show version"],
         "interfaces": ["show interfaces status", "show ip interface brief"],
         "cpu": ["show processes cpu | include CPU utilization", "show processes cpu"],
-        "memory": ["show memory statistics", "show processes memory | include Processor"],
         "environment": ["show environment all", "show environment"],
     }
 
@@ -261,7 +257,6 @@ def command_profile(platform: str) -> dict[str, list[str]]:
             {
                 "interfaces": ["show interface status"],
                 "cpu": ["show system resources"],
-                "memory": ["show system resources"],
                 "environment": ["show environment"],
             }
         )
@@ -270,7 +265,6 @@ def command_profile(platform: str) -> dict[str, list[str]]:
             {
                 "interfaces": ["show interfaces status"],
                 "cpu": ["show processes top once"],
-                "memory": ["show version"],
                 "environment": ["show system environment all"],
             }
         )
@@ -312,25 +306,6 @@ def parse_cpu_pct(output: str) -> float | None:
     kernel_match = re.search(r"(\d+(?:\.\d+)?)%\s*kernel", output, re.IGNORECASE)
     if user_match and kernel_match:
         return min(100.0, float(user_match.group(1)) + float(kernel_match.group(1)))
-    return None
-
-
-def parse_memory_pct(output: str) -> float | None:
-    patterns = (
-        r"Processor Pool Total:\s*(\d+)\s+Used:\s*(\d+)\s+Free:\s*(\d+)",
-        (
-            r"(?:System )?[Mm]emory(?: usage)?:\s*(\d+)\s*[KMG]?\s+total,\s*"
-            r"(\d+)\s*[KMG]?\s+used"
-        ),
-        r"^\s*Processor\s+\S+\s+(\d+)\s+(\d+)\s+(\d+)\s*$",
-    )
-    for pattern in patterns:
-        match = re.search(pattern, output, re.IGNORECASE | re.MULTILINE)
-        if match:
-            total = float(match.group(1))
-            used = float(match.group(2))
-            if total > 0:
-                return max(0.0, min(100.0, used / total * 100.0))
     return None
 
 
@@ -433,14 +408,6 @@ def collect_device_health(task: Task) -> Result:
         record.notes.append(f"CPU utilization unavailable: {exc}")
 
     try:
-        memory_output, _ = run_first_supported(task, "Memory", profile["memory"])
-        record.memory_pct = parse_memory_pct(memory_output)
-        if record.memory_pct is None:
-            record.notes.append("Memory output was returned but utilization could not be parsed.")
-    except Exception as exc:  # noqa: BLE001 - collection errors must remain in the report.
-        record.notes.append(f"Memory utilization unavailable: {exc}")
-
-    try:
         environment_output, _ = run_first_supported(
             task, "Environment", profile["environment"]
         )
@@ -529,26 +496,24 @@ def create_health_workbook(
         "NetBox Status": 13,
         "Primary IP": 14,
         "Serial Number": 15,
-        "Asset Tag": 16,
-        "Current Firmware": 17,
-        "Interface Usage": 18,
-        "Connected Interfaces": 19,
-        "Not Connected Interfaces": 20,
-        "Total Interfaces": 21,
-        "CPU Utilization": 22,
-        "Memory Utilization": 23,
-        "Environment Alerts": 24,
-        "Err-disabled Interfaces": 25,
-        "Reachable": 26,
-        "Collected UTC": 27,
-        "Collection Notes": 28,
+        "Current Firmware": 16,
+        "Interface Usage": 17,
+        "Connected Interfaces": 18,
+        "Not Connected Interfaces": 19,
+        "Total Interfaces": 20,
+        "CPU Utilization": 21,
+        "Environment Alerts": 22,
+        "Err-disabled Interfaces": 23,
+        "Reachable": 24,
+        "Collected UTC": 25,
+        "Collection Notes": 26,
     }
 
     sheet["A4"] = "Metric"
     for label, row in metric_rows.items():
         sheet.cell(row, 1, label)
 
-    for row in range(4, 29):
+    for row in range(4, 27):
         cell = sheet.cell(row, 1)
         cell.fill = _fill(navy)
         cell.font = Font(bold=True, color=white)
@@ -563,7 +528,6 @@ def create_health_workbook(
         "NetBox Status": "netbox_status",
         "Primary IP": "primary_ip",
         "Serial Number": "serial_number",
-        "Asset Tag": "asset_tag",
         "Current Firmware": "firmware",
         "Connected Interfaces": "connected_interfaces",
         "Not Connected Interfaces": "not_connected_interfaces",
@@ -580,35 +544,31 @@ def create_health_workbook(
             sheet.cell(metric_rows[label], index, record.get(field_name))
 
         cpu_pct = record.get("cpu_pct")
-        memory_pct = record.get("memory_pct")
-        sheet.cell(22, index, cpu_pct / 100 if isinstance(cpu_pct, (int, float)) else None)
-        sheet.cell(23, index, memory_pct / 100 if isinstance(memory_pct, (int, float)) else None)
-        sheet.cell(26, index, "Yes" if record.get("reachable") else "No")
-        sheet.cell(28, index, " | ".join(str(note) for note in record.get("notes", [])))
+        sheet.cell(21, index, cpu_pct / 100 if isinstance(cpu_pct, (int, float)) else None)
+        sheet.cell(24, index, "Yes" if record.get("reachable") else "No")
+        sheet.cell(26, index, " | ".join(str(note) for note in record.get("notes", [])))
 
-        sheet.cell(18, index, f'=IF({column}21=0,"",{column}19/{column}21)')
-        sheet.cell(7, index, f"=(1+COUNT({column}22:{column}25))/5")
+        sheet.cell(17, index, f'=IF({column}20=0,"",{column}18/{column}20)')
+        sheet.cell(7, index, f"=(1+COUNT({column}21:{column}23))/4")
         sheet.cell(
             6,
             index,
             (
-                f'=IF({column}26<>"Yes",0,MAX(0,100'
-                f'-IF(ISNUMBER({column}22),IF({column}22>=$B$34,$B$39,'
-                f'IF({column}22>=$B$33,$B$38,0)),0)'
-                f'-IF(ISNUMBER({column}23),IF({column}23>=$B$36,$B$39,'
-                f'IF({column}23>=$B$35,$B$38,0)),0)'
-                f'-IF(ISNUMBER({column}24),MIN({column}24*$B$40,$B$42),0)'
-                f'-IF(ISNUMBER({column}25),MIN({column}25*$B$41,$B$42),0)))'
+                f'=IF({column}24<>"Yes",0,MAX(0,100'
+                f'-IF(ISNUMBER({column}21),IF({column}21>=$B$32,$B$35,'
+                f'IF({column}21>=$B$31,$B$34,0)),0)'
+                f'-IF(ISNUMBER({column}22),MIN({column}22*$B$36,$B$38),0)'
+                f'-IF(ISNUMBER({column}23),MIN({column}23*$B$37,$B$38),0)))'
             ),
         )
         sheet.cell(
             5,
             index,
             (
-                f'=IF({column}26<>"Yes","Unreachable",'
-                f'IF({column}7<$B$37,"Insufficient Data",'
-                f'IF({column}6>=$B$43,"Healthy",'
-                f'IF({column}6>=$B$44,"Watch","Critical"))))'
+                f'=IF({column}24<>"Yes","Unreachable",'
+                f'IF({column}7<$B$33,"Insufficient Data",'
+                f'IF({column}6>=$B$39,"Healthy",'
+                f'IF({column}6>=$B$40,"Watch","Critical"))))'
             ),
         )
 
@@ -618,22 +578,20 @@ def create_health_workbook(
         header.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
         sheet.column_dimensions[column].width = 24
 
-        for row in range(5, 29):
+        for row in range(5, 27):
             cell = sheet.cell(row, index)
             cell.alignment = Alignment(vertical="center", wrap_text=True)
             cell.border = Border(bottom=thin_gray)
 
-    sheet["A31"] = "Health scoring method"
-    sheet.merge_cells("A31:B31")
-    sheet["A31"].fill = _fill(navy)
-    sheet["A31"].font = Font(bold=True, color=white)
-    sheet["A32"] = "Parameter"
-    sheet["B32"] = "Value"
+    sheet["A29"] = "Health scoring method"
+    sheet.merge_cells("A29:B29")
+    sheet["A29"].fill = _fill(navy)
+    sheet["A29"].font = Font(bold=True, color=white)
+    sheet["A30"] = "Parameter"
+    sheet["B30"] = "Value"
     settings = [
         ("CPU warning", 0.75),
         ("CPU critical", 0.90),
-        ("Memory warning", 0.75),
-        ("Memory critical", 0.90),
         ("Minimum data coverage", 0.60),
         ("Warning penalty", 10),
         ("Critical penalty", 25),
@@ -643,37 +601,37 @@ def create_health_workbook(
         ("Healthy score", 85),
         ("Watch score", 70),
     ]
-    for row, (label, value) in enumerate(settings, start=33):
+    for row, (label, value) in enumerate(settings, start=31):
         sheet.cell(row, 1, label)
         sheet.cell(row, 2, value)
-    for cell in sheet[32][:2]:
+    for cell in sheet[30][:2]:
         cell.fill = _fill(teal)
         cell.font = Font(bold=True, color=white)
-    for row in range(33, 38):
+    for row in range(31, 34):
         sheet.cell(row, 2).number_format = "0%"
 
-    sheet["A46"] = "Definitions"
-    sheet["A46"].font = Font(bold=True)
-    sheet.merge_cells(start_row=46, start_column=2, end_row=46, end_column=last_column)
-    sheet.merge_cells(start_row=47, start_column=2, end_row=47, end_column=last_column)
-    sheet["B46"] = (
+    sheet["A42"] = "Definitions"
+    sheet["A42"].font = Font(bold=True)
+    sheet.merge_cells(start_row=42, start_column=2, end_row=42, end_column=last_column)
+    sheet.merge_cells(start_row=43, start_column=2, end_row=43, end_column=last_column)
+    sheet["B42"] = (
         "Interface Usage = connected physical interfaces divided by all parsed physical "
         "interfaces. Unconnected, disabled, and err-disabled ports count as not connected."
     )
-    sheet["B47"] = (
-        "Health Score begins at 100 and applies visible CPU, memory, environment, and "
+    sheet["B43"] = (
+        "Health Score begins at 100 and applies visible CPU, environment, and "
         "err-disabled penalties. Missing metrics reduce Data Coverage instead of being "
         "treated as healthy or unhealthy."
     )
-    sheet["B46"].alignment = Alignment(wrap_text=True, vertical="top")
-    sheet["B47"].alignment = Alignment(wrap_text=True, vertical="top")
-    sheet.row_dimensions[46].height = 58
-    sheet.row_dimensions[47].height = 72
+    sheet["B42"].alignment = Alignment(wrap_text=True, vertical="top")
+    sheet["B43"].alignment = Alignment(wrap_text=True, vertical="top")
+    sheet.row_dimensions[42].height = 58
+    sheet.row_dimensions[43].height = 72
 
-    sheet["A49"] = "Fleet summary"
-    sheet.merge_cells("A49:B49")
-    sheet["A49"].fill = _fill(navy)
-    sheet["A49"].font = Font(bold=True, color=white)
+    sheet["A45"] = "Fleet summary"
+    sheet.merge_cells("A45:B45")
+    sheet["A45"].fill = _fill(navy)
+    sheet["A45"].font = Font(bold=True, color=white)
     summary_labels = [
         "Devices",
         "Healthy",
@@ -684,33 +642,32 @@ def create_health_workbook(
         "Average Health Score",
         "Average Interface Usage",
     ]
-    for row, label in enumerate(summary_labels, start=50):
+    for row, label in enumerate(summary_labels, start=46):
         sheet.cell(row, 1, label)
 
     device_header_range = f"B4:{last_column_letter}4"
     status_range = f"B5:{last_column_letter}5"
     score_range = f"B6:{last_column_letter}6"
-    usage_range = f"B18:{last_column_letter}18"
-    sheet["B50"] = f"=COUNTA({device_header_range})"
-    for row, status in zip(range(51, 56), summary_labels[1:6], strict=True):
+    usage_range = f"B17:{last_column_letter}17"
+    sheet["B46"] = f"=COUNTA({device_header_range})"
+    for row, status in zip(range(47, 52), summary_labels[1:6], strict=True):
         sheet.cell(row, 2, f'=COUNTIF({status_range},"{status}")')
-    sheet["B56"] = f'=IFERROR(AVERAGE({score_range}),"")'
-    sheet["B57"] = f'=IFERROR(AVERAGE({usage_range}),"")'
-    sheet["B57"].number_format = "0%"
+    sheet["B52"] = f'=IFERROR(AVERAGE({score_range}),"")'
+    sheet["B53"] = f'=IFERROR(AVERAGE({usage_range}),"")'
+    sheet["B53"].number_format = "0%"
 
     sheet.column_dimensions["A"].width = 29
     sheet.column_dimensions["B"].width = max(sheet.column_dimensions["B"].width or 0, 24)
     sheet.row_dimensions[4].height = 30
-    sheet.row_dimensions[28].height = 76
-    sheet.freeze_panes = "B5"
+    sheet.row_dimensions[26].height = 76
+    sheet.freeze_panes = "A5"
 
     for column in range(2, last_column + 1):
         sheet.cell(6, column).number_format = "0"
         sheet.cell(7, column).number_format = "0%"
-        sheet.cell(18, column).number_format = "0.0%"
-        sheet.cell(22, column).number_format = "0.0%"
-        sheet.cell(23, column).number_format = "0.0%"
-        sheet.cell(27, column).number_format = "yyyy-mm-dd hh:mm"
+        sheet.cell(17, column).number_format = "0.0%"
+        sheet.cell(21, column).number_format = "0.0%"
+        sheet.cell(25, column).number_format = "yyyy-mm-dd hh:mm"
 
     status_cells = f"B5:{last_column_letter}5"
     for status, color in {
@@ -740,15 +697,15 @@ def create_health_workbook(
     )
 
     sheet["B6"].comment = Comment(
-        "Formula-driven score using the visible thresholds in rows 33–44.",
+        "Formula-driven score using the visible thresholds in rows 31–40.",
         "Network Automation",
     )
-    sheet["B18"].comment = Comment(
+    sheet["B17"].comment = Comment(
         "Connected physical interfaces divided by all parsed physical interfaces.",
         "Network Automation",
     )
 
-    for row in range(31, 58):
+    for row in range(29, 54):
         for column in range(1, min(last_column, 2) + 1):
             sheet.cell(row, column).alignment = Alignment(vertical="center", wrap_text=True)
 
@@ -757,7 +714,7 @@ def create_health_workbook(
     sheet.page_setup.fitToWidth = 1
     sheet.page_setup.fitToHeight = 1
     sheet.print_title_rows = "1:4"
-    sheet.print_area = f"A1:{last_column_letter}28"
+    sheet.print_area = f"A1:{last_column_letter}26"
 
     workbook.calculation.calcMode = "auto"
     workbook.calculation.fullCalcOnLoad = True
@@ -821,7 +778,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         console.print("No devices matched the requested NetBox tag. No workbook was created.")
         return 0
 
-    console.print("Collecting firmware, interface state, CPU, memory, and environment health...")
+    console.print("Collecting firmware, interface state, CPU, and environment health...")
     results = targets.run(name="Collect network health", task=collect_device_health)
     records = _extract_records(results, targets.inventory.hosts)
     create_health_workbook(records, target_tag, output_path)
