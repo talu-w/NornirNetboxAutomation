@@ -263,15 +263,15 @@ def command_profile(platform: str) -> dict[str, list[str]]:
         "version": ["show version"],
         "interfaces": ["show interfaces status", "show ip interface brief"],
         "cpu": ["show processes cpu | include CPU utilization", "show processes cpu"],
-        "environment": ["show environment all", "show environment"],
+        "environment": ["show environment all", "show environment",],
     }
 
-    if "nxos" in platform_name or "nx-os" in platform_name:
+    if "nxos" in platform_name or "nx-os" in platform_name or "ios" in platform_name:
         profile.update(
             {
                 "interfaces": ["show interface status"],
                 "cpu": ["show system resources"],
-                "environment": ["show environment"],
+                "environment": ["show env all"],
             }
         )
     elif "eos" in platform_name or "arista" in platform_name:
@@ -543,7 +543,7 @@ def create_health_workbook(
     last_column_letter = get_column_letter(last_column)
 
     sheet.merge_cells(start_row=1, start_column=1, end_row=1, end_column=last_column)
-    sheet["A1"] = "Networking Infrastructure Health — Leadership Overview"
+    sheet["A1"] = "Nornir Networking Report - Networking Infrastructure Health"
     sheet["A1"].font = Font(size=18, bold=True, color=white)
     sheet["A1"].fill = _fill(navy)
     sheet["A1"].alignment = Alignment(vertical="center", wrap_text=True, shrink_to_fit=True)
