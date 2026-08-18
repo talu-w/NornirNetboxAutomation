@@ -45,6 +45,20 @@ DEFAULT_CONFIG_FILE = "config.yaml"
 DEFAULT_TARGET_TAG = "nornirtest"
 DEFAULT_OUTPUT_FILE = "network_health_report.xlsx"
 
+# Internal scoring values. They are stored in hidden worksheet rows so the
+# front-facing report stays clean while its formulas remain consistent.
+CPU_WARNING_PCT = 75.0
+CPU_CRITICAL_PCT = 90.0
+MIN_DATA_COVERAGE_PCT = 60.0
+WARNING_PENALTY = 10
+CRITICAL_PENALTY = 25
+ENVIRONMENT_ALERT_PENALTY = 10
+ERR_DISABLED_PENALTY = 10
+MAX_COUNT_PENALTY = 30
+HEALTHY_SCORE = 85
+WATCH_SCORE = 70
+HEALTH_COMPONENT_COUNT = 4
+
 NETMIKO_EXTRAS = {
     "conn_timeout": 30,
     "banner_timeout": 60,
@@ -442,6 +456,68 @@ def _fill(color: str) -> PatternFill:
     return PatternFill("solid", fgColor=color)
 
 
+def build_collection_notes(record: Mapping[str, Any]) -> list[str]:
+    """Combine collection warnings with the conditions that reduced health."""
+
+    notes = [str(note) for note in record.get("notes", []) if str(note).strip()]
+
+    def add(note: str) -> None:
+        if note not in notes:
+            notes.append(note)
+
+    if not record.get("reachable"):
+        add("Health impact: device was unreachable; health score is forced to 0.")
+        return notes
+
+    cpu_pct = record.get("cpu_pct")
+    if isinstance(cpu_pct, (int, float)):
+        if cpu_pct >= CPU_CRITICAL_PCT:
+            add(
+                f"Health impact: CPU utilization {cpu_pct:.1f}% met or exceeded the "
+                f"critical threshold of {CPU_CRITICAL_PCT:.0f}%; score reduced by "
+                f"{CRITICAL_PENALTY} points."
+            )
+        elif cpu_pct >= CPU_WARNING_PCT:
+            add(
+                f"Health impact: CPU utilization {cpu_pct:.1f}% met or exceeded the "
+                f"warning threshold of {CPU_WARNING_PCT:.0f}%; score reduced by "
+                f"{WARNING_PENALTY} points."
+            )
+
+    environment_alerts = record.get("environment_alerts")
+    if isinstance(environment_alerts, (int, float)) and environment_alerts > 0:
+        penalty = min(
+            int(environment_alerts) * ENVIRONMENT_ALERT_PENALTY, MAX_COUNT_PENALTY
+        )
+        add(
+            f"Health impact: {int(environment_alerts)} environmental alert"
+            f"{'s were' if environment_alerts != 1 else ' was'} detected; score reduced "
+            f"by {penalty} points."
+        )
+
+    err_disabled = record.get("err_disabled_interfaces")
+    if isinstance(err_disabled, (int, float)) and err_disabled > 0:
+        penalty = min(int(err_disabled) * ERR_DISABLED_PENALTY, MAX_COUNT_PENALTY)
+        add(
+            f"Health impact: {int(err_disabled)} physical interface"
+            f"{'s are' if err_disabled != 1 else ' is'} err-disabled; score reduced by "
+            f"{penalty} points."
+        )
+
+    available_components = 1 + sum(
+        isinstance(record.get(field), (int, float))
+        for field in ("cpu_pct", "environment_alerts", "err_disabled_interfaces")
+    )
+    coverage_pct = available_components / HEALTH_COMPONENT_COUNT * 100
+    if coverage_pct < MIN_DATA_COVERAGE_PCT:
+        add(
+            f"Health impact: only {coverage_pct:.0f}% of health inputs were available; "
+            "status is Insufficient Data."
+        )
+
+    return notes
+
+
 def create_health_workbook(
     records: Sequence[Mapping[str, Any]],
     target_tag: str,
@@ -546,7 +622,7 @@ def create_health_workbook(
         cpu_pct = record.get("cpu_pct")
         sheet.cell(21, index, cpu_pct / 100 if isinstance(cpu_pct, (int, float)) else None)
         sheet.cell(24, index, "Yes" if record.get("reachable") else "No")
-        sheet.cell(26, index, " | ".join(str(note) for note in record.get("notes", [])))
+        sheet.cell(26, index, " | ".join(build_collection_notes(record)))
 
         sheet.cell(17, index, f'=IF({column}20=0,"",{column}18/{column}20)')
         sheet.cell(7, index, f"=(1+COUNT({column}21:{column}23))/4")
@@ -590,16 +666,16 @@ def create_health_workbook(
     sheet["A30"] = "Parameter"
     sheet["B30"] = "Value"
     settings = [
-        ("CPU warning", 0.75),
-        ("CPU critical", 0.90),
-        ("Minimum data coverage", 0.60),
-        ("Warning penalty", 10),
-        ("Critical penalty", 25),
-        ("Environment alert penalty", 10),
-        ("Err-disabled penalty", 10),
-        ("Maximum count penalty", 30),
-        ("Healthy score", 85),
-        ("Watch score", 70),
+        ("CPU warning", CPU_WARNING_PCT / 100),
+        ("CPU critical", CPU_CRITICAL_PCT / 100),
+        ("Minimum data coverage", MIN_DATA_COVERAGE_PCT / 100),
+        ("Warning penalty", WARNING_PENALTY),
+        ("Critical penalty", CRITICAL_PENALTY),
+        ("Environment alert penalty", ENVIRONMENT_ALERT_PENALTY),
+        ("Err-disabled penalty", ERR_DISABLED_PENALTY),
+        ("Maximum count penalty", MAX_COUNT_PENALTY),
+        ("Healthy score", HEALTHY_SCORE),
+        ("Watch score", WATCH_SCORE),
     ]
     for row, (label, value) in enumerate(settings, start=31):
         sheet.cell(row, 1, label)
@@ -659,8 +735,14 @@ def create_health_workbook(
     sheet.column_dimensions["A"].width = 29
     sheet.column_dimensions["B"].width = max(sheet.column_dimensions["B"].width or 0, 24)
     sheet.row_dimensions[4].height = 30
-    sheet.row_dimensions[26].height = 76
+    sheet.row_dimensions[26].height = 160
     sheet.freeze_panes = "A5"
+
+    # Keep scoring mechanics available to formulas without showing them to
+    # management users. Hidden rows collapse the method/definition section so
+    # Fleet Summary follows the scorecard when scrolling.
+    for row in range(29, 45):
+        sheet.row_dimensions[row].hidden = True
 
     for column in range(2, last_column + 1):
         sheet.cell(6, column).number_format = "0"
@@ -696,10 +778,6 @@ def create_health_workbook(
         ),
     )
 
-    sheet["B6"].comment = Comment(
-        "Formula-driven score using the visible thresholds in rows 31–40.",
-        "Network Automation",
-    )
     sheet["B17"].comment = Comment(
         "Connected physical interfaces divided by all parsed physical interfaces.",
         "Network Automation",
