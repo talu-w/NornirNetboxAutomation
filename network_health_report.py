@@ -44,6 +44,11 @@ except ImportError as exc:
 DEFAULT_CONFIG_FILE = "config.yaml"
 DEFAULT_TARGET_TAG = "nornirtest"
 DEFAULT_OUTPUT_FILE = "network_health_report.xlsx"
+DEFAULT_CONNECTION_TIMEOUT = 60.0
+DEFAULT_AUTH_TIMEOUT = 120.0
+DEFAULT_BANNER_TIMEOUT = 120.0
+DEFAULT_READ_TIMEOUT = 180.0
+DEFAULT_GLOBAL_DELAY_FACTOR = 2.0
 
 # Internal scoring values. They are stored in hidden worksheet rows so the
 # front-facing report stays clean while its formulas remain consistent.
@@ -58,13 +63,6 @@ MAX_COUNT_PENALTY = 30
 HEALTHY_SCORE = 85
 WATCH_SCORE = 70
 HEALTH_COMPONENT_COUNT = 4
-
-NETMIKO_EXTRAS = {
-    "conn_timeout": 30,
-    "banner_timeout": 60,
-    "auth_timeout": 60,
-    "fast_cli": False,
-}
 
 PHYSICAL_INTERFACE_RE = re.compile(
     r"^(?:Fa|FastEthernet|Gi|GigabitEthernet|Te|TenGigabitEthernet|"
@@ -124,6 +122,25 @@ class DeviceHealth:
         return asdict(self)
 
 
+def positive_float(value: str) -> float:
+    """Return a positive numeric command-line value."""
+
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"{value!r} is not a number") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be greater than zero")
+    return parsed
+
+
+def environment_flag(name: str) -> bool:
+    """Interpret a common true/false environment-variable value."""
+
+    value = os.getenv(name, "").strip().casefold()
+    return value in {"1", "true", "yes", "on"}
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -146,7 +163,81 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_OUTPUT_FILE,
         help="Excel output path (default: network_health_report.xlsx)",
     )
+    parser.add_argument(
+        "--connection-timeout",
+        "--conn-timeout",
+        dest="connection_timeout",
+        type=positive_float,
+        default=os.getenv("NORNIR_CONNECTION_TIMEOUT", str(DEFAULT_CONNECTION_TIMEOUT)),
+        help=(
+            "Seconds allowed to establish SSH transport "
+            f"(default: {DEFAULT_CONNECTION_TIMEOUT:g})"
+        ),
+    )
+    parser.add_argument(
+        "--auth-timeout",
+        type=positive_float,
+        default=os.getenv("NORNIR_AUTH_TIMEOUT", str(DEFAULT_AUTH_TIMEOUT)),
+        help=(
+            "Seconds allowed for SSH authentication "
+            f"(default: {DEFAULT_AUTH_TIMEOUT:g})"
+        ),
+    )
+    parser.add_argument(
+        "--banner-timeout",
+        type=positive_float,
+        default=os.getenv("NORNIR_BANNER_TIMEOUT", str(DEFAULT_BANNER_TIMEOUT)),
+        help=(
+            "Seconds allowed for an SSH identification banner "
+            f"(default: {DEFAULT_BANNER_TIMEOUT:g})"
+        ),
+    )
+    parser.add_argument(
+        "--read-timeout",
+        type=positive_float,
+        default=os.getenv("NORNIR_READ_TIMEOUT", str(DEFAULT_READ_TIMEOUT)),
+        help=(
+            "Seconds allowed for each show command to finish "
+            f"(default: {DEFAULT_READ_TIMEOUT:g})"
+        ),
+    )
+    parser.add_argument(
+        "--global-delay-factor",
+        type=positive_float,
+        default=os.getenv(
+            "NORNIR_GLOBAL_DELAY_FACTOR", str(DEFAULT_GLOBAL_DELAY_FACTOR)
+        ),
+        help=(
+            "Netmiko delay multiplier for slow devices "
+            f"(default: {DEFAULT_GLOBAL_DELAY_FACTOR:g})"
+        ),
+    )
+    parser.add_argument(
+        "--legacy-ssh",
+        action="store_true",
+        default=environment_flag("NORNIR_LEGACY_SSH"),
+        help=(
+            "Enable Netmiko compatibility for older SSH servers that do not "
+            "advertise RSA-SHA2 support"
+        ),
+    )
     return parser.parse_args(argv)
+
+
+def build_netmiko_extras(args: argparse.Namespace) -> dict[str, Any]:
+    """Build adjustable Netmiko settings for slow or legacy devices."""
+
+    extras: dict[str, Any] = {
+        "conn_timeout": args.connection_timeout,
+        "banner_timeout": args.banner_timeout,
+        "auth_timeout": args.auth_timeout,
+        "read_timeout_override": args.read_timeout,
+        "global_delay_factor": args.global_delay_factor,
+        "fast_cli": False,
+    }
+    if args.legacy_ssh:
+        extras["disable_sha2_fix"] = True
+    return extras
 
 
 def normalize_tags(tags: Sequence[Any] | None) -> list[str]:
@@ -227,7 +318,7 @@ def run_first_supported(
     task: Task,
     label: str,
     commands: Sequence[str],
-    read_timeout: int = 120,
+    read_timeout: float = DEFAULT_READ_TIMEOUT,
 ) -> tuple[str, str]:
     """Run commands in order and return the first usable output and command."""
 
@@ -262,15 +353,23 @@ def command_profile(platform: str) -> dict[str, list[str]]:
     profile = {
         "version": ["show version"],
         "interfaces": ["show interfaces status", "show ip interface brief"],
-        "cpu": ["show processes cpu | include CPU utilization", "show processes cpu"],
+        "cpu": ["show process cpu"],
         "environment": ["show environment all", "show environment",],
     }
 
-    if "nxos" in platform_name or "nx-os" in platform_name or "ios" in platform_name:
+    if "nxos" in platform_name or "nx-os" in platform_name:
         profile.update(
             {
                 "interfaces": ["show interface status"],
                 "cpu": ["show system resources"],
+                "environment": ["show env all"],
+            }
+        )
+    elif "ios" in platform_name:
+        profile.update(
+            {
+                "interfaces": ["show interface status"],
+                "cpu": ["show process cpu"],
                 "environment": ["show env all"],
             }
         )
@@ -386,13 +485,17 @@ def count_environment_alerts(output: str) -> int:
     )
 
 
-def collect_device_health(task: Task) -> Result:
+def collect_device_health(
+    task: Task, read_timeout: float = DEFAULT_READ_TIMEOUT
+) -> Result:
     metadata = netbox_metadata(task.host)
     record = DeviceHealth(hostname=task.host.name, **metadata)
     profile = command_profile(record.platform)
 
     try:
-        version_output, _ = run_first_supported(task, "Firmware", profile["version"])
+        version_output, _ = run_first_supported(
+            task, "Firmware", profile["version"], read_timeout
+        )
     except Exception as exc:  # noqa: BLE001 - collection errors must remain in the report.
         record.notes.append(f"Connection or show version failed: {exc}")
         return Result(host=task.host, changed=False, result=record.to_dict())
@@ -402,7 +505,9 @@ def collect_device_health(task: Task) -> Result:
     record.collected_at_utc = datetime.now(UTC).replace(tzinfo=None)
 
     try:
-        interface_output, _ = run_first_supported(task, "Interfaces", profile["interfaces"])
+        interface_output, _ = run_first_supported(
+            task, "Interfaces", profile["interfaces"], read_timeout
+        )
         summary = parse_interface_summary(interface_output)
         record.connected_interfaces = summary.connected
         record.not_connected_interfaces = summary.not_connected
@@ -414,7 +519,9 @@ def collect_device_health(task: Task) -> Result:
         record.notes.append(f"Interface statistics unavailable: {exc}")
 
     try:
-        cpu_output, _ = run_first_supported(task, "CPU", profile["cpu"])
+        cpu_output, _ = run_first_supported(
+            task, "CPU", profile["cpu"], read_timeout
+        )
         record.cpu_pct = parse_cpu_pct(cpu_output)
         if record.cpu_pct is None:
             record.notes.append("CPU output was returned but utilization could not be parsed.")
@@ -423,7 +530,7 @@ def collect_device_health(task: Task) -> Result:
 
     try:
         environment_output, _ = run_first_supported(
-            task, "Environment", profile["environment"]
+            task, "Environment", profile["environment"], read_timeout
         )
         record.environment_alerts = count_environment_alerts(environment_output)
     except Exception as exc:  # noqa: BLE001 - collection errors must remain in the report.
@@ -838,26 +945,44 @@ def main(argv: Sequence[str] | None = None) -> int:
         nr.inventory.defaults.username = username
         nr.inventory.defaults.password = password
 
+    netmiko_extras = build_netmiko_extras(args)
     for host in nr.inventory.hosts.values():
         host.data["tag_slugs"] = normalize_tags(host.data.get("tags", []))
         if "netmiko" not in host.connection_options:
-            host.connection_options["netmiko"] = ConnectionOptions(extras=dict(NETMIKO_EXTRAS))
+            host.connection_options["netmiko"] = ConnectionOptions(
+                extras=dict(netmiko_extras)
+            )
         else:
             existing_extras = host.connection_options["netmiko"].extras or {}
-            for key, value in NETMIKO_EXTRAS.items():
-                existing_extras.setdefault(key, value)
+            existing_extras.update(netmiko_extras)
             host.connection_options["netmiko"].extras = existing_extras
 
     targets = nr.filter(F(tag_slugs__contains=target_tag))
     console.print(f"Target tag: [bold]{target_tag}[/]")
     console.print(f"Matched devices: [bold]{len(targets.inventory.hosts)}[/]")
+    console.print(
+        "SSH timing: "
+        f"connect {args.connection_timeout:g}s | "
+        f"authenticate {args.auth_timeout:g}s | "
+        f"banner {args.banner_timeout:g}s | "
+        f"command {args.read_timeout:g}s | "
+        f"delay factor {args.global_delay_factor:g}"
+    )
+    if args.legacy_ssh:
+        console.print(
+            "[yellow]Legacy SSH compatibility is enabled for this run.[/]"
+        )
 
     if not targets.inventory.hosts:
         console.print("No devices matched the requested NetBox tag. No workbook was created.")
         return 0
 
     console.print("Collecting firmware, interface state, CPU, and environment health...")
-    results = targets.run(name="Collect network health", task=collect_device_health)
+    results = targets.run(
+        name="Collect network health",
+        task=collect_device_health,
+        read_timeout=args.read_timeout,
+    )
     records = _extract_records(results, targets.inventory.hosts)
     create_health_workbook(records, target_tag, output_path)
 
