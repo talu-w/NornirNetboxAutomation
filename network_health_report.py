@@ -43,7 +43,9 @@ except ImportError as exc:
 
 DEFAULT_CONFIG_FILE = "config.yaml"
 DEFAULT_TARGET_TAG = "nornirtest"
-DEFAULT_OUTPUT_FILE = "network_health_report.xlsx"
+DEFAULT_OUTPUT_FILE = (
+    f"Network_Health_Report_{datetime.now().astimezone().strftime('%Y-%m-%d')}.xlsx"
+)
 DEFAULT_CONNECTION_TIMEOUT = 60.0
 DEFAULT_AUTH_TIMEOUT = 120.0
 DEFAULT_BANNER_TIMEOUT = 120.0
@@ -161,7 +163,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--output",
         default=DEFAULT_OUTPUT_FILE,
-        help="Excel output path (default: network_health_report.xlsx)",
+        help=f"Excel output path (default: {DEFAULT_OUTPUT_FILE})",
     )
     parser.add_argument(
         "--connection-timeout",
@@ -573,7 +575,10 @@ def build_collection_notes(record: Mapping[str, Any]) -> list[str]:
             notes.append(note)
 
     if not record.get("reachable"):
-        add("Health impact: device was unreachable; health score is forced to 0.")
+        add(
+            "Health impact: device was unreachable; live health data could not "
+            "be collected."
+        )
         return notes
 
     cpu_pct = record.get("cpu_pct")
@@ -581,34 +586,26 @@ def build_collection_notes(record: Mapping[str, Any]) -> list[str]:
         if cpu_pct >= CPU_CRITICAL_PCT:
             add(
                 f"Health impact: CPU utilization {cpu_pct:.1f}% met or exceeded the "
-                f"critical threshold of {CPU_CRITICAL_PCT:.0f}%; score reduced by "
-                f"{CRITICAL_PENALTY} points."
+                f"critical threshold of {CPU_CRITICAL_PCT:.0f}%."
             )
         elif cpu_pct >= CPU_WARNING_PCT:
             add(
                 f"Health impact: CPU utilization {cpu_pct:.1f}% met or exceeded the "
-                f"warning threshold of {CPU_WARNING_PCT:.0f}%; score reduced by "
-                f"{WARNING_PENALTY} points."
+                f"warning threshold of {CPU_WARNING_PCT:.0f}%."
             )
 
     environment_alerts = record.get("environment_alerts")
     if isinstance(environment_alerts, (int, float)) and environment_alerts > 0:
-        penalty = min(
-            int(environment_alerts) * ENVIRONMENT_ALERT_PENALTY, MAX_COUNT_PENALTY
-        )
         add(
             f"Health impact: {int(environment_alerts)} environmental alert"
-            f"{'s were' if environment_alerts != 1 else ' was'} detected; score reduced "
-            f"by {penalty} points."
+            f"{'s were' if environment_alerts != 1 else ' was'} detected."
         )
 
     err_disabled = record.get("err_disabled_interfaces")
     if isinstance(err_disabled, (int, float)) and err_disabled > 0:
-        penalty = min(int(err_disabled) * ERR_DISABLED_PENALTY, MAX_COUNT_PENALTY)
         add(
             f"Health impact: {int(err_disabled)} physical interface"
-            f"{'s are' if err_disabled != 1 else ' is'} err-disabled; score reduced by "
-            f"{penalty} points."
+            f"{'s are' if err_disabled != 1 else ' is'} err-disabled."
         )
 
     available_components = 1 + sum(
@@ -619,7 +616,7 @@ def build_collection_notes(record: Mapping[str, Any]) -> list[str]:
     if coverage_pct < MIN_DATA_COVERAGE_PCT:
         add(
             f"Health impact: only {coverage_pct:.0f}% of health inputs were available; "
-            "status is Insufficient Data."
+            "health data is incomplete."
         )
 
     return notes
