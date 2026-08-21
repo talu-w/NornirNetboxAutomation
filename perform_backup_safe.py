@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-"""Create sanitized Nornir/NetBox running-configuration backups.
+"""Create standalone sanitized Nornir/NetBox configuration backups.
 
 Sensitive values are replaced inline so the resulting configuration retains
 its useful structure. For example, ``enable secret 9 HASH`` becomes
@@ -12,7 +12,10 @@ from __future__ import annotations
 
 import os
 import re
+import tempfile
+from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 
 # Universal NetBox tag used to select devices for sanitized backups.
@@ -21,7 +24,7 @@ DEFAULT_TARGET_TAG = "nornirtest"
 NORNIR_TARGET_TAG = os.getenv("NORNIR_TARGET_TAG", DEFAULT_TARGET_TAG)
 
 DEFAULT_SAFE_BACKUP_ROOT = "./config_backups_safe"
-REQUIRED_SANITIZER_API_VERSION = 1
+NORNIR_CONFIG_FILE = os.getenv("NORNIR_CONFIG_FILE", "config.yaml")
 SANITIZED_HEADER = (
     "! SANITIZED BACKUP - NOT A COMPLETE RESTORE CONFIGURATION\n"
     "! Sensitive values were replaced before this file was written."
@@ -241,31 +244,262 @@ def sanitize_running_config(running_config: str) -> str:
     return SANITIZED_HEADER + "\n" + "\n".join(sanitized).rstrip() + "\n"
 
 
+def normalize_tags(tags: list[Any]) -> list[str]:
+    """Return lowercase NetBox tag names and slugs."""
+
+    normalized: set[str] = set()
+    for tag in tags:
+        if isinstance(tag, str):
+            values = (tag,)
+        elif isinstance(tag, dict):
+            values = (tag.get("slug"), tag.get("name"))
+        else:
+            values = (getattr(tag, "slug", None), getattr(tag, "name", None))
+
+        for value in values:
+            if value:
+                normalized.add(str(value).casefold())
+
+    return sorted(normalized)
+
+
+def safe_host_component(hostname: str) -> str:
+    """Return a hostname that cannot escape the backup directory."""
+
+    component = re.sub(r"[^A-Za-z0-9._-]+", "_", hostname).strip("._")
+    return component or "device"
+
+
+def config_output_path(output_dir: Path, hostname: str) -> Path:
+    """Return the sanitized configuration path for one device."""
+
+    safe_hostname = safe_host_component(hostname)
+    return output_dir / safe_hostname / f"{safe_hostname}.cfg"
+
+
+def write_private_text(output_path: Path, content: str) -> None:
+    """Atomically write a UTF-8 file restricted to its owner."""
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{output_path.name}.",
+        suffix=".tmp",
+        dir=output_path.parent,
+    )
+    temporary_path = Path(temporary_name)
+
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            descriptor = -1
+            handle.write(content.rstrip() + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, output_path)
+        output_path.chmod(0o600)
+    except Exception:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+
+def collect_and_save_safe_config(task: Any, output_dir: Path) -> Any:
+    """Collect, sanitize, and save one device's running configuration."""
+
+    from nornir.core.task import Result
+    from nornir_netmiko.tasks import netmiko_send_command
+
+    try:
+        command_results = task.run(
+            name="Collect running configuration (contents omitted from logs)",
+            task=netmiko_send_command,
+            command_string="show running-config",
+            read_timeout=120,
+        )
+    except Exception as exc:
+        return Result(
+            host=task.host,
+            failed=True,
+            exception=exc,
+            result=f"Collection failed ({type(exc).__name__}); no file was written.",
+        )
+
+    command_result = command_results[-1]
+    if command_result.failed:
+        failure_exception = command_result.exception
+        command_result.result = "Collection failed; device output omitted from logs."
+        return Result(
+            host=task.host,
+            failed=True,
+            exception=failure_exception,
+            result="Running-configuration collection failed; no file was written.",
+        )
+
+    running_config = str(command_result.result)
+    command_result.result = "Running configuration collected; contents omitted from logs."
+
+    if not running_config.strip():
+        return Result(
+            host=task.host,
+            failed=True,
+            result="The device returned an empty configuration; no file was written.",
+        )
+
+    try:
+        sanitized_config = sanitize_running_config(running_config)
+    except SanitizationError as exc:
+        return Result(
+            host=task.host,
+            failed=True,
+            exception=exc,
+            result=f"Sanitation failed: {exc}",
+        )
+
+    output_path = config_output_path(output_dir, task.host.name)
+    try:
+        write_private_text(output_path, sanitized_config)
+    except OSError as exc:
+        return Result(
+            host=task.host,
+            failed=True,
+            exception=exc,
+            result=f"Could not write the sanitized configuration ({type(exc).__name__}).",
+        )
+
+    return Result(
+        host=task.host,
+        changed=False,
+        result=f"Saved sanitized configuration to {output_path.resolve()}",
+    )
+
+
 def main() -> int:
-    """Run the shared Nornir backup workflow with inline sanitation enabled."""
+    """Run the standalone Nornir/NetBox safe-backup workflow."""
 
-    import perform_backup as backup
-
-    if (
-        getattr(backup, "CONFIG_SANITIZER_API_VERSION", None)
-        != REQUIRED_SANITIZER_API_VERSION
-    ):
-        backup.console.print(
-            "[bold red]ERROR:[/] This safe script requires the recreated companion "
-            "perform_backup.py with sanitizer hook version 1. No backup was run."
+    try:
+        from nornir import InitNornir
+        from nornir.core.filter import F
+        from nornir.core.inventory import ConnectionOptions
+        from nornir_netmiko.tasks import netmiko_send_command  # noqa: F401
+    except ImportError as exc:
+        print(
+            "ERROR: Missing backup dependency. Install nornir and "
+            f"nornir-netmiko in this environment: {exc}"
         )
         return 1
 
-    backup.TARGET_TAG = NORNIR_TARGET_TAG
-    backup.CONFIG_SANITIZER = sanitize_running_config
-    backup.BACKUP_ROOT = Path(
+    username = os.getenv("NORNIR_USERNAME")
+    password = os.getenv("NORNIR_PASSWORD")
+    if not username or not password:
+        print("ERROR: NORNIR_USERNAME and NORNIR_PASSWORD must be set.")
+        return 1
+
+    try:
+        nr = InitNornir(config_file=NORNIR_CONFIG_FILE)
+    except Exception as exc:
+        print(f"ERROR: Could not initialize Nornir/NetBox inventory: {exc}")
+        return 1
+
+    nr.inventory.defaults.username = username
+    nr.inventory.defaults.password = password
+
+    if not nr.inventory.hosts:
+        print(
+            "No devices were loaded. Check the NetBox inventory plugin, API URL, "
+            "token, permissions, and Nornir configuration."
+        )
+        return 1
+
+    connection_defaults = {
+        "conn_timeout": 30,
+        "banner_timeout": 60,
+        "auth_timeout": 60,
+        "fast_cli": False,
+    }
+
+    for host in nr.inventory.hosts.values():
+        host.data["tag_slugs"] = normalize_tags(host.data.get("tags") or [])
+        existing = host.connection_options.get("netmiko")
+        extras = dict(connection_defaults)
+        if existing and existing.extras:
+            extras.update(existing.extras)
+
+        host.connection_options["netmiko"] = ConnectionOptions(
+            hostname=existing.hostname if existing else None,
+            port=existing.port if existing else None,
+            username=existing.username if existing else None,
+            password=existing.password if existing else None,
+            platform=existing.platform if existing else None,
+            extras=extras,
+        )
+
+    targets = nr.filter(F(tag_slugs__contains=NORNIR_TARGET_TAG.casefold()))
+
+    print("\n--- Safe backup filter results ---")
+    print(f"Target tag: {NORNIR_TARGET_TAG!r}")
+    print(f"Matched devices: {len(targets.inventory.hosts)}")
+    for number, hostname in enumerate(targets.inventory.hosts, start=1):
+        print(f"  {number:>3}. {hostname}")
+
+    if not targets.inventory.hosts:
+        print("No devices matched the configured NetBox tag.")
+        return 0
+
+    backup_time = datetime.now()
+    backup_root = Path(
         os.getenv("NORNIR_SAFE_BACKUP_ROOT", DEFAULT_SAFE_BACKUP_ROOT)
     )
-    backup.console.print(
-        "[bold yellow]SANITIZED BACKUP MODE:[/] Sensitive values will be replaced "
-        "inline before configuration files are written."
+    output_dir = (
+        backup_root
+        / backup_time.strftime("%Y")
+        / backup_time.strftime("%m")
+        / backup_time.strftime("%d")
     )
-    return backup.main()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"Output directory: {output_dir.resolve()}")
+    print("Collecting and sanitizing running configurations...")
+
+    results = targets.run(
+        name="Collect and save sanitized running configurations",
+        task=collect_and_save_safe_config,
+        output_dir=output_dir,
+    )
+
+    log_lines = [
+        "Standalone sanitized Nornir backup",
+        f"Time: {backup_time.isoformat()}",
+        f"Target tag: {NORNIR_TARGET_TAG}",
+        f"Output directory: {output_dir.resolve()}",
+        "",
+    ]
+
+    print("\n--- Safe backup summary ---")
+    for hostname in targets.inventory.hosts:
+        if hostname in results.failed_hosts:
+            status = f"FAILED {hostname} (no sanitized configuration written)"
+        else:
+            output_path = config_output_path(output_dir, hostname)
+            status = f"SAVED  {hostname}: {output_path.resolve()}"
+        print(status)
+        log_lines.append(status)
+
+    failed_count = len(results.failed_hosts)
+    successful_count = len(targets.inventory.hosts) - failed_count
+    completion = f"Completed: {successful_count} successful, {failed_count} failed"
+    print(completion)
+    log_lines.extend(("", completion))
+
+    log_path = output_dir / f"nornir_safe_backup_{backup_time:%Y%m%d_%H%M%S}.log"
+    try:
+        write_private_text(log_path, "\n".join(log_lines))
+    except OSError as exc:
+        print(f"ERROR: Could not write the safe backup log ({type(exc).__name__}).")
+        return 1
+
+    print(f"Run log: {log_path.resolve()}")
+    return 1 if failed_count else 0
 
 
 if __name__ == "__main__":
