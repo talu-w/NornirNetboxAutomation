@@ -2,8 +2,9 @@
 
 The script uses the repository's existing Nornir ``config.yaml``. NetBox devices
 are loaded by that configuration, normalized, and filtered with Nornir's ``F``
-filter. It collects device, interface, EtherChannel, port-security, CPU, and
-environment state. No device configuration is changed.
+filter. It collects device, interface quality, spanning-tree, deep
+EtherChannel, security/control-plane, CPU, and environment state. No device
+configuration is changed.
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ try:
     from openpyxl.formatting.rule import ColorScaleRule, FormulaRule
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
     from openpyxl.utils import get_column_letter
+    from openpyxl.worksheet.pagebreak import Break
     from openpyxl.worksheet.table import Table, TableStyleInfo
 except ImportError as exc:
     raise SystemExit(
@@ -69,9 +71,17 @@ DEGRADED_ETHERCHANNEL_PENALTY = 10
 DOWN_ETHERCHANNEL_PENALTY = 25
 MAX_COUNT_PENALTY = 30
 MAX_ETHERCHANNEL_PENALTY = 50
+INTERFACE_QUALITY_PENALTY = 3
+INTERFACE_INSTABILITY_PENALTY = 5
+STP_RECENT_CHANGE_PENALTY = 5
+STP_INCONSISTENT_PORT_PENALTY = 15
+SECURITY_EXCEPTION_PENALTY = 5
+MAX_ENGINEERING_EXCEPTION_PENALTY = 30
 HEALTHY_SCORE = 85
 WATCH_SCORE = 70
-HEALTH_COMPONENT_COUNT = 6
+HEALTH_COMPONENT_COUNT = 9
+INTERFACE_ERROR_CRITICAL_COUNT = 10_000
+RECENT_EVENT_SECONDS = 3_600
 
 PHYSICAL_INTERFACE_RE = re.compile(
     r"^(?:Fa|FastEthernet|Gi|GigabitEthernet|Te|TenGigabitEthernet|"
@@ -97,6 +107,50 @@ ETHERCHANNEL_MEMBER_RE = re.compile(
     r"(?P<name>[A-Za-z][A-Za-z-]*\d[\w./:-]*)"
     r"\((?P<flags>[^)]+)\)",
 )
+
+NETWORK_INTERFACE_RE = re.compile(
+    r"^(?:(?:Fa|FastEthernet|Gi|GigabitEthernet|Te|TenGigabitEthernet|"
+    r"Tw|TwoGigabitEthernet|Twe|TwentyFiveGigE|Fo|FortyGigabitEthernet|"
+    r"Hu|HundredGig(?:E|abitEthernet)|Eth|Ethernet|Et|Po|Port-?channel)\d)",
+    re.IGNORECASE,
+)
+
+INTERFACE_COUNTER_ALIASES = {
+    "alignerr": "alignment_errors",
+    "fcserr": "crc_errors",
+    "crc": "crc_errors",
+    "xmterr": "output_errors",
+    "rcverr": "input_errors",
+    "inerrors": "input_errors",
+    "outerrors": "output_errors",
+    "undersize": "undersize",
+    "outdiscards": "output_drops",
+    "indiscards": "input_drops",
+    "singlecol": "single_collisions",
+    "multicol": "multiple_collisions",
+    "latecol": "late_collisions",
+    "excesscol": "excessive_collisions",
+    "collisions": "collisions",
+    "carrisen": "carrier_sense_errors",
+    "runts": "runts",
+    "runt": "runts",
+    "giants": "giants",
+    "frame": "frame_errors",
+    "overrun": "overruns",
+    "ignored": "ignored",
+}
+
+ETHERCHANNEL_MEMBER_FLAG_MEANINGS = {
+    "P": "bundled",
+    "H": "hot standby",
+    "s": "suspended",
+    "I": "stand-alone",
+    "D": "down",
+    "w": "waiting",
+    "f": "failed aggregator allocation",
+    "M": "minimum links not met",
+    "m": "minimum links not met",
+}
 
 ERRDISABLE_REASON_RE = re.compile(
     r"\b(psecure-violation|security-violation|bpduguard|bpdu-guard|"
@@ -133,7 +187,11 @@ class EtherChannelState:
     state: str
     members: list[str] = field(default_factory=list)
     bundled_members: list[str] = field(default_factory=list)
+    standby_members: list[str] = field(default_factory=list)
     problem_members: list[str] = field(default_factory=list)
+    member_details: list[dict[str, str]] = field(default_factory=list)
+    min_links: int | None = None
+    risk_reasons: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -144,6 +202,59 @@ class PortSecurityIssue:
     interface: str
     violation_count: int
     action: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class InterfaceQualityIssue:
+    interface: str
+    counters: dict[str, int] = field(default_factory=dict)
+    last_link_flapped: str = ""
+    recent_link_flap: bool = False
+    interface_resets: int = 0
+    carrier_transitions: int = 0
+
+    @property
+    def error_total(self) -> int:
+        return sum(self.counters.values())
+
+    @property
+    def unstable(self) -> bool:
+        return bool(
+            self.recent_link_flap
+            or self.interface_resets > 0
+            or self.carrier_transitions > 0
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        data = asdict(self)
+        data["error_total"] = self.error_total
+        data["unstable"] = self.unstable
+        return data
+
+
+@dataclass(slots=True)
+class SpanningTreeInstance:
+    instance: str
+    root_bridge: str = ""
+    root_port: str = ""
+    topology_changes: int = 0
+    last_change: str = ""
+    change_source: str = ""
+    recent_change: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class SecurityControlException:
+    category: str
+    object_name: str
+    count: int
+    details: str
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -164,6 +275,10 @@ class DeviceHealth:
     connected_interfaces: int | None = None
     not_connected_interfaces: int | None = None
     total_interfaces: int | None = None
+    interface_quality_issues: list[dict[str, Any]] = field(default_factory=list)
+    interfaces_with_errors: int | None = None
+    interface_error_total: int | None = None
+    interface_instability_count: int | None = None
     cpu_pct: float | None = None
     environment_alerts: int | None = None
     err_disabled_interfaces: list[dict[str, str]] = field(default_factory=list)
@@ -178,6 +293,18 @@ class DeviceHealth:
     etherchannels_down: int | None = None
     etherchannel_members_total: int | None = None
     etherchannel_members_bundled: int | None = None
+    etherchannel_members_standby: int | None = None
+    etherchannel_member_issues: int | None = None
+    etherchannel_min_link_risks: int | None = None
+    spanning_tree_instances: list[dict[str, Any]] = field(default_factory=list)
+    spanning_tree_instance_count: int | None = None
+    stp_topology_changes: int | None = None
+    stp_recent_changes: int | None = None
+    stp_inconsistent_ports: list[dict[str, str]] = field(default_factory=list)
+    stp_inconsistent_port_count: int | None = None
+    security_control_exceptions: list[dict[str, Any]] = field(default_factory=list)
+    security_control_exception_count: int | None = None
+    security_control_drop_count: int | None = None
     reachable: bool = False
     collected_at_utc: datetime | None = None
     notes: list[str] = field(default_factory=list)
@@ -419,12 +546,32 @@ def command_profile(platform: str) -> dict[str, list[str]]:
         "interfaces": ["show interfaces status", "show ip interface brief"],
         "cpu": ["show process cpu"],
         "environment": ["show environment all", "show environment",],
+        "interface_errors": [
+            "show interfaces counters errors",
+            "show interface counters errors",
+        ],
+        "interface_detail": ["show interfaces"],
         "etherchannels": ["show etherchannel summary", "show port-channel summary"],
+        "etherchannel_detail": [
+            "show etherchannel detail",
+            "show port-channel database",
+        ],
+        "spanning_tree": ["show spanning-tree detail"],
+        "stp_inconsistent": [
+            "show spanning-tree inconsistentports",
+            "show spanning-tree inconsistent-ports",
+        ],
         "err_disabled": [
             "show interfaces status err-disabled",
             "show interface status err-disabled",
         ],
         "port_security": ["show port-security"],
+        "control_plane": [
+            "show policy-map control-plane",
+            "show policy-map interface control-plane",
+        ],
+        "arp_inspection": ["show ip arp inspection statistics"],
+        "dhcp_snooping": ["show ip dhcp snooping statistics"],
     }
 
     if "nxos" in platform_name or "nx-os" in platform_name:
@@ -433,15 +580,32 @@ def command_profile(platform: str) -> dict[str, list[str]]:
                 "interfaces": ["show interface status"],
                 "cpu": ["show system resources"],
                 "environment": ["show env all"],
+                "interface_errors": [
+                    "show interface counters errors",
+                    "show interfaces counters errors",
+                ],
+                "interface_detail": ["show interface"],
                 "etherchannels": [
                     "show port-channel summary",
                     "show etherchannel summary",
+                ],
+                "etherchannel_detail": [
+                    "show port-channel database",
+                    "show port-channel summary",
+                ],
+                "spanning_tree": ["show spanning-tree detail"],
+                "stp_inconsistent": [
+                    "show spanning-tree inconsistentports",
                 ],
                 "err_disabled": [
                     "show interface status err-disabled",
                     "show interfaces status err-disabled",
                 ],
                 "port_security": ["show port-security"],
+                "control_plane": [
+                    "show policy-map interface control-plane",
+                    "show policy-map control-plane",
+                ],
             }
         )
     elif "ios" in platform_name:
@@ -450,15 +614,33 @@ def command_profile(platform: str) -> dict[str, list[str]]:
                 "interfaces": ["show interface status"],
                 "cpu": ["show process cpu"],
                 "environment": ["show env all"],
+                "interface_errors": [
+                    "show interfaces counters errors",
+                    "show interface counters errors",
+                ],
+                "interface_detail": ["show interfaces"],
                 "etherchannels": [
                     "show etherchannel summary",
                     "show port-channel summary",
+                ],
+                "etherchannel_detail": [
+                    "show etherchannel detail",
+                    "show port-channel database",
+                ],
+                "spanning_tree": ["show spanning-tree detail"],
+                "stp_inconsistent": [
+                    "show spanning-tree inconsistentports",
+                    "show spanning-tree inconsistent-ports",
                 ],
                 "err_disabled": [
                     "show interfaces status err-disabled",
                     "show interface status err-disabled",
                 ],
                 "port_security": ["show port-security"],
+                "control_plane": [
+                    "show policy-map control-plane",
+                    "show policy-map interface control-plane",
+                ],
             }
         )
     elif "eos" in platform_name or "arista" in platform_name:
@@ -467,12 +649,26 @@ def command_profile(platform: str) -> dict[str, list[str]]:
                 "interfaces": ["show interfaces status"],
                 "cpu": ["show processes top once"],
                 "environment": ["show system environment all"],
+                "interface_errors": [
+                    "show interfaces counters errors",
+                    "show interfaces counters discards",
+                ],
+                "interface_detail": ["show interfaces"],
                 "etherchannels": ["show port-channel summary"],
+                "etherchannel_detail": [
+                    "show lacp neighbor",
+                    "show port-channel summary",
+                ],
+                "spanning_tree": ["show spanning-tree detail"],
+                "stp_inconsistent": [
+                    "show spanning-tree inconsistentports",
+                ],
                 "err_disabled": [
                     "show interfaces status errdisabled",
                     "show interfaces status err-disabled",
                 ],
                 "port_security": ["show port-security"],
+                "control_plane": ["show policy-map control-plane"],
             }
         )
     return profile
@@ -514,6 +710,335 @@ def parse_cpu_pct(output: str) -> float | None:
     if user_match and kernel_match:
         return min(100.0, float(user_match.group(1)) + float(kernel_match.group(1)))
     return None
+
+
+def _counter_value(value: str) -> int | None:
+    cleaned = value.replace(",", "").strip()
+    return int(cleaned) if cleaned.isdigit() else None
+
+
+def _counter_name(value: str) -> str | None:
+    normalized = re.sub(r"[^a-z0-9]", "", value.casefold())
+    return INTERFACE_COUNTER_ALIASES.get(normalized)
+
+
+def _interface_key(value: str) -> str:
+    """Normalize common long/short interface prefixes for deduplication."""
+
+    compact = value.strip().replace(" ", "").casefold()
+    prefixes = (
+        ("twentyfivegige", "twe"),
+        ("hundredgigabitethernet", "hu"),
+        ("hundredgige", "hu"),
+        ("fortygigabitethernet", "fo"),
+        ("tengigabitethernet", "te"),
+        ("twogigabitethernet", "tw"),
+        ("gigabitethernet", "gi"),
+        ("fastethernet", "fa"),
+        ("port-channel", "po"),
+        ("portchannel", "po"),
+        ("ethernet", "eth"),
+    )
+    for long_name, short_name in prefixes:
+        if compact.startswith(long_name):
+            return short_name + compact[len(long_name) :]
+    return compact
+
+
+def _duration_seconds(value: str) -> int | None:
+    """Convert common IOS/NX-OS elapsed-time strings to seconds."""
+
+    text = value.strip().casefold().rstrip(".,")
+    if not text or "never" in text:
+        return None
+
+    clock_match = re.fullmatch(r"(?:(\d+):)?(\d+):(\d+)", text)
+    if clock_match:
+        hours = int(clock_match.group(1) or 0)
+        minutes = int(clock_match.group(2))
+        seconds = int(clock_match.group(3))
+        return hours * 3_600 + minutes * 60 + seconds
+
+    units = {
+        "w": 604_800,
+        "week": 604_800,
+        "weeks": 604_800,
+        "d": 86_400,
+        "day": 86_400,
+        "days": 86_400,
+        "h": 3_600,
+        "hour": 3_600,
+        "hours": 3_600,
+        "m": 60,
+        "minute": 60,
+        "minutes": 60,
+        "s": 1,
+        "second": 1,
+        "seconds": 1,
+    }
+    matches = re.findall(
+        r"(\d+)\s*(weeks?|days?|hours?|minutes?|seconds?|[wdhms])", text
+    )
+    if not matches:
+        return None
+    return sum(int(number) * units[unit] for number, unit in matches)
+
+
+def parse_interface_quality(output: str) -> list[InterfaceQualityIssue]:
+    """Parse cumulative interface errors plus reset/link-transition indicators."""
+
+    issues: dict[str, InterfaceQualityIssue] = {}
+
+    def get_issue(interface: str) -> InterfaceQualityIssue:
+        key = _interface_key(interface)
+        if key not in issues:
+            issues[key] = InterfaceQualityIssue(interface=interface)
+        return issues[key]
+
+    header: list[str | None] | None = None
+    for line in output.splitlines():
+        tokens = line.split()
+        if not tokens:
+            continue
+        if tokens[0].casefold() in {"port", "interface"}:
+            candidate = [_counter_name(token) for token in tokens[1:]]
+            header = candidate if any(candidate) else None
+            continue
+        if header and PHYSICAL_INTERFACE_RE.match(tokens[0]):
+            issue = get_issue(tokens[0])
+            for name, raw_value in zip(header, tokens[1:], strict=False):
+                value = _counter_value(raw_value)
+                if name and value is not None:
+                    issue.counters[name] = max(issue.counters.get(name, 0), value)
+
+    current: InterfaceQualityIssue | None = None
+    block_pattern = re.compile(
+        r"^\s*(?P<interface>\S+)\s+is\s+.+?,\s*line protocol is\s+",
+        re.IGNORECASE,
+    )
+    metric_patterns = {
+        "input_errors": r"([\d,]+)\s+input errors",
+        "crc_errors": r"([\d,]+)\s+CRC",
+        "frame_errors": r"([\d,]+)\s+frame",
+        "overruns": r"([\d,]+)\s+overrun",
+        "ignored": r"([\d,]+)\s+ignored",
+        "runts": r"([\d,]+)\s+runts",
+        "giants": r"([\d,]+)\s+giants",
+        "output_errors": r"([\d,]+)\s+output errors",
+        "collisions": r"([\d,]+)\s+collisions",
+        "output_drops": r"Total output drops:\s*([\d,]+)",
+    }
+    for line in output.splitlines():
+        block_match = block_pattern.match(line)
+        if block_match:
+            interface = block_match.group("interface")
+            current = get_issue(interface) if PHYSICAL_INTERFACE_RE.match(interface) else None
+            continue
+        if current is None:
+            continue
+        for name, pattern in metric_patterns.items():
+            match = re.search(pattern, line, re.IGNORECASE)
+            if match:
+                value = _counter_value(match.group(1))
+                if value is not None:
+                    current.counters[name] = max(current.counters.get(name, 0), value)
+
+        reset_match = re.search(r"([\d,]+)\s+interface resets", line, re.IGNORECASE)
+        if reset_match:
+            current.interface_resets = _counter_value(reset_match.group(1)) or 0
+        transition_match = re.search(
+            r"([\d,]+)\s+carrier transitions", line, re.IGNORECASE
+        )
+        if transition_match:
+            current.carrier_transitions = _counter_value(transition_match.group(1)) or 0
+        flap_match = re.search(
+            r"Last link flapped\s+([^\s,()]+)", line, re.IGNORECASE
+        )
+        if flap_match:
+            current.last_link_flapped = flap_match.group(1)
+            elapsed = _duration_seconds(current.last_link_flapped)
+            current.recent_link_flap = (
+                elapsed is not None and elapsed <= RECENT_EVENT_SECONDS
+            )
+
+    return sorted(
+        (
+            issue
+            for issue in issues.values()
+            if issue.error_total > 0 or issue.unstable
+        ),
+        key=lambda item: item.interface.casefold(),
+    )
+
+
+def merge_interface_quality_issues(
+    *issue_groups: Sequence[InterfaceQualityIssue],
+) -> list[InterfaceQualityIssue]:
+    merged: dict[str, InterfaceQualityIssue] = {}
+    for group in issue_groups:
+        for issue in group:
+            key = _interface_key(issue.interface)
+            target = merged.setdefault(key, InterfaceQualityIssue(issue.interface))
+            for name, value in issue.counters.items():
+                target.counters[name] = max(target.counters.get(name, 0), value)
+            target.interface_resets = max(
+                target.interface_resets, issue.interface_resets
+            )
+            target.carrier_transitions = max(
+                target.carrier_transitions, issue.carrier_transitions
+            )
+            if issue.last_link_flapped:
+                target.last_link_flapped = issue.last_link_flapped
+            target.recent_link_flap = target.recent_link_flap or issue.recent_link_flap
+    return sorted(merged.values(), key=lambda item: item.interface.casefold())
+
+
+def parse_spanning_tree_instances(output: str) -> list[SpanningTreeInstance]:
+    """Parse roots and topology-change data from spanning-tree detail output."""
+
+    instances: list[SpanningTreeInstance] = []
+    current: SpanningTreeInstance | None = None
+    instance_pattern = re.compile(
+        r"^\s*(?P<instance>\S+)\s+is executing .*Spanning Tree protocol",
+        re.IGNORECASE,
+    )
+    for line in output.splitlines():
+        instance_match = instance_pattern.match(line)
+        if instance_match:
+            current = SpanningTreeInstance(instance=instance_match.group("instance"))
+            instances.append(current)
+            continue
+        if current is None:
+            continue
+
+        root_match = re.search(
+            r"Current root has priority\s+\d+,\s+address\s+([0-9a-f.:-]+)",
+            line,
+            re.IGNORECASE,
+        )
+        if root_match:
+            current.root_bridge = root_match.group(1)
+        root_port_match = re.search(r"Root port is .*?\(([^)]+)\)", line, re.IGNORECASE)
+        if root_port_match:
+            current.root_port = root_port_match.group(1)
+        change_match = re.search(
+            r"Number of topology changes\s+(\d+)\s+last change occurred\s+(.+?)\s+ago",
+            line,
+            re.IGNORECASE,
+        )
+        if change_match:
+            current.topology_changes = int(change_match.group(1))
+            current.last_change = change_match.group(2).strip()
+            elapsed = _duration_seconds(current.last_change)
+            current.recent_change = (
+                elapsed is not None and elapsed <= RECENT_EVENT_SECONDS
+            )
+        source_match = re.match(r"^\s*from\s+(\S+)", line, re.IGNORECASE)
+        if source_match and current.last_change:
+            current.change_source = source_match.group(1)
+    return instances
+
+
+def parse_stp_inconsistent_ports(output: str) -> list[dict[str, str]]:
+    """Return STP inconsistent interfaces and their reported reason/state."""
+
+    issues: dict[tuple[str, str], dict[str, str]] = {}
+    for line in output.splitlines():
+        tokens = line.split()
+        interface_index = next(
+            (
+                index
+                for index, token in enumerate(tokens)
+                if NETWORK_INTERFACE_RE.match(token)
+            ),
+            None,
+        )
+        if interface_index is None:
+            continue
+        interface = tokens[interface_index]
+        instance = tokens[0] if interface_index > 0 else "Spanning Tree"
+        reason = " ".join(tokens[interface_index + 1 :]) or "Inconsistent"
+        issues[(instance.casefold(), interface.casefold())] = {
+            "instance": instance,
+            "interface": interface,
+            "reason": reason,
+        }
+    return sorted(
+        issues.values(),
+        key=lambda item: (item["instance"].casefold(), item["interface"].casefold()),
+    )
+
+
+def parse_security_control_exceptions(
+    outputs: Mapping[str, str],
+) -> list[SecurityControlException]:
+    """Parse nonzero CoPP, Dynamic ARP Inspection, and DHCP-snooping drops."""
+
+    exceptions: dict[tuple[str, str, str], SecurityControlException] = {}
+
+    def add(category: str, object_name: str, count: int, details: str) -> None:
+        if count <= 0:
+            return
+        key = (category.casefold(), object_name.casefold(), details.casefold())
+        exceptions[key] = SecurityControlException(
+            category=category,
+            object_name=object_name,
+            count=count,
+            details=details,
+        )
+
+    control_plane = outputs.get("control_plane", "")
+    current_class = "Control plane"
+    for line in control_plane.splitlines():
+        class_match = re.search(r"Class-map:\s*([^\s(]+)", line, re.IGNORECASE)
+        if class_match:
+            current_class = class_match.group(1)
+        drop_match = re.search(r"drop packets\s+([\d,]+)", line, re.IGNORECASE)
+        if drop_match:
+            add(
+                "Control Plane",
+                current_class,
+                _counter_value(drop_match.group(1)) or 0,
+                "Cumulative control-plane policy drops",
+            )
+
+    arp_output = outputs.get("arp_inspection", "")
+    for line in arp_output.splitlines():
+        tokens = line.split()
+        if len(tokens) >= 3 and tokens[0].isdigit():
+            dropped = _counter_value(tokens[2])
+            if dropped is not None:
+                add(
+                    "Dynamic ARP Inspection",
+                    f"VLAN {tokens[0]}",
+                    dropped,
+                    "Cumulative DAI drops",
+                )
+
+    for source, category in (
+        ("arp_inspection", "Dynamic ARP Inspection"),
+        ("dhcp_snooping", "DHCP Snooping"),
+    ):
+        for line in outputs.get(source, "").splitlines():
+            match = re.search(
+                r"^\s*(?P<label>[^:=]*drop[^:=]*?)\s*(?:=|:)\s*"
+                r"(?P<count>[\d,]+)\s*$",
+                line,
+                re.IGNORECASE,
+            )
+            if not match:
+                continue
+            label = " ".join(match.group("label").split())
+            add(
+                category,
+                label or category,
+                _counter_value(match.group("count")) or 0,
+                "Cumulative security drop counter",
+            )
+    return sorted(
+        exceptions.values(),
+        key=lambda item: (item.category.casefold(), item.object_name.casefold()),
+    )
 
 
 def parse_interface_summary(output: str) -> InterfaceSummary:
@@ -664,7 +1189,9 @@ def parse_etherchannels(output: str) -> list[EtherChannelState]:
 
         members: list[str] = []
         bundled: list[str] = []
+        standby: list[str] = []
         problem: list[str] = []
+        member_details: list[dict[str, str]] = []
         seen: set[str] = set()
         for member_match in ETHERCHANNEL_MEMBER_RE.finditer(text):
             member = member_match.group("name")
@@ -674,21 +1201,52 @@ def parse_etherchannels(output: str) -> list[EtherChannelState]:
                 continue
             seen.add(key)
             members.append(member)
+            meanings = [
+                ETHERCHANNEL_MEMBER_FLAG_MEANINGS[flag]
+                for flag in flags
+                if flag in ETHERCHANNEL_MEMBER_FLAG_MEANINGS
+            ]
             if "P" in flags:
                 bundled.append(member)
+                member_state = "Bundled"
+                is_problem = False
+            elif "H" in flags:
+                standby.append(member)
+                member_state = "Hot standby"
+                is_problem = False
             else:
-                problem.append(f"{member}({flags})")
+                member_state = ", ".join(meanings) or "Not bundled"
+                is_problem = True
+                problem.append(f"{member} ({flags}: {member_state})")
+            member_details.append(
+                {
+                    "interface": member,
+                    "flags": flags,
+                    "state": member_state,
+                    "problem": "Yes" if is_problem else "No",
+                }
+            )
 
         channel_flags = str(raw["flags"])
         channel_is_up = "U" in channel_flags or (
             not channel_flags and bool(bundled)
         )
+        risk_reasons: list[str] = []
         if not channel_is_up:
             state = "Down"
+            risk_reasons.append("port-channel is not in use")
         elif problem or not members:
             state = "Degraded"
+            if problem:
+                risk_reasons.append("one or more members are not bundled")
+            if not members:
+                risk_reasons.append("no member interfaces were parsed")
         else:
             state = "Up"
+        if "M" in channel_flags or "m" in channel_flags:
+            if "minimum links not met" not in risk_reasons:
+                risk_reasons.append("minimum links not met")
+            state = "Down"
 
         channels.append(
             EtherChannelState(
@@ -699,10 +1257,53 @@ def parse_etherchannels(output: str) -> list[EtherChannelState]:
                 state=state,
                 members=members,
                 bundled_members=bundled,
+                standby_members=standby,
                 problem_members=problem,
+                member_details=member_details,
+                risk_reasons=risk_reasons,
             )
         )
     return sorted(channels, key=lambda item: (item.group, item.name.casefold()))
+
+
+def parse_etherchannel_min_links(output: str) -> dict[int, int]:
+    """Parse configured minimum-link requirements from channel detail output."""
+
+    minimums: dict[int, int] = {}
+    current_group: int | None = None
+    for line in output.splitlines():
+        group_match = re.search(r"\bGroup\s*:?\s*(\d+)\b", line, re.IGNORECASE)
+        if group_match:
+            current_group = int(group_match.group(1))
+        min_match = re.search(
+            r"\b(?:Minimum Links|Min-?links)\s*:?\s*(\d+)\b",
+            line,
+            re.IGNORECASE,
+        )
+        if current_group is not None and min_match:
+            minimums[current_group] = int(min_match.group(1))
+    return minimums
+
+
+def enrich_etherchannels(
+    channels: Sequence[EtherChannelState], detail_output: str
+) -> None:
+    """Apply minimum-link requirements to parsed EtherChannel state."""
+
+    minimums = parse_etherchannel_min_links(detail_output)
+    for channel in channels:
+        channel.min_links = minimums.get(channel.group)
+        if not channel.min_links:
+            continue
+        bundled = len(channel.bundled_members)
+        if bundled < channel.min_links:
+            reason = (
+                f"{bundled}/{channel.min_links} required members are bundled; "
+                "minimum links not met"
+            )
+            if reason not in channel.risk_reasons:
+                channel.risk_reasons.append(reason)
+            channel.state = "Down"
 
 
 def count_environment_alerts(output: str) -> int:
@@ -754,6 +1355,48 @@ def collect_device_health(
     except Exception as exc:  # noqa: BLE001 - collection errors must remain in the report.
         record.notes.append(f"Interface statistics unavailable: {exc}")
 
+    quality_outputs: list[str] = []
+    quality_errors: list[str] = []
+    for label, profile_key in (
+        ("Interface error counters", "interface_errors"),
+        ("Interface detail", "interface_detail"),
+    ):
+        try:
+            output, _ = run_first_supported(
+                task, label, profile[profile_key], read_timeout
+            )
+            quality_outputs.append(output)
+        except Exception:  # noqa: BLE001 - command support varies by platform.
+            quality_errors.append(label)
+
+    if quality_outputs:
+        quality_issues = merge_interface_quality_issues(
+            *(parse_interface_quality(output) for output in quality_outputs)
+        )
+        record.interface_quality_issues = [
+            issue.to_dict() for issue in quality_issues
+        ]
+        record.interfaces_with_errors = sum(
+            issue.error_total > 0 for issue in quality_issues
+        )
+        record.interface_error_total = sum(
+            issue.error_total for issue in quality_issues
+        )
+        record.interface_instability_count = sum(
+            issue.unstable for issue in quality_issues
+        )
+        if quality_errors:
+            record.notes.append(
+                "Some interface-quality detail was unavailable: "
+                + ", ".join(quality_errors)
+                + "."
+            )
+    else:
+        record.notes.append(
+            "Interface quality and instability commands were unsupported or "
+            "returned no usable output."
+        )
+
     try:
         errdisabled_output, _ = run_first_supported(
             task, "Err-disabled interfaces", profile["err_disabled"], read_timeout
@@ -773,6 +1416,20 @@ def collect_device_health(
             task, "EtherChannels", profile["etherchannels"], read_timeout
         )
         channels = parse_etherchannels(etherchannel_output)
+        try:
+            etherchannel_detail, _ = run_first_supported(
+                task,
+                "EtherChannel detail",
+                profile["etherchannel_detail"],
+                read_timeout,
+            )
+            enrich_etherchannels(channels, etherchannel_detail)
+        except Exception:  # noqa: BLE001 - deep detail is platform-dependent.
+            if channels:
+                record.notes.append(
+                    "Deep EtherChannel detail was unavailable; summary member flags "
+                    "were still collected."
+                )
         record.etherchannels = [channel.to_dict() for channel in channels]
         record.etherchannels_total = len(channels)
         record.etherchannels_healthy = sum(
@@ -790,8 +1447,54 @@ def collect_device_health(
         record.etherchannel_members_bundled = sum(
             len(channel.bundled_members) for channel in channels
         )
+        record.etherchannel_members_standby = sum(
+            len(channel.standby_members) for channel in channels
+        )
+        record.etherchannel_member_issues = sum(
+            len(channel.problem_members) for channel in channels
+        )
+        record.etherchannel_min_link_risks = sum(
+            any("minimum links" in reason for reason in channel.risk_reasons)
+            for channel in channels
+        )
     except Exception as exc:  # noqa: BLE001 - unsupported commands vary by platform.
         record.notes.append(f"EtherChannel status unavailable: {exc}")
+
+    try:
+        spanning_tree_output, _ = run_first_supported(
+            task, "Spanning tree", profile["spanning_tree"], read_timeout
+        )
+        instances = parse_spanning_tree_instances(spanning_tree_output)
+        record.spanning_tree_instances = [item.to_dict() for item in instances]
+        record.spanning_tree_instance_count = len(instances)
+        record.stp_topology_changes = sum(
+            item.topology_changes for item in instances
+        )
+        record.stp_recent_changes = sum(item.recent_change for item in instances)
+        if not instances and "no spanning tree" not in spanning_tree_output.casefold():
+            record.notes.append(
+                "Spanning-tree output was returned but no instances were parsed."
+            )
+        try:
+            inconsistent_output, _ = run_first_supported(
+                task,
+                "STP inconsistent ports",
+                profile["stp_inconsistent"],
+                read_timeout,
+            )
+            record.stp_inconsistent_ports = parse_stp_inconsistent_ports(
+                inconsistent_output
+            )
+            record.stp_inconsistent_port_count = len(
+                record.stp_inconsistent_ports
+            )
+        except Exception:  # noqa: BLE001 - not all platforms expose this view.
+            record.notes.append(
+                "STP inconsistent-port detail was unavailable; instance health was "
+                "still collected."
+            )
+    except Exception as exc:  # noqa: BLE001 - routers may not support spanning tree.
+        record.notes.append(f"Spanning-tree health unavailable: {exc}")
 
     try:
         port_security_output, _ = run_first_supported(
@@ -805,6 +1508,42 @@ def collect_device_health(
         )
     except Exception as exc:  # noqa: BLE001 - unsupported commands vary by platform.
         record.notes.append(f"Port-security status unavailable: {exc}")
+
+    security_outputs: dict[str, str] = {}
+    security_errors: list[str] = []
+    for profile_key, label in (
+        ("control_plane", "Control-plane policy"),
+        ("arp_inspection", "Dynamic ARP Inspection"),
+        ("dhcp_snooping", "DHCP snooping"),
+    ):
+        try:
+            output, _ = run_first_supported(
+                task, label, profile[profile_key], read_timeout
+            )
+            security_outputs[profile_key] = output
+        except Exception:  # noqa: BLE001 - features are frequently optional.
+            security_errors.append(label)
+
+    if security_outputs:
+        exceptions = parse_security_control_exceptions(security_outputs)
+        record.security_control_exceptions = [
+            exception.to_dict() for exception in exceptions
+        ]
+        record.security_control_exception_count = len(exceptions)
+        record.security_control_drop_count = sum(
+            exception.count for exception in exceptions
+        )
+        if security_errors:
+            record.notes.append(
+                "Some security/control-plane views were unavailable: "
+                + ", ".join(security_errors)
+                + "."
+            )
+    else:
+        record.notes.append(
+            "Security/control-plane exception commands were unsupported or returned "
+            "no usable output."
+        )
 
     try:
         cpu_output, _ = run_first_supported(
@@ -896,20 +1635,49 @@ def build_collection_notes(record: Mapping[str, Any]) -> list[str]:
             for issue in err_disabled
             if isinstance(issue, Mapping)
         )
-        add(
-            f"Health impact: err-disabled interface details: {details}."
-        )
+        add(f"Health impact: err-disabled: {details}.")
 
     port_security_issues = record.get("port_security_issues", [])
     if isinstance(port_security_issues, Sequence) and port_security_issues:
         details = ", ".join(
             f"{issue.get('interface', 'Unknown')} "
-            f"({issue.get('violation_count', 0)} violations, "
-            f"action {issue.get('action', 'Unknown')})"
+            f"({issue.get('violation_count', 0)} violations / "
+            f"{issue.get('action', 'Unknown')})"
             for issue in port_security_issues
             if isinstance(issue, Mapping)
         )
-        add(f"Health impact: port-security issues: {details}.")
+        add(f"Health impact: port security: {details}.")
+
+    interface_quality = record.get("interface_quality_issues", [])
+    if isinstance(interface_quality, Sequence) and interface_quality:
+        quality_details: list[str] = []
+        for issue in interface_quality[:8]:
+            if not isinstance(issue, Mapping):
+                continue
+            parts: list[str] = []
+            error_total = issue.get("error_total")
+            if isinstance(error_total, (int, float)) and error_total > 0:
+                parts.append(f"{int(error_total):,} cumulative error counters")
+            if issue.get("interface_resets"):
+                parts.append(f"interface resets {issue.get('interface_resets')}")
+            if issue.get("carrier_transitions"):
+                parts.append(
+                    f"carrier transitions {issue.get('carrier_transitions')}"
+                )
+            if issue.get("recent_link_flap"):
+                parts.append(
+                    f"last link flap {issue.get('last_link_flapped', 'recent')} ago"
+                )
+            quality_details.append(f"{issue.get('interface', 'Unknown')} ({', '.join(parts)})")
+        if len(interface_quality) > 8:
+            quality_details.append(
+                f"{len(interface_quality) - 8} additional interfaces; see Issue Details"
+            )
+        add(
+            "Health impact: interface quality/instability: "
+            + "; ".join(quality_details)
+            + "."
+        )
 
     etherchannels = record.get("etherchannels", [])
     if isinstance(etherchannels, Sequence):
@@ -920,13 +1688,67 @@ def build_collection_notes(record: Mapping[str, Any]) -> list[str]:
             bundled = channel.get("bundled_members", [])
             problem = channel.get("problem_members", [])
             detail = (
-                f"Health impact: {channel.get('name', 'Unknown channel')} is "
+                f"Health impact: {channel.get('name', 'Unknown channel')} "
                 f"{channel.get('state', 'Unknown')}; {len(bundled)}/{len(members)} "
-                "members are bundled"
+                "members bundled"
             )
             if problem:
-                detail += f"; affected members: {', '.join(map(str, problem))}"
+                detail += f"; affected: {', '.join(map(str, problem))}"
+            risks = channel.get("risk_reasons", [])
+            if risks:
+                concise_risks = [
+                    "minimum links not met" if "minimum links" in str(risk) else str(risk)
+                    for risk in risks
+                ]
+                detail += f"; {', '.join(dict.fromkeys(concise_risks))}"
             add(f"{detail}.")
+
+    recent_stp = [
+        item
+        for item in record.get("spanning_tree_instances", [])
+        if isinstance(item, Mapping) and item.get("recent_change")
+    ]
+    if recent_stp:
+        details = ", ".join(
+            f"{item.get('instance', 'Unknown')} changed "
+            f"{item.get('last_change', 'recently')} ago"
+            + (
+                f" from {item.get('change_source')}"
+                if item.get("change_source")
+                else ""
+            )
+            for item in recent_stp
+        )
+        add(f"Health impact: recent STP changes: {details}.")
+
+    inconsistent_ports = record.get("stp_inconsistent_ports", [])
+    if isinstance(inconsistent_ports, Sequence) and inconsistent_ports:
+        details = ", ".join(
+            f"{issue.get('interface', 'Unknown')} "
+            f"({issue.get('instance', 'STP')}: {issue.get('reason', 'Inconsistent')})"
+            for issue in inconsistent_ports
+            if isinstance(issue, Mapping)
+        )
+        add(f"Health impact: STP inconsistent ports: {details}.")
+
+    security_exceptions = record.get("security_control_exceptions", [])
+    if isinstance(security_exceptions, Sequence) and security_exceptions:
+        object_names = [
+            f"{issue.get('category', 'Security')} / {issue.get('object_name', 'Unknown')}"
+            for issue in security_exceptions[:6]
+            if isinstance(issue, Mapping)
+        ]
+        drop_total = sum(
+            int(issue.get("count", 0))
+            for issue in security_exceptions
+            if isinstance(issue, Mapping)
+            and isinstance(issue.get("count", 0), (int, float))
+        )
+        add(
+            f"Health impact: {len(security_exceptions)} security/control-plane "
+            f"exceptions with {drop_total:,} cumulative drops: "
+            f"{', '.join(object_names)}."
+        )
 
     available_components = 1 + sum(
         isinstance(record.get(field), (int, float))
@@ -936,6 +1758,9 @@ def build_collection_notes(record: Mapping[str, Any]) -> list[str]:
             "err_disabled_count",
             "port_security_interfaces",
             "etherchannels_total",
+            "interfaces_with_errors",
+            "spanning_tree_instance_count",
+            "security_control_exception_count",
         )
     )
     coverage_pct = available_components / HEALTH_COMPONENT_COUNT * 100
@@ -946,6 +1771,23 @@ def build_collection_notes(record: Mapping[str, Any]) -> list[str]:
         )
 
     return notes
+
+
+def engineering_notes_text(record: Mapping[str, Any]) -> str:
+    """Keep the overview notes readable while Issue Details retains full context."""
+
+    notes = build_collection_notes(record)
+    displayed: list[str] = []
+    for note in notes[:10]:
+        text = " ".join(note.split())
+        if len(text) > 140:
+            text = text[:137].rstrip() + "..."
+        displayed.append(text)
+    if len(notes) > 10:
+        displayed.append(
+            f"{len(notes) - 10} additional findings are listed in Issue Details."
+        )
+    return "\n".join(displayed)
 
 
 def _create_compact_health_workbook(
@@ -1256,6 +2098,64 @@ def _port_security_text(record: Mapping[str, Any]) -> str:
     )
 
 
+def _interface_quality_text(record: Mapping[str, Any]) -> str:
+    issues = record.get("interface_quality_issues", [])
+    if not isinstance(issues, Sequence):
+        return ""
+    details: list[str] = []
+    for issue in issues:
+        if not isinstance(issue, Mapping):
+            continue
+        parts: list[str] = []
+        counters = issue.get("counters", {})
+        if isinstance(counters, Mapping):
+            values = [
+                f"{name.replace('_', ' ')}={value}"
+                for name, value in counters.items()
+                if isinstance(value, (int, float)) and value > 0
+            ]
+            if values:
+                parts.append(", ".join(values))
+        if issue.get("interface_resets"):
+            parts.append(f"resets={issue.get('interface_resets')}")
+        if issue.get("carrier_transitions"):
+            parts.append(f"carrier transitions={issue.get('carrier_transitions')}")
+        if issue.get("recent_link_flap"):
+            parts.append(f"last flap={issue.get('last_link_flapped', 'recent')} ago")
+        details.append(f"{issue.get('interface', 'Unknown')}: {'; '.join(parts)}")
+    return " | ".join(details)
+
+
+def _spanning_tree_text(record: Mapping[str, Any]) -> str:
+    details: list[str] = []
+    instances = record.get("spanning_tree_instances", [])
+    if isinstance(instances, Sequence):
+        for item in instances:
+            if not isinstance(item, Mapping):
+                continue
+            text = (
+                f"{item.get('instance', 'Unknown')}: root "
+                f"{item.get('root_bridge') or 'not parsed'}, root port "
+                f"{item.get('root_port') or 'local/not parsed'}, "
+                f"topology changes {item.get('topology_changes', 0)}"
+            )
+            if item.get("last_change"):
+                text += f", last {item.get('last_change')} ago"
+            if item.get("change_source"):
+                text += f" from {item.get('change_source')}"
+            details.append(text)
+    inconsistent = record.get("stp_inconsistent_ports", [])
+    if isinstance(inconsistent, Sequence):
+        for issue in inconsistent:
+            if isinstance(issue, Mapping):
+                details.append(
+                    f"{issue.get('instance', 'STP')} / "
+                    f"{issue.get('interface', 'Unknown')}: "
+                    f"{issue.get('reason', 'Inconsistent')}"
+                )
+    return " | ".join(details)
+
+
 def _etherchannel_issue_text(record: Mapping[str, Any]) -> str:
     channels = record.get("etherchannels", [])
     if not isinstance(channels, Sequence):
@@ -1273,8 +2173,55 @@ def _etherchannel_issue_text(record: Mapping[str, Any]) -> str:
         )
         if problem:
             text += f": {', '.join(map(str, problem))}"
+        standby = channel.get("standby_members", [])
+        if standby:
+            text += f"; hot standby: {', '.join(map(str, standby))}"
+        if channel.get("min_links") is not None:
+            text += f"; minimum links: {channel.get('min_links')}"
+        risks = channel.get("risk_reasons", [])
+        if risks:
+            text += f"; risks: {', '.join(map(str, risks))}"
         details.append(text)
     return " | ".join(details)
+
+
+def _deep_etherchannel_text(record: Mapping[str, Any]) -> str:
+    channels = record.get("etherchannels", [])
+    if not isinstance(channels, Sequence):
+        return ""
+    details: list[str] = []
+    for channel in channels:
+        if not isinstance(channel, Mapping):
+            continue
+        members = channel.get("member_details", [])
+        member_text = ", ".join(
+            f"{member.get('interface', 'Unknown')}={member.get('state', 'Unknown')}"
+            for member in members
+            if isinstance(member, Mapping)
+        )
+        text = (
+            f"{channel.get('name', 'Unknown')} [{channel.get('protocol', 'Unknown')}] "
+            f"{channel.get('state', 'Unknown')}"
+        )
+        if channel.get("min_links") is not None:
+            text += f", min-links {channel.get('min_links')}"
+        if member_text:
+            text += f": {member_text}"
+        details.append(text)
+    return " | ".join(details)
+
+
+def _security_control_text(record: Mapping[str, Any]) -> str:
+    issues = record.get("security_control_exceptions", [])
+    if not isinstance(issues, Sequence):
+        return ""
+    return " | ".join(
+        f"{issue.get('category', 'Security')} / "
+        f"{issue.get('object_name', 'Unknown')}: {issue.get('count', 0)} — "
+        f"{issue.get('details', '')}"
+        for issue in issues
+        if isinstance(issue, Mapping)
+    )
 
 
 def build_issue_rows(records: Sequence[Mapping[str, Any]]) -> list[list[Any]]:
@@ -1364,16 +2311,69 @@ def build_issue_rows(records: Sequence[Mapping[str, Any]]) -> list[list[Any]]:
                     f"Violation counter: {issue.get('violation_count', 0)}",
                 )
 
+        for issue in record.get("interface_quality_issues", []):
+            if not isinstance(issue, Mapping):
+                continue
+            error_total = issue.get("error_total", 0)
+            error_total = error_total if isinstance(error_total, (int, float)) else 0
+            states: list[str] = []
+            detail_parts: list[str] = []
+            counters = issue.get("counters", {})
+            if error_total > 0:
+                states.append("Quality errors")
+            if isinstance(counters, Mapping):
+                detail_parts.extend(
+                    f"{name.replace('_', ' ')}={value}"
+                    for name, value in counters.items()
+                    if isinstance(value, (int, float)) and value > 0
+                )
+            if issue.get("interface_resets"):
+                states.append("Instability")
+                detail_parts.append(f"resets={issue.get('interface_resets')}")
+            if issue.get("carrier_transitions"):
+                if "Instability" not in states:
+                    states.append("Instability")
+                detail_parts.append(
+                    f"carrier transitions={issue.get('carrier_transitions')}"
+                )
+            if issue.get("recent_link_flap"):
+                if "Instability" not in states:
+                    states.append("Instability")
+                detail_parts.append(
+                    f"last link flap={issue.get('last_link_flapped', 'recent')} ago"
+                )
+            add(
+                "Critical"
+                if error_total >= INTERFACE_ERROR_CRITICAL_COUNT
+                else "Warning",
+                "Interface Quality",
+                str(issue.get("interface", "Unknown")),
+                " / ".join(states) or "Exception",
+                "; ".join(detail_parts)
+                + "; counters are cumulative unless cleared on the device",
+            )
+
         for channel in record.get("etherchannels", []):
             if not isinstance(channel, Mapping) or channel.get("state") == "Up":
                 continue
             state = str(channel.get("state", "Unknown"))
             problem = channel.get("problem_members", [])
             bundled = channel.get("bundled_members", [])
+            standby = channel.get("standby_members", [])
             members = channel.get("members", [])
-            details = f"{len(bundled)}/{len(members)} members bundled"
+            details = (
+                f"Protocol {channel.get('protocol', 'Unknown')}; "
+                f"{len(bundled)}/{len(members)} members bundled"
+            )
             if problem:
                 details += f"; affected: {', '.join(map(str, problem))}"
+            if standby:
+                details += f"; hot standby: {', '.join(map(str, standby))}"
+            if channel.get("min_links") is not None:
+                details += f"; minimum links: {channel.get('min_links')}"
+            risks = channel.get("risk_reasons", [])
+            if risks:
+                details += f"; risks: {', '.join(map(str, risks))}"
             add(
                 "Critical" if state == "Down" else "Warning",
                 "EtherChannel",
@@ -1381,6 +2381,46 @@ def build_issue_rows(records: Sequence[Mapping[str, Any]]) -> list[list[Any]]:
                 state,
                 details,
             )
+
+        for instance in record.get("spanning_tree_instances", []):
+            if not isinstance(instance, Mapping) or not instance.get("recent_change"):
+                continue
+            details = (
+                f"{instance.get('topology_changes', 0)} cumulative topology changes; "
+                f"last change {instance.get('last_change', 'recently')} ago"
+            )
+            if instance.get("change_source"):
+                details += f" from {instance.get('change_source')}"
+            if instance.get("root_bridge"):
+                details += f"; current root {instance.get('root_bridge')}"
+            add(
+                "Warning",
+                "Spanning Tree",
+                str(instance.get("instance", "Unknown")),
+                "Recent topology change",
+                details,
+            )
+
+        for issue in record.get("stp_inconsistent_ports", []):
+            if isinstance(issue, Mapping):
+                add(
+                    "Critical",
+                    "Spanning Tree",
+                    str(issue.get("interface", "Unknown")),
+                    "Inconsistent",
+                    f"{issue.get('instance', 'STP')}: "
+                    f"{issue.get('reason', 'Inconsistent')}",
+                )
+
+        for issue in record.get("security_control_exceptions", []):
+            if isinstance(issue, Mapping):
+                add(
+                    "Warning",
+                    str(issue.get("category", "Security / Control Plane")),
+                    str(issue.get("object_name", "Unknown")),
+                    f"{issue.get('count', 0)} drops",
+                    str(issue.get("details", "Cumulative exception counter")),
+                )
 
         for note in record.get("notes", []):
             add("Warning", "Telemetry", hostname, "Collection note", str(note))
@@ -1476,15 +2516,34 @@ def create_elaborate_health_workbook(
         "System and Collection Health": 41,
         "CPU Utilization": 42,
         "Environment Alerts": 43,
-        "Engineering Notes": 44,
+        "Interface Quality and Instability": 46,
+        "Interfaces with Errors": 47,
+        "Error Counter Sum": 48,
+        "Instability Indicators": 49,
+        "Interface Quality Details": 50,
+        "Spanning Tree Health": 52,
+        "STP Instances": 53,
+        "Topology Changes": 54,
+        "Recent Topology Changes": 55,
+        "Inconsistent Ports": 56,
+        "STP Details": 57,
+        "Deep EtherChannel Health": 59,
+        "Min-link Risks": 60,
+        "Hot-standby Members": 61,
+        "Member State Details": 62,
+        "Security and Control Plane Exceptions": 64,
+        "Additional Exceptions": 65,
+        "Drop Counter Sum": 66,
+        "Security / Control Plane Details": 67,
+        "Engineering Notes": 69,
     }
-    section_rows = {20, 31, 41}
+    section_rows = {20, 31, 41, 46, 52, 59, 64}
 
     overview["A4"] = "Metric"
     for label, row in metric_rows.items():
         overview.cell(row, 1, label)
 
-    for row in range(4, 45):
+    for row in range(4, 70):
         cell = overview.cell(row, 1)
         if row in section_rows:
             cell.fill = _fill(teal)
@@ -1523,6 +2582,17 @@ def create_elaborate_health_workbook(
         "Bundled Members": "etherchannel_members_bundled",
         "Total Members": "etherchannel_members_total",
         "Environment Alerts": "environment_alerts",
+        "Interfaces with Errors": "interfaces_with_errors",
+        "Error Counter Sum": "interface_error_total",
+        "Instability Indicators": "interface_instability_count",
+        "STP Instances": "spanning_tree_instance_count",
+        "Topology Changes": "stp_topology_changes",
+        "Recent Topology Changes": "stp_recent_changes",
+        "Inconsistent Ports": "stp_inconsistent_port_count",
+        "Min-link Risks": "etherchannel_min_link_risks",
+        "Hot-standby Members": "etherchannel_members_standby",
+        "Additional Exceptions": "security_control_exception_count",
+        "Drop Counter Sum": "security_control_drop_count",
     }
 
     for index, record in enumerate(records, start=2):
@@ -1535,7 +2605,11 @@ def create_elaborate_health_workbook(
         overview.cell(26, index, _interface_issue_text(record))
         overview.cell(29, index, _port_security_text(record))
         overview.cell(39, index, _etherchannel_issue_text(record))
-        overview.cell(44, index, " | ".join(build_collection_notes(record)))
+        overview.cell(69, index, engineering_notes_text(record))
+        overview.cell(50, index, _interface_quality_text(record))
+        overview.cell(57, index, _spanning_tree_text(record))
+        overview.cell(62, index, _deep_etherchannel_text(record))
+        overview.cell(67, index, _security_control_text(record))
 
         cpu_pct = record.get("cpu_pct")
         overview.cell(
@@ -1550,7 +2624,9 @@ def create_elaborate_health_workbook(
             index,
             (
                 f'=(IF({column}17="Yes",1,0)+'
-                f'COUNT({column}42,{column}43,{column}25,{column}27,{column}32))/6'
+                f'COUNT({column}42,{column}43,{column}25,{column}27,'
+                f'{column}32,{column}47,{column}53,{column}65))/'
+                f"{HEALTH_COMPONENT_COUNT}"
             ),
         )
         overview.cell(
@@ -1569,7 +2645,15 @@ def create_elaborate_health_workbook(
                 f"'Scoring'!$B$12),0)"
                 f"-MIN(IF(ISNUMBER({column}34),{column}34*'Scoring'!$B$10,0)"
                 f"+IF(ISNUMBER({column}35),{column}35*'Scoring'!$B$11,0),"
-                f"'Scoring'!$B$13)))"
+                f"'Scoring'!$B$13)"
+                f"-MIN(IF(ISNUMBER({column}47),{column}47*'Scoring'!$B$16,0)"
+                f"+IF(ISNUMBER({column}49),{column}49*'Scoring'!$B$17,0),"
+                f"'Scoring'!$B$21)"
+                f"-MIN(IF(ISNUMBER({column}55),{column}55*'Scoring'!$B$18,0)"
+                f"+IF(ISNUMBER({column}56),{column}56*'Scoring'!$B$19,0),"
+                f"'Scoring'!$B$21)"
+                f"-IF(ISNUMBER({column}65),MIN({column}65*'Scoring'!$B$20,"
+                f"'Scoring'!$B$21),0)))"
             ),
         )
         overview.cell(
@@ -1578,9 +2662,12 @@ def create_elaborate_health_workbook(
             (
                 f"=IF({column}17<>\"Yes\",\"Unreachable\","
                 f"IF({column}7<'Scoring'!$B$4,\"Insufficient Data\","
-                f"IF(OR({column}35>0,{column}6<'Scoring'!$B$15),\"Critical\","
+                f"IF(OR({column}35>0,{column}56>0,"
+                f"{column}6<'Scoring'!$B$15),\"Critical\","
                 f"IF(OR({column}6<'Scoring'!$B$14,{column}34>0,"
-                f"{column}25>0,{column}27>0,{column}43>0),\"Watch\",\"Healthy\"))))"
+                f"{column}25>0,{column}27>0,{column}43>0,{column}47>0,"
+                f"{column}49>0,{column}55>0,{column}60>0,{column}65>0),"
+                f"\"Watch\",\"Healthy\"))))"
             ),
         )
 
@@ -1592,7 +2679,7 @@ def create_elaborate_health_workbook(
         )
         overview.column_dimensions[column].width = 29
 
-        for row in range(5, 45):
+        for row in range(5, 70):
             if row in section_rows:
                 continue
             cell = overview.cell(row, index)
@@ -1604,7 +2691,11 @@ def create_elaborate_health_workbook(
     overview.row_dimensions[26].height = 72
     overview.row_dimensions[29].height = 72
     overview.row_dimensions[39].height = 96
-    overview.row_dimensions[44].height = 220
+    overview.row_dimensions[69].height = 400
+    overview.row_dimensions[50].height = 130
+    overview.row_dimensions[57].height = 130
+    overview.row_dimensions[62].height = 150
+    overview.row_dimensions[67].height = 110
     overview.freeze_panes = "A5"
 
     for column in range(2, last_column + 1):
@@ -1641,7 +2732,20 @@ def create_elaborate_health_workbook(
             end_color="63BE7B",
         ),
     )
-    for row, color in ((25, red), (27, red), (34, amber), (35, red), (43, amber)):
+    for row, color in (
+        (25, red),
+        (27, red),
+        (34, amber),
+        (35, red),
+        (43, amber),
+        (47, amber),
+        (49, amber),
+        (55, amber),
+        (56, red),
+        (60, red),
+        (65, amber),
+        (66, amber),
+    ):
         overview.conditional_formatting.add(
             f"B{row}:{last_column_letter}{row}",
             FormulaRule(formula=[f"B{row}>0"], fill=_fill(color)),
@@ -1656,7 +2760,21 @@ def create_elaborate_health_workbook(
         "Network Automation",
     )
 
-    summary_start = 47
+    overview["A48"].comment = Comment(
+        "Sum of parsed cumulative error/drop counters; use Issue Details to see "
+        "the counter type and interface.",
+        "Network Automation",
+    )
+    overview["A54"].comment = Comment(
+        "Cumulative spanning-tree topology changes reported by all parsed instances.",
+        "Network Automation",
+    )
+    overview["A66"].comment = Comment(
+        "Cumulative parsed CoPP, DAI, and DHCP-snooping drop counters.",
+        "Network Automation",
+    )
+
+    summary_start = 72
     overview[f"A{summary_start}"] = "Fleet Summary"
     overview.merge_cells(
         start_row=summary_start,
@@ -1679,6 +2797,12 @@ def create_elaborate_health_workbook(
         "Down EtherChannels",
         "Err-disabled Interfaces",
         "Port-security Interfaces",
+        "Interfaces with Quality Errors",
+        "Instability Indicators",
+        "Recent STP Changes",
+        "STP Inconsistent Ports",
+        "EtherChannel Min-link Risks",
+        "Security / Control Exceptions",
     ]
     for row, label in enumerate(summary_labels, start=summary_start + 1):
         overview.cell(row, 1, label)
@@ -1696,7 +2820,10 @@ def create_elaborate_health_workbook(
         2,
         f'=IFERROR(AVERAGE(B6:{last_column_letter}6),"")',
     )
-    for offset, source_row in enumerate((32, 34, 35, 25, 27), start=8):
+    for offset, source_row in enumerate(
+        (32, 34, 35, 25, 27, 47, 49, 55, 56, 60, 65),
+        start=8,
+    ):
         overview.cell(
             summary_start + offset,
             2,
@@ -1717,6 +2844,8 @@ def create_elaborate_health_workbook(
     overview.print_area = (
         f"A1:{last_column_letter}{summary_start + len(summary_labels)}"
     )
+    overview.row_breaks.append(Break(id=68))
+    overview.row_breaks.append(Break(id=summary_start - 1))
 
     details.merge_cells("A1:I1")
     details["A1"] = "Engineer Issue Details"
@@ -1726,8 +2855,8 @@ def create_elaborate_health_workbook(
     details.row_dimensions[1].height = 42
     details.merge_cells("A2:I2")
     details["A2"] = (
-        "One row per actionable device, interface, port-security, EtherChannel, "
-        f"or telemetry issue | Generated {generated}"
+        "One row per actionable device, interface, spanning-tree, security, "
+        f"EtherChannel, or telemetry issue | Generated {generated}"
     )
     details["A2"].font = Font(italic=True, color=gray)
     details["A2"].fill = _fill(pale_blue)
@@ -1822,6 +2951,12 @@ def create_elaborate_health_workbook(
         ("Maximum EtherChannel penalty", MAX_ETHERCHANNEL_PENALTY),
         ("Healthy score", HEALTHY_SCORE),
         ("Watch score", WATCH_SCORE),
+        ("Interface quality penalty", INTERFACE_QUALITY_PENALTY),
+        ("Interface instability penalty", INTERFACE_INSTABILITY_PENALTY),
+        ("Recent STP change penalty", STP_RECENT_CHANGE_PENALTY),
+        ("STP inconsistent-port penalty", STP_INCONSISTENT_PORT_PENALTY),
+        ("Security/control-plane exception penalty", SECURITY_EXCEPTION_PENALTY),
+        ("Maximum engineering exception penalty", MAX_ENGINEERING_EXCEPTION_PENALTY),
     ]
     for row in scoring_rows:
         scoring.append(row)
@@ -1905,8 +3040,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     console.print(
-        "Collecting firmware, interface, EtherChannel, port-security, CPU, "
-        "and environment health..."
+        "Collecting firmware, interface quality/instability, spanning-tree, "
+        "deep EtherChannel, security/control-plane, CPU, and environment health..."
     )
     results = targets.run(
         name="Collect network health",
