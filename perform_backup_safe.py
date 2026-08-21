@@ -1,23 +1,17 @@
 #!/usr/bin/env python3
 
-"""Create sanitized Nornir/NetBox backups of network running configurations.
+"""Create sanitized Nornir/NetBox running-configuration backups.
 
-This entry point reuses the collection workflow in ``perform_backup.py`` and
-removes common credential, AAA, RADIUS, TACACS+, SNMP authentication, and key
-statements before a configuration is written. It is intentionally conservative:
-when a line appears security-sensitive, the complete line is replaced instead
-of attempting to preserve part of it.
-
-The sanitizer targets common Cisco IOS/IOS-XE/NX-OS/ASA syntax and also catches
-several generic network-configuration secret forms. Always validate the rules
-against sanitized lab configurations for every platform in your inventory.
+Sensitive values are replaced inline so the resulting configuration retains
+its useful structure. For example, ``enable secret 9 HASH`` becomes
+``enable secret 9 <removed enable secret>``. The safe backup is intentionally
+not suitable as a complete restore configuration.
 """
 
 from __future__ import annotations
 
 import os
 import re
-from collections.abc import Iterable
 from pathlib import Path
 
 
@@ -27,15 +21,20 @@ DEFAULT_TARGET_TAG = "nornirtest"
 NORNIR_TARGET_TAG = os.getenv("NORNIR_TARGET_TAG", DEFAULT_TARGET_TAG)
 
 DEFAULT_SAFE_BACKUP_ROOT = "./config_backups_safe"
+REQUIRED_SANITIZER_API_VERSION = 1
 SANITIZED_HEADER = (
     "! SANITIZED BACKUP - NOT A COMPLETE RESTORE CONFIGURATION\n"
-    "! Security-sensitive statements were removed before this file was written."
+    "! Sensitive values were replaced before this file was written."
 )
 _SANITIZED_HEADER_LINES = frozenset(SANITIZED_HEADER.splitlines())
 
+# A value can be a normal config token, a quoted value, or one of our existing
+# placeholders. Treating placeholders as one value makes sanitation idempotent.
+_VALUE = r'(?:<removed [^>\r\n]+>|"[^"\r\n]*"|\'[^\'\r\n]*\'|\S+)'
+
 
 class SanitizationError(ValueError):
-    """Raised when sanitized output still appears to contain sensitive data."""
+    """Raised when safe output cannot be guaranteed."""
 
 
 _PRIVATE_KEY_START = re.compile(
@@ -47,158 +46,164 @@ _PRIVATE_KEY_END = re.compile(
     re.IGNORECASE,
 )
 
-# These commands introduce indented Cisco-style blocks whose names, endpoints,
-# and child commands are all considered sensitive for a clean shared backup.
-_SENSITIVE_BLOCKS: tuple[tuple[re.Pattern[str], str], ...] = (
-    (
-        re.compile(r"^aaa\s+group\s+server\b", re.IGNORECASE),
-        "centralized authentication block",
-    ),
-    (
-        re.compile(r"^(?:radius|tacacs)\s+server\b", re.IGNORECASE),
-        "centralized authentication block",
-    ),
-    (
-        re.compile(r"^key\s+chain\b", re.IGNORECASE),
-        "key-chain block",
-    ),
-    (
-        re.compile(r"^crypto\s+ikev2\s+keyring\b", re.IGNORECASE),
-        "keyring block",
-    ),
-    (
-        re.compile(r"^crypto\s+keyring\b", re.IGNORECASE),
-        "keyring block",
-    ),
+
+def _value_pattern(prefix: str) -> re.Pattern[str]:
+    """Compile a case-insensitive pattern with prefix and value groups."""
+
+    return re.compile(
+        rf"(?P<prefix>{prefix})(?P<value>{_VALUE})",
+        re.IGNORECASE,
+    )
+
+
+_IP_HTTP_USERNAME = _value_pattern(r"\bip\s+http\s+client\s+username\s+")
+_IP_HTTP_PASSWORD = _value_pattern(
+    r"\bip\s+http\s+client\s+password(?:\s+[056789])?\s+"
+)
+_USERNAME = _value_pattern(r"\b(?:username|user-name)\s+")
+_LOGIN_USER = _value_pattern(r"\blogin\s+user\s+")
+
+_ENABLE_SECRET = _value_pattern(r"^\s*enable\s+secret(?:\s+[056789])?\s+")
+_ENABLE_PASSWORD = _value_pattern(r"^\s*enable\s+password(?:\s+[056789])?\s+")
+_GENERIC_CREDENTIAL = _value_pattern(
+    r"\b(?:password|passwd|secret|shared-secret|client-secret)"
+    r"(?:\s+[056789])?\s+"
 )
 
-# Order matters: the first match supplies the audit-friendly redaction label.
-_SENSITIVE_LINES: tuple[tuple[str, re.Pattern[str]], ...] = (
-    (
-        "local account",
-        re.compile(
-            r"(?:^|\s)(?:username|user-name)\b|\blogin\s+user\b",
-            re.IGNORECASE,
-        ),
-    ),
-    (
-        "AAA or centralized authentication",
-        re.compile(
-            r"(?:^|\s)(?:aaa(?:-server)?|radius(?:-server)?|tacacs(?:-server)?)\b"
-            r"|\b(?:authentication|authorization|accounting)\b"
-            r"|\bserver-private\b"
-            r"|^(?:\s*)(?:dot1x|mab)\b",
-            re.IGNORECASE,
-        ),
-    ),
-    (
-        "credential",
-        re.compile(
-            r"\b(?:password|passwd|secret|shared-secret|client-secret)\b"
-            r"|\bencrypted-password\b",
-            re.IGNORECASE,
-        ),
-    ),
-    (
-        "SNMP access",
-        re.compile(
-            r"(?:^|\s)snmp(?:-server)?\s+(?:community|user|host|group)\b",
-            re.IGNORECASE,
-        ),
-    ),
-    (
-        "authentication key",
-        re.compile(
-            r"\b(?:key-string|authentication-key|message-digest-key|pre-shared-key|"
-            r"private-key|wpa-psk|psk)\b"
-            r"|\bcrypto\s+isakmp\s+key\b"
-            r"|^\s*key\s+(?!chain\b)(?:\d+\s+)?\S+"
-            r"|\b(?:standby|vrrp|glbp)\b.*\bauthentication\b"
-            r"|\bntp\s+(?:authentication-key|trusted-key)\b",
-            re.IGNORECASE,
-        ),
-    ),
-    (
-        "embedded access token",
-        re.compile(
-            r"\b(?:api[-_ ]?key|access[-_ ]?token|bearer[-_ ]?token)\b\s*(?:=|\s)\s*\S+",
-            re.IGNORECASE,
-        ),
-    ),
-    (
-        "embedded URL credential",
-        re.compile(r"://[^/\s:@]+:[^@\s/]+@", re.IGNORECASE),
-    ),
-    (
-        "PPP credential",
-        re.compile(r"(?:^|\s)ppp\s+(?:chap|pap)\b", re.IGNORECASE),
-    ),
+_SNMP_COMMUNITY = _value_pattern(r"\bsnmp(?:-server)?\s+community\s+")
+_SNMP_USER = _value_pattern(r"\bsnmp(?:-server)?\s+user\s+")
+_SNMP_AUTH = _value_pattern(
+    r"\bauth\s+(?:md5|sha(?:-\d+)?)(?:\s+[056789])?\s+"
+)
+_SNMP_PRIV = _value_pattern(
+    r"\bpriv\s+(?:des|3des|aes(?:\s+\d+)?)(?:\s+[056789])?\s+"
+)
+
+_SERVER_KEY = _value_pattern(r"\bserver-key(?:\s+[056789])?\s+")
+_KEY_STRING = _value_pattern(r"\bkey-string(?:\s+[056789])?\s+")
+_PRE_SHARED_KEY = _value_pattern(r"\bpre-shared-key(?:\s+[056789])?\s+")
+_RADIUS_TACACS_KEY = _value_pattern(
+    r"\b(?:radius-server|tacacs-server)\s+key(?:\s+[056789])?\s+"
+)
+_TYPED_KEY = _value_pattern(r"(?<![-\w])key\s+[056789]\s+")
+_ISAKMP_KEY = _value_pattern(r"\bcrypto\s+isakmp\s+key\s+")
+_OSPF_AUTH_KEY = _value_pattern(
+    r"\bip\s+ospf\s+authentication-key(?:\s+[056789])?\s+"
+)
+_MESSAGE_DIGEST_KEY = _value_pattern(
+    r"\bmessage-digest-key\s+\S+\s+(?:md5|sha(?:-\d+)?)"
+    r"(?:\s+[056789])?\s+"
+)
+_NTP_AUTH_KEY = _value_pattern(
+    r"^\s*ntp\s+authentication-key\s+\S+\s+"
+    r"(?:md5|sha(?:-\d+)?)(?:\s+[056789])?\s+"
+)
+_WPA_PSK = _value_pattern(r"\b(?:wpa-psk|psk)(?:\s+[056789])?\s+")
+
+_ACCESS_TOKEN = _value_pattern(
+    r"\b(?:api[-_ ]?key|access[-_ ]?token|bearer[-_ ]?token)\b\s*(?:=|\s)\s*"
+)
+_URL_CREDENTIAL = re.compile(
+    rf"(?P<prefix>://)(?P<username>{_VALUE}):(?P<password>{_VALUE})@",
+    re.IGNORECASE,
 )
 
 
-def _block_category(line: str) -> str | None:
-    """Return the category when a line starts a sensitive config block."""
-
-    for pattern, category in _SENSITIVE_BLOCKS:
-        if pattern.search(line):
-            return category
-    return None
+def _is_removed(value: str) -> bool:
+    return value.casefold().startswith("<removed ") and value.endswith(">")
 
 
-def _line_category(line: str) -> str | None:
-    """Classify a single sensitive statement without returning its contents."""
+def _replace_value(line: str, pattern: re.Pattern[str], marker: str) -> str:
+    """Replace every unsanitized value matched by pattern."""
 
-    stripped = line.strip()
-    if stripped.startswith("! <redacted:") or stripped.startswith("! SANITIZED BACKUP"):
-        return None
+    def replace(match: re.Match[str]) -> str:
+        if _is_removed(match.group("value")):
+            return match.group(0)
+        return match.group("prefix") + marker
 
-    for category, pattern in _SENSITIVE_LINES:
-        if pattern.search(line):
-            return category
-    return None
+    return pattern.sub(replace, line)
 
 
-def _append_marker(lines: list[str], category: str, indentation: str = "") -> None:
-    """Append one marker and collapse adjacent identical redactions."""
+def _replace_url_credentials(line: str) -> str:
+    """Remove usernames and passwords embedded in URLs."""
 
-    marker = f"{indentation}! <redacted: {category}>"
-    if not lines or lines[-1] != marker:
-        lines.append(marker)
+    def replace(match: re.Match[str]) -> str:
+        username = match.group("username")
+        password = match.group("password")
+        if _is_removed(username) and _is_removed(password):
+            return match.group(0)
+        return "://<removed username>:<removed password>@"
+
+    return _URL_CREDENTIAL.sub(replace, line)
 
 
-def _remaining_sensitive_lines(lines: Iterable[str]) -> list[int]:
-    """Return line numbers that fail the post-sanitization safety scan."""
+def sanitize_config_line(line: str) -> str:
+    """Replace recognized sensitive values while preserving command syntax."""
 
-    suspicious: list[int] = []
-    for line_number, line in enumerate(lines, start=1):
-        stripped = line.strip()
-        if _PRIVATE_KEY_START.match(stripped):
-            suspicious.append(line_number)
-        elif _block_category(stripped) or _line_category(line):
-            suspicious.append(line_number)
-    return suspicious
+    cleaned = _replace_url_credentials(line)
+
+    # Account identifiers.
+    cleaned = _replace_value(
+        cleaned,
+        _IP_HTTP_USERNAME,
+        "<removed IP HTTP client username>",
+    )
+    cleaned = _replace_value(cleaned, _SNMP_USER, "<removed SNMP username>")
+    cleaned = _replace_value(cleaned, _USERNAME, "<removed username>")
+    cleaned = _replace_value(cleaned, _LOGIN_USER, "<removed username>")
+
+    # Passwords and enable secrets. Run special cases before the generic rule.
+    cleaned = _replace_value(
+        cleaned,
+        _IP_HTTP_PASSWORD,
+        "<removed IP HTTP client password>",
+    )
+    cleaned = _replace_value(
+        cleaned,
+        _ENABLE_SECRET,
+        "<removed enable secret>",
+    )
+    cleaned = _replace_value(
+        cleaned,
+        _ENABLE_PASSWORD,
+        "<removed enable password>",
+    )
+    cleaned = _replace_value(cleaned, _GENERIC_CREDENTIAL, "<removed password>")
+
+    # SNMP names and authentication material.
+    cleaned = _replace_value(cleaned, _SNMP_COMMUNITY, "<removed SNMP community>")
+    if re.search(r"\bsnmp(?:-server)?\b", cleaned, re.IGNORECASE):
+        cleaned = _replace_value(cleaned, _SNMP_AUTH, "<removed SNMP auth key>")
+        cleaned = _replace_value(cleaned, _SNMP_PRIV, "<removed SNMP privacy key>")
+
+    # Shared keys used by AAA, routing, VPN, NTP, and wireless features.
+    cleaned = _replace_value(cleaned, _SERVER_KEY, "<removed key>")
+    cleaned = _replace_value(cleaned, _KEY_STRING, "<removed key string>")
+    cleaned = _replace_value(cleaned, _PRE_SHARED_KEY, "<removed key>")
+    cleaned = _replace_value(cleaned, _RADIUS_TACACS_KEY, "<removed key>")
+    cleaned = _replace_value(cleaned, _ISAKMP_KEY, "<removed key>")
+    cleaned = _replace_value(cleaned, _OSPF_AUTH_KEY, "<removed key>")
+    cleaned = _replace_value(cleaned, _MESSAGE_DIGEST_KEY, "<removed key>")
+    cleaned = _replace_value(cleaned, _NTP_AUTH_KEY, "<removed key>")
+    cleaned = _replace_value(cleaned, _WPA_PSK, "<removed key>")
+    cleaned = _replace_value(cleaned, _TYPED_KEY, "<removed key>")
+
+    cleaned = _replace_value(cleaned, _ACCESS_TOKEN, "<removed token>")
+    return cleaned
 
 
 def sanitize_running_config(running_config: str) -> str:
-    """Return a shareable configuration with security material removed.
-
-    Sensitive statements become comments so a reviewer can see where material
-    was removed without seeing names, endpoints, hashes, keys, or clear text.
-    A final scan fails closed if a recognized sensitive form somehow remains.
-    """
+    """Return a readable configuration with sensitive values replaced inline."""
 
     if not running_config.strip():
         raise SanitizationError("Cannot sanitize an empty running configuration.")
 
     sanitized: list[str] = []
-    sensitive_block: str | None = None
     private_key_block = False
 
     for original_line in running_config.splitlines():
         stripped = original_line.strip()
 
-        # Avoid duplicating the notice if a previously sanitized backup is
-        # processed again during testing or an offline workflow.
         if original_line in _SANITIZED_HEADER_LINES:
             continue
 
@@ -207,56 +212,49 @@ def sanitize_running_config(running_config: str) -> str:
                 private_key_block = False
             continue
 
-        if sensitive_block is not None:
-            if stripped == "!":
-                sanitized.append("!")
-                sensitive_block = None
-                continue
-            if stripped.casefold() == "exit":
-                sensitive_block = None
-                continue
-            if not stripped or original_line[:1].isspace():
-                continue
-
-            # A non-indented command begins a new section even when the input
-            # omitted the usual Cisco ``!`` separator. Process it normally.
-            sensitive_block = None
-
         if _PRIVATE_KEY_START.match(stripped):
-            _append_marker(sanitized, "private key block")
+            sanitized.append("! <removed private key block>")
             private_key_block = True
             continue
 
-        block_category = _block_category(stripped)
-        if block_category:
-            _append_marker(sanitized, block_category)
-            sensitive_block = block_category
-            continue
+        sanitized.append(sanitize_config_line(original_line.rstrip()))
 
-        line_category = _line_category(original_line)
-        if line_category:
-            indentation_match = re.match(r"^\s*", original_line)
-            indentation = indentation_match.group(0) if indentation_match else ""
-            _append_marker(sanitized, line_category, indentation)
-            continue
+    if private_key_block:
+        raise SanitizationError(
+            "An unterminated private-key block was found; no configuration was written."
+        )
 
-        sanitized.append(original_line.rstrip())
-
-    remaining = _remaining_sensitive_lines(sanitized)
+    # Fail closed if another sanitation pass would change anything. This keeps
+    # recognized raw values from reaching disk if a replacement rule regresses.
+    remaining = [
+        line_number
+        for line_number, line in enumerate(sanitized, start=1)
+        if sanitize_config_line(line) != line
+    ]
     if remaining:
         locations = ", ".join(str(line_number) for line_number in remaining[:10])
         raise SanitizationError(
-            "The safety scan found recognized sensitive syntax after sanitation "
-            f"at output line(s) {locations}; no configuration was written."
+            "Recognized sensitive values remain after sanitation at output line(s) "
+            f"{locations}; no configuration was written."
         )
 
     return SANITIZED_HEADER + "\n" + "\n".join(sanitized).rstrip() + "\n"
 
 
 def main() -> int:
-    """Run the shared Nornir backup workflow with sanitation enabled."""
+    """Run the shared Nornir backup workflow with inline sanitation enabled."""
 
     import perform_backup as backup
+
+    if (
+        getattr(backup, "CONFIG_SANITIZER_API_VERSION", None)
+        != REQUIRED_SANITIZER_API_VERSION
+    ):
+        backup.console.print(
+            "[bold red]ERROR:[/] This safe script requires the recreated companion "
+            "perform_backup.py with sanitizer hook version 1. No backup was run."
+        )
+        return 1
 
     backup.TARGET_TAG = NORNIR_TARGET_TAG
     backup.CONFIG_SANITIZER = sanitize_running_config
@@ -264,8 +262,8 @@ def main() -> int:
         os.getenv("NORNIR_SAFE_BACKUP_ROOT", DEFAULT_SAFE_BACKUP_ROOT)
     )
     backup.console.print(
-        "[bold yellow]SANITIZED BACKUP MODE:[/] Security-sensitive configuration "
-        "will be removed before files are written."
+        "[bold yellow]SANITIZED BACKUP MODE:[/] Sensitive values will be replaced "
+        "inline before configuration files are written."
     )
     return backup.main()
 
