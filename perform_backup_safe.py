@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 """Create sanitized Nornir/NetBox backups of network running configurations.
 
 This entry point reuses the collection workflow in ``perform_backup.py`` and
@@ -18,6 +20,11 @@ import re
 from collections.abc import Iterable
 from pathlib import Path
 
+
+# Universal NetBox tag used to select devices for sanitized backups.
+# Change the default here or override it at runtime with NORNIR_TARGET_TAG.
+DEFAULT_TARGET_TAG = "nornirtest"
+NORNIR_TARGET_TAG = os.getenv("NORNIR_TARGET_TAG", DEFAULT_TARGET_TAG)
 
 DEFAULT_SAFE_BACKUP_ROOT = "./config_backups_safe"
 SANITIZED_HEADER = (
@@ -251,6 +258,7 @@ def main() -> int:
 
     import perform_backup as backup
 
+    backup.TARGET_TAG = NORNIR_TARGET_TAG
     backup.CONFIG_SANITIZER = sanitize_running_config
     backup.BACKUP_ROOT = Path(
         os.getenv("NORNIR_SAFE_BACKUP_ROOT", DEFAULT_SAFE_BACKUP_ROOT)
