@@ -106,7 +106,7 @@ def main() -> int:
 
     #Local Nornir inventory filtering.
     testing_devices = nr.filter(
-        F(tag_slugs__contains="networking-active")
+        F(tag_slugs__contains="nornirtest")
     )
 
     if not testing_devices.inventory.hosts:
