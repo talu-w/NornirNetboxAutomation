@@ -1616,9 +1616,10 @@ def _set_compact_detail_cell(
     cell.value = _compact_detail_preview(text, max_chars=max_chars)
     if not text:
         return
+    note_text = re.sub(r"\s*\|\s*", "\n", text)
     note = Comment(
         "Full unabridged details:\n\n"
-        f"{text}\n\n"
+        f"{note_text}\n\n"
         "Tip: hover over or select this noted cell in Excel to review the full text.",
         "Network Automation",
     )
