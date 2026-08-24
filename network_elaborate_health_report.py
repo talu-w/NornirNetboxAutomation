@@ -1592,6 +1592,41 @@ def _fill(color: str) -> PatternFill:
     return PatternFill("solid", fgColor=color)
 
 
+def _compact_detail_preview(value: Any, max_chars: int = 110) -> str:
+    """Return a single compact preview while retaining room for a note hint."""
+
+    text = " ".join(str(value or "").split())
+    if len(text) <= max_chars:
+        return text
+    suffix = "... [see note]"
+    available = max(20, max_chars - len(suffix))
+    preview = text[:available].rsplit(" ", 1)[0].rstrip(" ,;:")
+    return f"{preview}{suffix}"
+
+
+def _set_compact_detail_cell(
+    cell: Any,
+    full_text: Any,
+    *,
+    max_chars: int = 110,
+) -> None:
+    """Show a short cell preview and retain unabridged text in an Excel note."""
+
+    text = str(full_text or "").strip()
+    cell.value = _compact_detail_preview(text, max_chars=max_chars)
+    if not text:
+        return
+    note = Comment(
+        "Full unabridged details:\n\n"
+        f"{text}\n\n"
+        "Tip: hover over or select this noted cell in Excel to review the full text.",
+        "Network Automation",
+    )
+    note.width = 620
+    note.height = 360
+    cell.comment = note
+
+
 def build_collection_notes(record: Mapping[str, Any]) -> list[str]:
     """Combine collection warnings with the conditions that reduced health."""
 
@@ -1771,23 +1806,6 @@ def build_collection_notes(record: Mapping[str, Any]) -> list[str]:
         )
 
     return notes
-
-
-def engineering_notes_text(record: Mapping[str, Any]) -> str:
-    """Keep the overview notes readable while Issue Details retains full context."""
-
-    notes = build_collection_notes(record)
-    displayed: list[str] = []
-    for note in notes[:10]:
-        text = " ".join(note.split())
-        if len(text) > 140:
-            text = text[:137].rstrip() + "..."
-        displayed.append(text)
-    if len(notes) > 10:
-        displayed.append(
-            f"{len(notes) - 10} additional findings are listed in Issue Details."
-        )
-    return "\n".join(displayed)
 
 
 def _create_compact_health_workbook(
@@ -2602,14 +2620,21 @@ def create_elaborate_health_workbook(
             overview.cell(metric_rows[label], index, record.get(field_name))
 
         overview.cell(17, index, "Yes" if record.get("reachable") else "No")
-        overview.cell(26, index, _interface_issue_text(record))
-        overview.cell(29, index, _port_security_text(record))
-        overview.cell(39, index, _etherchannel_issue_text(record))
-        overview.cell(69, index, engineering_notes_text(record))
-        overview.cell(50, index, _interface_quality_text(record))
-        overview.cell(57, index, _spanning_tree_text(record))
-        overview.cell(62, index, _deep_etherchannel_text(record))
-        overview.cell(67, index, _security_control_text(record))
+        for row, full_text, max_chars in (
+            (26, _interface_issue_text(record), 100),
+            (29, _port_security_text(record), 100),
+            (39, _etherchannel_issue_text(record), 120),
+            (50, _interface_quality_text(record), 120),
+            (57, _spanning_tree_text(record), 120),
+            (62, _deep_etherchannel_text(record), 120),
+            (67, _security_control_text(record), 120),
+            (69, "\n".join(build_collection_notes(record)), 150),
+        ):
+            _set_compact_detail_cell(
+                overview.cell(row, index),
+                full_text,
+                max_chars=max_chars,
+            )
 
         cpu_pct = record.get("cpu_pct")
         overview.cell(
@@ -2688,14 +2713,14 @@ def create_elaborate_health_workbook(
 
     overview.column_dimensions["A"].width = 31
     overview.row_dimensions[4].height = 32
-    overview.row_dimensions[26].height = 72
-    overview.row_dimensions[29].height = 72
-    overview.row_dimensions[39].height = 96
-    overview.row_dimensions[69].height = 400
-    overview.row_dimensions[50].height = 130
-    overview.row_dimensions[57].height = 130
-    overview.row_dimensions[62].height = 150
-    overview.row_dimensions[67].height = 110
+    overview.row_dimensions[26].height = 45
+    overview.row_dimensions[29].height = 45
+    overview.row_dimensions[39].height = 60
+    overview.row_dimensions[50].height = 60
+    overview.row_dimensions[57].height = 60
+    overview.row_dimensions[62].height = 60
+    overview.row_dimensions[67].height = 60
+    overview.row_dimensions[69].height = 72
     overview.freeze_panes = "A5"
 
     for column in range(2, last_column + 1):
@@ -2771,6 +2796,11 @@ def create_elaborate_health_workbook(
     )
     overview["A66"].comment = Comment(
         "Cumulative parsed CoPP, DAI, and DHCP-snooping drop counters.",
+        "Network Automation",
+    )
+    overview["A69"].comment = Comment(
+        "Device cells in detail and Engineering Notes rows show a short preview. "
+        "Hover over or select the noted device cell to read its complete text.",
         "Network Automation",
     )
 
@@ -2873,6 +2903,7 @@ def create_elaborate_health_workbook(
         "Location",
         "Primary IP",
         "Collected UTC",
+        "Full Details",
     ]
     for column, header in enumerate(headers, start=1):
         details.cell(4, column, header)
@@ -2892,11 +2923,18 @@ def create_elaborate_health_workbook(
             ]
         ]
     for row_index, row in enumerate(issue_rows, start=5):
+        full_detail = str(row[5] or "")
         for column_index, value in enumerate(row, start=1):
-            details.cell(row_index, column_index, value)
+            cell = details.cell(row_index, column_index)
+            if column_index == 6:
+                _set_compact_detail_cell(cell, full_detail, max_chars=105)
+            else:
+                cell.value = value
+        details.cell(row_index, 10, full_detail)
+        details.row_dimensions[row_index].height = 36
 
     detail_last_row = 4 + len(issue_rows)
-    detail_table = Table(displayName="EngineerIssues", ref=f"A4:I{detail_last_row}")
+    detail_table = Table(displayName="EngineerIssues", ref=f"A4:J{detail_last_row}")
     detail_table.tableStyleInfo = TableStyleInfo(
         name="TableStyleMedium2",
         showFirstColumn=False,
@@ -2915,11 +2953,19 @@ def create_elaborate_health_workbook(
     details.column_dimensions["G"].width = 20
     details.column_dimensions["H"].width = 18
     details.column_dimensions["I"].width = 20
+    details.column_dimensions["J"].width = 90
+    details.column_dimensions["J"].hidden = True
     for row in range(5, detail_last_row + 1):
         details.cell(row, 9).number_format = "yyyy-mm-dd hh:mm"
-    for row in details.iter_rows(min_row=5, max_row=detail_last_row):
+    for row in details.iter_rows(min_row=5, max_row=detail_last_row, max_col=10):
         for cell in row:
-            cell.alignment = Alignment(vertical="top", wrap_text=True)
+            cell.alignment = Alignment(vertical="center", wrap_text=True)
+    details["F4"].comment = Comment(
+        "Visible Details cells are compact previews. Hover over or select a noted "
+        "cell for the complete text. The same unabridged value is retained in the "
+        "hidden Full Details column.",
+        "Network Automation",
+    )
     details.conditional_formatting.add(
         f"A5:I{detail_last_row}",
         FormulaRule(formula=['$B5="Critical"'], fill=_fill(red)),
