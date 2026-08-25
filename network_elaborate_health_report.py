@@ -2,8 +2,8 @@
 
 The script uses the repository's existing Nornir ``config.yaml``. NetBox devices
 are loaded by that configuration, normalized, and filtered with Nornir's ``F``
-filter. It collects device, interface quality, spanning-tree, deep
-EtherChannel, security/control-plane, CPU, and environment state. No device
+filter. It collects device, interface quality, EtherChannel,
+security/control-plane, CPU, and environment state. No device
 configuration is changed.
 """
 
@@ -65,22 +65,20 @@ MIN_DATA_COVERAGE_PCT = 60.0
 WARNING_PENALTY = 10
 CRITICAL_PENALTY = 25
 ENVIRONMENT_ALERT_PENALTY = 10
-ERR_DISABLED_PENALTY = 10
-PORT_SECURITY_PENALTY = 10
+ERR_DISABLED_PENALTY = 2
 DEGRADED_ETHERCHANNEL_PENALTY = 10
 DOWN_ETHERCHANNEL_PENALTY = 25
 MAX_COUNT_PENALTY = 30
 MAX_ETHERCHANNEL_PENALTY = 50
-INTERFACE_QUALITY_PENALTY = 3
-INTERFACE_INSTABILITY_PENALTY = 5
-STP_RECENT_CHANGE_PENALTY = 5
-STP_INCONSISTENT_PORT_PENALTY = 15
+INTERFACE_QUALITY_PENALTY = 1
+INTERFACE_INSTABILITY_PENALTY = 2
+MAX_INTERFACE_PENALTY = 10
 SECURITY_EXCEPTION_PENALTY = 5
 MAX_ENGINEERING_EXCEPTION_PENALTY = 30
 HEALTHY_SCORE = 85
 WATCH_SCORE = 70
-HEALTH_COMPONENT_COUNT = 9
-INTERFACE_ERROR_CRITICAL_COUNT = 10_000
+HEALTH_COMPONENT_COUNT = 7
+ETHERCHANNEL_CRITICAL_DOWN_RATIO = 0.75
 RECENT_EVENT_SECONDS = 3_600
 
 PHYSICAL_INTERFACE_RE = re.compile(
@@ -556,11 +554,6 @@ def command_profile(platform: str) -> dict[str, list[str]]:
             "show etherchannel detail",
             "show port-channel database",
         ],
-        "spanning_tree": ["show spanning-tree detail"],
-        "stp_inconsistent": [
-            "show spanning-tree inconsistentports",
-            "show spanning-tree inconsistent-ports",
-        ],
         "err_disabled": [
             "show interfaces status err-disabled",
             "show interface status err-disabled",
@@ -593,10 +586,6 @@ def command_profile(platform: str) -> dict[str, list[str]]:
                     "show port-channel database",
                     "show port-channel summary",
                 ],
-                "spanning_tree": ["show spanning-tree detail"],
-                "stp_inconsistent": [
-                    "show spanning-tree inconsistentports",
-                ],
                 "err_disabled": [
                     "show interface status err-disabled",
                     "show interfaces status err-disabled",
@@ -627,11 +616,6 @@ def command_profile(platform: str) -> dict[str, list[str]]:
                     "show etherchannel detail",
                     "show port-channel database",
                 ],
-                "spanning_tree": ["show spanning-tree detail"],
-                "stp_inconsistent": [
-                    "show spanning-tree inconsistentports",
-                    "show spanning-tree inconsistent-ports",
-                ],
                 "err_disabled": [
                     "show interfaces status err-disabled",
                     "show interface status err-disabled",
@@ -658,10 +642,6 @@ def command_profile(platform: str) -> dict[str, list[str]]:
                 "etherchannel_detail": [
                     "show lacp neighbor",
                     "show port-channel summary",
-                ],
-                "spanning_tree": ["show spanning-tree detail"],
-                "stp_inconsistent": [
-                    "show spanning-tree inconsistentports",
                 ],
                 "err_disabled": [
                     "show interfaces status errdisabled",
@@ -1461,42 +1441,6 @@ def collect_device_health(
         record.notes.append(f"EtherChannel status unavailable: {exc}")
 
     try:
-        spanning_tree_output, _ = run_first_supported(
-            task, "Spanning tree", profile["spanning_tree"], read_timeout
-        )
-        instances = parse_spanning_tree_instances(spanning_tree_output)
-        record.spanning_tree_instances = [item.to_dict() for item in instances]
-        record.spanning_tree_instance_count = len(instances)
-        record.stp_topology_changes = sum(
-            item.topology_changes for item in instances
-        )
-        record.stp_recent_changes = sum(item.recent_change for item in instances)
-        if not instances and "no spanning tree" not in spanning_tree_output.casefold():
-            record.notes.append(
-                "Spanning-tree output was returned but no instances were parsed."
-            )
-        try:
-            inconsistent_output, _ = run_first_supported(
-                task,
-                "STP inconsistent ports",
-                profile["stp_inconsistent"],
-                read_timeout,
-            )
-            record.stp_inconsistent_ports = parse_stp_inconsistent_ports(
-                inconsistent_output
-            )
-            record.stp_inconsistent_port_count = len(
-                record.stp_inconsistent_ports
-            )
-        except Exception:  # noqa: BLE001 - not all platforms expose this view.
-            record.notes.append(
-                "STP inconsistent-port detail was unavailable; instance health was "
-                "still collected."
-            )
-    except Exception as exc:  # noqa: BLE001 - routers may not support spanning tree.
-        record.notes.append(f"Spanning-tree health unavailable: {exc}")
-
-    try:
         port_security_output, _ = run_first_supported(
             task, "Port security", profile["port_security"], read_timeout
         )
@@ -1628,6 +1572,28 @@ def _set_compact_detail_cell(
     cell.comment = note
 
 
+def _etherchannel_down_ratio(record: Mapping[str, Any]) -> float | None:
+    """Return the share of reported EtherChannels that are fully down."""
+
+    total = record.get("etherchannels_total")
+    down = record.get("etherchannels_down")
+    if not isinstance(total, (int, float)) or not isinstance(down, (int, float)):
+        channels = record.get("etherchannels", [])
+        if not isinstance(channels, Sequence):
+            return None
+        reported = [channel for channel in channels if isinstance(channel, Mapping)]
+        total = len(reported)
+        down = sum(channel.get("state") == "Down" for channel in reported)
+    if total <= 0:
+        return None
+    return max(0.0, float(down)) / float(total)
+
+
+def _etherchannel_outage_is_critical(record: Mapping[str, Any]) -> bool:
+    ratio = _etherchannel_down_ratio(record)
+    return ratio is not None and ratio >= ETHERCHANNEL_CRITICAL_DOWN_RATIO
+
+
 def build_collection_notes(record: Mapping[str, Any]) -> list[str]:
     """Combine collection warnings with the conditions that reduced health."""
 
@@ -1682,7 +1648,7 @@ def build_collection_notes(record: Mapping[str, Any]) -> list[str]:
             for issue in port_security_issues
             if isinstance(issue, Mapping)
         )
-        add(f"Health impact: port security: {details}.")
+        add(f"Informational: port security: {details}.")
 
     interface_quality = record.get("interface_quality_issues", [])
     if isinstance(interface_quality, Sequence) and interface_quality:
@@ -1717,6 +1683,15 @@ def build_collection_notes(record: Mapping[str, Any]) -> list[str]:
 
     etherchannels = record.get("etherchannels", [])
     if isinstance(etherchannels, Sequence):
+        down_ratio = _etherchannel_down_ratio(record)
+        if _etherchannel_outage_is_critical(record) and down_ratio is not None:
+            add(
+                "Health impact: "
+                f"{record.get('etherchannels_down', 0)}/"
+                f"{record.get('etherchannels_total', 0)} EtherChannels are down "
+                f"({down_ratio:.0%}), meeting the critical outage threshold of "
+                f"{ETHERCHANNEL_CRITICAL_DOWN_RATIO:.0%}."
+            )
         for channel in etherchannels:
             if not isinstance(channel, Mapping) or channel.get("state") == "Up":
                 continue
@@ -1738,34 +1713,6 @@ def build_collection_notes(record: Mapping[str, Any]) -> list[str]:
                 ]
                 detail += f"; {', '.join(dict.fromkeys(concise_risks))}"
             add(f"{detail}.")
-
-    recent_stp = [
-        item
-        for item in record.get("spanning_tree_instances", [])
-        if isinstance(item, Mapping) and item.get("recent_change")
-    ]
-    if recent_stp:
-        details = ", ".join(
-            f"{item.get('instance', 'Unknown')} changed "
-            f"{item.get('last_change', 'recently')} ago"
-            + (
-                f" from {item.get('change_source')}"
-                if item.get("change_source")
-                else ""
-            )
-            for item in recent_stp
-        )
-        add(f"Health impact: recent STP changes: {details}.")
-
-    inconsistent_ports = record.get("stp_inconsistent_ports", [])
-    if isinstance(inconsistent_ports, Sequence) and inconsistent_ports:
-        details = ", ".join(
-            f"{issue.get('interface', 'Unknown')} "
-            f"({issue.get('instance', 'STP')}: {issue.get('reason', 'Inconsistent')})"
-            for issue in inconsistent_ports
-            if isinstance(issue, Mapping)
-        )
-        add(f"Health impact: STP inconsistent ports: {details}.")
 
     security_exceptions = record.get("security_control_exceptions", [])
     if isinstance(security_exceptions, Sequence) and security_exceptions:
@@ -1792,10 +1739,8 @@ def build_collection_notes(record: Mapping[str, Any]) -> list[str]:
             "cpu_pct",
             "environment_alerts",
             "err_disabled_count",
-            "port_security_interfaces",
             "etherchannels_total",
             "interfaces_with_errors",
-            "spanning_tree_instance_count",
             "security_control_exception_count",
         )
     )
@@ -2313,7 +2258,7 @@ def build_issue_rows(records: Sequence[Mapping[str, Any]]) -> list[list[Any]]:
         for issue in record.get("err_disabled_interfaces", []):
             if isinstance(issue, Mapping):
                 add(
-                    "Critical",
+                    "Warning",
                     "Err-disabled",
                     str(issue.get("interface", "Unknown")),
                     "Err-disabled",
@@ -2323,7 +2268,7 @@ def build_issue_rows(records: Sequence[Mapping[str, Any]]) -> list[list[Any]]:
         for issue in record.get("port_security_issues", []):
             if isinstance(issue, Mapping):
                 add(
-                    "Critical",
+                    "Info",
                     "Port Security",
                     str(issue.get("interface", "Unknown")),
                     str(issue.get("action", "Violation")),
@@ -2362,9 +2307,7 @@ def build_issue_rows(records: Sequence[Mapping[str, Any]]) -> list[list[Any]]:
                     f"last link flap={issue.get('last_link_flapped', 'recent')} ago"
                 )
             add(
-                "Critical"
-                if error_total >= INTERFACE_ERROR_CRITICAL_COUNT
-                else "Warning",
+                "Warning",
                 "Interface Quality",
                 str(issue.get("interface", "Unknown")),
                 " / ".join(states) or "Exception",
@@ -2372,6 +2315,7 @@ def build_issue_rows(records: Sequence[Mapping[str, Any]]) -> list[list[Any]]:
                 + "; counters are cumulative unless cleared on the device",
             )
 
+        etherchannel_outage_is_critical = _etherchannel_outage_is_critical(record)
         for channel in record.get("etherchannels", []):
             if not isinstance(channel, Mapping) or channel.get("state") == "Up":
                 continue
@@ -2394,42 +2338,14 @@ def build_issue_rows(records: Sequence[Mapping[str, Any]]) -> list[list[Any]]:
             if risks:
                 details += f"; risks: {', '.join(map(str, risks))}"
             add(
-                "Critical" if state == "Down" else "Warning",
+                "Critical"
+                if state == "Down" and etherchannel_outage_is_critical
+                else "Warning",
                 "EtherChannel",
                 str(channel.get("name", "Unknown")),
                 state,
                 details,
             )
-
-        for instance in record.get("spanning_tree_instances", []):
-            if not isinstance(instance, Mapping) or not instance.get("recent_change"):
-                continue
-            details = (
-                f"{instance.get('topology_changes', 0)} cumulative topology changes; "
-                f"last change {instance.get('last_change', 'recently')} ago"
-            )
-            if instance.get("change_source"):
-                details += f" from {instance.get('change_source')}"
-            if instance.get("root_bridge"):
-                details += f"; current root {instance.get('root_bridge')}"
-            add(
-                "Warning",
-                "Spanning Tree",
-                str(instance.get("instance", "Unknown")),
-                "Recent topology change",
-                details,
-            )
-
-        for issue in record.get("stp_inconsistent_ports", []):
-            if isinstance(issue, Mapping):
-                add(
-                    "Critical",
-                    "Spanning Tree",
-                    str(issue.get("interface", "Unknown")),
-                    "Inconsistent",
-                    f"{issue.get('instance', 'STP')}: "
-                    f"{issue.get('reason', 'Inconsistent')}",
-                )
 
         for issue in record.get("security_control_exceptions", []):
             if isinstance(issue, Mapping):
@@ -2543,25 +2459,19 @@ def create_elaborate_health_workbook(
         "Error Counter Sum": 50,
         "Instability Indicators": 51,
         "Interface Quality Details": 52,
-        "Spanning Tree Health": 54,
-        "STP Instances": 55,
-        "Topology Changes": 56,
-        "Recent Topology Changes": 57,
-        "Inconsistent Ports": 58,
-        "STP Details": 59,
-        "Security and Control Plane Exceptions": 61,
-        "Additional Exceptions": 62,
-        "Drop Counter Sum": 63,
-        "Security / Control Plane Details": 64,
-        "Engineering Notes": 66,
+        "Security and Control Plane Exceptions": 54,
+        "Additional Exceptions": 55,
+        "Drop Counter Sum": 56,
+        "Security / Control Plane Details": 57,
+        "Engineering Notes": 59,
     }
-    section_rows = {20, 31, 44, 48, 54, 61}
+    section_rows = {20, 31, 44, 48, 54}
 
     overview["A4"] = "Metric"
     for label, row in metric_rows.items():
         overview.cell(row, 1, label)
 
-    for row in range(4, 67):
+    for row in range(4, 60):
         cell = overview.cell(row, 1)
         if row in section_rows:
             cell.fill = _fill(teal)
@@ -2603,10 +2513,6 @@ def create_elaborate_health_workbook(
         "Interfaces with Errors": "interfaces_with_errors",
         "Error Counter Sum": "interface_error_total",
         "Instability Indicators": "interface_instability_count",
-        "STP Instances": "spanning_tree_instance_count",
-        "Topology Changes": "stp_topology_changes",
-        "Recent Topology Changes": "stp_recent_changes",
-        "Inconsistent Ports": "stp_inconsistent_port_count",
         "Min-link Risks": "etherchannel_min_link_risks",
         "Hot-standby Members": "etherchannel_members_standby",
         "Additional Exceptions": "security_control_exception_count",
@@ -2626,9 +2532,8 @@ def create_elaborate_health_workbook(
             (39, _etherchannel_issue_text(record), 120),
             (42, _etherchannel_member_state_text(record), 120),
             (52, _interface_quality_text(record), 120),
-            (59, _spanning_tree_text(record), 120),
-            (64, _security_control_text(record), 120),
-            (66, "\n".join(build_collection_notes(record)), 150),
+            (57, _security_control_text(record), 120),
+            (59, "\n".join(build_collection_notes(record)), 150),
         ):
             _set_compact_detail_cell(
                 overview.cell(row, index),
@@ -2649,8 +2554,8 @@ def create_elaborate_health_workbook(
             index,
             (
                 f'=(IF({column}17="Yes",1,0)+'
-                f'COUNT({column}45,{column}46,{column}25,{column}27,'
-                f'{column}32,{column}49,{column}55,{column}62))/'
+                f'COUNT({column}45,{column}46,{column}25,'
+                f'{column}32,{column}49,{column}55))/'
                 f"{HEALTH_COMPONENT_COUNT}"
             ),
         )
@@ -2663,22 +2568,16 @@ def create_elaborate_health_workbook(
                 f"'Scoring'!$B$6,IF({column}45>='Scoring'!$B$2,"
                 f"'Scoring'!$B$5,0)),0)"
                 f"-IF(ISNUMBER({column}46),MIN({column}46*'Scoring'!$B$7,"
-                f"'Scoring'!$B$12),0)"
-                f"-IF(ISNUMBER({column}25),MIN({column}25*'Scoring'!$B$8,"
-                f"'Scoring'!$B$12),0)"
-                f"-IF(ISNUMBER({column}27),MIN({column}27*'Scoring'!$B$9,"
-                f"'Scoring'!$B$12),0)"
-                f"-MIN(IF(ISNUMBER({column}34),{column}34*'Scoring'!$B$10,0)"
-                f"+IF(ISNUMBER({column}35),{column}35*'Scoring'!$B$11,0),"
-                f"'Scoring'!$B$13)"
-                f"-MIN(IF(ISNUMBER({column}49),{column}49*'Scoring'!$B$16,0)"
-                f"+IF(ISNUMBER({column}51),{column}51*'Scoring'!$B$17,0),"
-                f"'Scoring'!$B$21)"
-                f"-MIN(IF(ISNUMBER({column}57),{column}57*'Scoring'!$B$18,0)"
-                f"+IF(ISNUMBER({column}58),{column}58*'Scoring'!$B$19,0),"
-                f"'Scoring'!$B$21)"
-                f"-IF(ISNUMBER({column}62),MIN({column}62*'Scoring'!$B$20,"
-                f"'Scoring'!$B$21),0)))"
+                f"'Scoring'!$B$11),0)"
+                f"-MIN(IF(ISNUMBER({column}25),{column}25*'Scoring'!$B$8,0)"
+                f"+IF(ISNUMBER({column}49),{column}49*'Scoring'!$B$15,0)"
+                f"+IF(ISNUMBER({column}51),{column}51*'Scoring'!$B$16,0),"
+                f"'Scoring'!$B$17)"
+                f"-MIN(IF(ISNUMBER({column}34),{column}34*'Scoring'!$B$9,0)"
+                f"+IF(ISNUMBER({column}35),{column}35*'Scoring'!$B$10,0),"
+                f"'Scoring'!$B$12)"
+                f"-IF(ISNUMBER({column}55),MIN({column}55*'Scoring'!$B$18,"
+                f"'Scoring'!$B$19),0)))"
             ),
         )
         overview.cell(
@@ -2687,11 +2586,15 @@ def create_elaborate_health_workbook(
             (
                 f"=IF({column}17<>\"Yes\",\"Unreachable\","
                 f"IF({column}7<'Scoring'!$B$4,\"Insufficient Data\","
-                f"IF(OR({column}35>0,{column}58>0,"
-                f"{column}6<'Scoring'!$B$15),\"Critical\","
-                f"IF(OR({column}6<'Scoring'!$B$14,{column}34>0,"
-                f"{column}25>0,{column}27>0,{column}46>0,{column}49>0,"
-                f"{column}51>0,{column}57>0,{column}40>0,{column}62>0),"
+                f"IF(OR(AND(ISNUMBER({column}45),"
+                f"{column}45>='Scoring'!$B$3),"
+                f"AND({column}32>0,{column}35>="
+                f"{column}32*'Scoring'!$B$20)),\"Critical\","
+                f"IF(OR(AND(ISNUMBER({column}45),"
+                f"{column}45>='Scoring'!$B$2),{column}46>0,"
+                f"{column}25>0,{column}34>0,{column}35>0,"
+                f"{column}40>0,{column}55>0,"
+                f"{column}6<'Scoring'!$B$13),"
                 f"\"Watch\",\"Healthy\"))))"
             ),
         )
@@ -2704,7 +2607,7 @@ def create_elaborate_health_workbook(
         )
         overview.column_dimensions[column].width = 29
 
-        for row in range(5, 67):
+        for row in range(5, 60):
             if row in section_rows:
                 continue
             cell = overview.cell(row, index)
@@ -2718,9 +2621,8 @@ def create_elaborate_health_workbook(
     overview.row_dimensions[39].height = 60
     overview.row_dimensions[42].height = 60
     overview.row_dimensions[52].height = 60
-    overview.row_dimensions[59].height = 60
-    overview.row_dimensions[64].height = 60
-    overview.row_dimensions[66].height = 72
+    overview.row_dimensions[57].height = 60
+    overview.row_dimensions[59].height = 72
     overview.freeze_panes = "A5"
 
     for column in range(2, last_column + 1):
@@ -2757,19 +2659,24 @@ def create_elaborate_health_workbook(
             end_color="63BE7B",
         ),
     )
+    overview.conditional_formatting.add(
+        f"B35:{last_column_letter}35",
+        FormulaRule(
+            formula=["AND(B32>0,B35>=B32*'Scoring'!$B$20)"],
+            fill=_fill(red),
+            stopIfTrue=True,
+        ),
+    )
     for row, color in (
-        (25, red),
-        (27, red),
+        (25, amber),
         (34, amber),
-        (35, red),
+        (35, amber),
         (46, amber),
         (49, amber),
         (51, amber),
-        (57, amber),
-        (58, red),
-        (40, red),
-        (62, amber),
-        (63, amber),
+        (40, amber),
+        (55, amber),
+        (56, amber),
     ):
         overview.conditional_formatting.add(
             f"B{row}:{last_column_letter}{row}",
@@ -2791,20 +2698,16 @@ def create_elaborate_health_workbook(
         "Network Automation",
     )
     overview["A56"].comment = Comment(
-        "Cumulative spanning-tree topology changes reported by all parsed instances.",
-        "Network Automation",
-    )
-    overview["A63"].comment = Comment(
         "Cumulative parsed CoPP, DAI, and DHCP-snooping drop counters.",
         "Network Automation",
     )
-    overview["A66"].comment = Comment(
+    overview["A59"].comment = Comment(
         "Device cells in detail and Engineering Notes rows show a short preview. "
         "Hover over or select the noted device cell to read its complete text.",
         "Network Automation",
     )
 
-    summary_start = 69
+    summary_start = 62
     overview[f"A{summary_start}"] = "Fleet Summary"
     overview.merge_cells(
         start_row=summary_start,
@@ -2829,8 +2732,6 @@ def create_elaborate_health_workbook(
         "Port-security Interfaces",
         "Interfaces with Quality Errors",
         "Instability Indicators",
-        "Recent STP Changes",
-        "STP Inconsistent Ports",
         "EtherChannel Min-link Risks",
         "Security / Control Exceptions",
     ]
@@ -2851,7 +2752,7 @@ def create_elaborate_health_workbook(
         f'=IFERROR(AVERAGE(B6:{last_column_letter}6),"")',
     )
     for offset, source_row in enumerate(
-        (32, 34, 35, 25, 27, 49, 51, 57, 58, 40, 62),
+        (32, 34, 35, 25, 27, 49, 51, 40, 55),
         start=8,
     ):
         overview.cell(
@@ -2874,7 +2775,7 @@ def create_elaborate_health_workbook(
     overview.print_area = (
         f"A1:{last_column_letter}{summary_start + len(summary_labels)}"
     )
-    overview.row_breaks.append(Break(id=65))
+    overview.row_breaks.append(Break(id=58))
     overview.row_breaks.append(Break(id=summary_start - 1))
 
     details.merge_cells("A1:I1")
@@ -2885,7 +2786,7 @@ def create_elaborate_health_workbook(
     details.row_dimensions[1].height = 42
     details.merge_cells("A2:I2")
     details["A2"] = (
-        "One row per actionable device, interface, spanning-tree, security, "
+        "One row per actionable device, interface, security, "
         f"EtherChannel, or telemetry issue | Generated {generated}"
     )
     details["A2"].font = Font(italic=True, color=gray)
@@ -2990,7 +2891,6 @@ def create_elaborate_health_workbook(
         ("Critical penalty", CRITICAL_PENALTY),
         ("Environment alert penalty", ENVIRONMENT_ALERT_PENALTY),
         ("Err-disabled penalty", ERR_DISABLED_PENALTY),
-        ("Port-security penalty", PORT_SECURITY_PENALTY),
         ("Degraded EtherChannel penalty", DEGRADED_ETHERCHANNEL_PENALTY),
         ("Down EtherChannel penalty", DOWN_ETHERCHANNEL_PENALTY),
         ("Maximum count penalty", MAX_COUNT_PENALTY),
@@ -2999,15 +2899,16 @@ def create_elaborate_health_workbook(
         ("Watch score", WATCH_SCORE),
         ("Interface quality penalty", INTERFACE_QUALITY_PENALTY),
         ("Interface instability penalty", INTERFACE_INSTABILITY_PENALTY),
-        ("Recent STP change penalty", STP_RECENT_CHANGE_PENALTY),
-        ("STP inconsistent-port penalty", STP_INCONSISTENT_PORT_PENALTY),
+        ("Maximum interface penalty", MAX_INTERFACE_PENALTY),
         ("Security/control-plane exception penalty", SECURITY_EXCEPTION_PENALTY),
         ("Maximum engineering exception penalty", MAX_ENGINEERING_EXCEPTION_PENALTY),
+        ("Critical EtherChannel down ratio", ETHERCHANNEL_CRITICAL_DOWN_RATIO),
     ]
     for row in scoring_rows:
         scoring.append(row)
     for row in range(2, 5):
         scoring.cell(row, 2).number_format = "0%"
+    scoring.cell(20, 2).number_format = "0%"
     scoring.sheet_state = "veryHidden"
 
     workbook.calculation.calcMode = "auto"
@@ -3086,8 +2987,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     console.print(
-        "Collecting firmware, interface quality/instability, spanning-tree, "
-        "EtherChannel details, security/control-plane, CPU, and environment health..."
+        "Collecting firmware, interface quality/instability, EtherChannel details, "
+        "security/control-plane, CPU, and environment health..."
     )
     results = targets.run(
         name="Collect network health",
