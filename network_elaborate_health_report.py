@@ -2204,7 +2204,7 @@ def _etherchannel_issue_text(record: Mapping[str, Any]) -> str:
     return " | ".join(details)
 
 
-def _deep_etherchannel_text(record: Mapping[str, Any]) -> str:
+def _etherchannel_member_state_text(record: Mapping[str, Any]) -> str:
     channels = record.get("etherchannels", [])
     if not isinstance(channels, Sequence):
         return ""
@@ -2532,37 +2532,36 @@ def create_elaborate_health_workbook(
         "Bundled Members": 37,
         "Total Members": 38,
         "Degraded / Down Details": 39,
-        "System and Collection Health": 41,
-        "CPU Utilization": 42,
-        "Environment Alerts": 43,
-        "Interface Quality and Instability": 46,
-        "Interfaces with Errors": 47,
-        "Error Counter Sum": 48,
-        "Instability Indicators": 49,
-        "Interface Quality Details": 50,
-        "Spanning Tree Health": 52,
-        "STP Instances": 53,
-        "Topology Changes": 54,
-        "Recent Topology Changes": 55,
-        "Inconsistent Ports": 56,
-        "STP Details": 57,
-        "Deep EtherChannel Health": 59,
-        "Min-link Risks": 60,
-        "Hot-standby Members": 61,
-        "Member State Details": 62,
-        "Security and Control Plane Exceptions": 64,
-        "Additional Exceptions": 65,
-        "Drop Counter Sum": 66,
-        "Security / Control Plane Details": 67,
-        "Engineering Notes": 69,
+        "Min-link Risks": 40,
+        "Hot-standby Members": 41,
+        "Member State Details": 42,
+        "System and Collection Health": 44,
+        "CPU Utilization": 45,
+        "Environment Alerts": 46,
+        "Interface Quality and Instability": 48,
+        "Interfaces with Errors": 49,
+        "Error Counter Sum": 50,
+        "Instability Indicators": 51,
+        "Interface Quality Details": 52,
+        "Spanning Tree Health": 54,
+        "STP Instances": 55,
+        "Topology Changes": 56,
+        "Recent Topology Changes": 57,
+        "Inconsistent Ports": 58,
+        "STP Details": 59,
+        "Security and Control Plane Exceptions": 61,
+        "Additional Exceptions": 62,
+        "Drop Counter Sum": 63,
+        "Security / Control Plane Details": 64,
+        "Engineering Notes": 66,
     }
-    section_rows = {20, 31, 41, 46, 52, 59, 64}
+    section_rows = {20, 31, 44, 48, 54, 61}
 
     overview["A4"] = "Metric"
     for label, row in metric_rows.items():
         overview.cell(row, 1, label)
 
-    for row in range(4, 70):
+    for row in range(4, 67):
         cell = overview.cell(row, 1)
         if row in section_rows:
             cell.fill = _fill(teal)
@@ -2625,11 +2624,11 @@ def create_elaborate_health_workbook(
             (26, _interface_issue_text(record), 100),
             (29, _port_security_text(record), 100),
             (39, _etherchannel_issue_text(record), 120),
-            (50, _interface_quality_text(record), 120),
-            (57, _spanning_tree_text(record), 120),
-            (62, _deep_etherchannel_text(record), 120),
-            (67, _security_control_text(record), 120),
-            (69, "\n".join(build_collection_notes(record)), 150),
+            (42, _etherchannel_member_state_text(record), 120),
+            (52, _interface_quality_text(record), 120),
+            (59, _spanning_tree_text(record), 120),
+            (64, _security_control_text(record), 120),
+            (66, "\n".join(build_collection_notes(record)), 150),
         ):
             _set_compact_detail_cell(
                 overview.cell(row, index),
@@ -2639,7 +2638,7 @@ def create_elaborate_health_workbook(
 
         cpu_pct = record.get("cpu_pct")
         overview.cell(
-            42,
+            45,
             index,
             cpu_pct / 100 if isinstance(cpu_pct, (int, float)) else None,
         )
@@ -2650,8 +2649,8 @@ def create_elaborate_health_workbook(
             index,
             (
                 f'=(IF({column}17="Yes",1,0)+'
-                f'COUNT({column}42,{column}43,{column}25,{column}27,'
-                f'{column}32,{column}47,{column}53,{column}65))/'
+                f'COUNT({column}45,{column}46,{column}25,{column}27,'
+                f'{column}32,{column}49,{column}55,{column}62))/'
                 f"{HEALTH_COMPONENT_COUNT}"
             ),
         )
@@ -2660,10 +2659,10 @@ def create_elaborate_health_workbook(
             index,
             (
                 f"=IF({column}17<>\"Yes\",0,MAX(0,100"
-                f"-IF(ISNUMBER({column}42),IF({column}42>='Scoring'!$B$3,"
-                f"'Scoring'!$B$6,IF({column}42>='Scoring'!$B$2,"
+                f"-IF(ISNUMBER({column}45),IF({column}45>='Scoring'!$B$3,"
+                f"'Scoring'!$B$6,IF({column}45>='Scoring'!$B$2,"
                 f"'Scoring'!$B$5,0)),0)"
-                f"-IF(ISNUMBER({column}43),MIN({column}43*'Scoring'!$B$7,"
+                f"-IF(ISNUMBER({column}46),MIN({column}46*'Scoring'!$B$7,"
                 f"'Scoring'!$B$12),0)"
                 f"-IF(ISNUMBER({column}25),MIN({column}25*'Scoring'!$B$8,"
                 f"'Scoring'!$B$12),0)"
@@ -2672,13 +2671,13 @@ def create_elaborate_health_workbook(
                 f"-MIN(IF(ISNUMBER({column}34),{column}34*'Scoring'!$B$10,0)"
                 f"+IF(ISNUMBER({column}35),{column}35*'Scoring'!$B$11,0),"
                 f"'Scoring'!$B$13)"
-                f"-MIN(IF(ISNUMBER({column}47),{column}47*'Scoring'!$B$16,0)"
-                f"+IF(ISNUMBER({column}49),{column}49*'Scoring'!$B$17,0),"
+                f"-MIN(IF(ISNUMBER({column}49),{column}49*'Scoring'!$B$16,0)"
+                f"+IF(ISNUMBER({column}51),{column}51*'Scoring'!$B$17,0),"
                 f"'Scoring'!$B$21)"
-                f"-MIN(IF(ISNUMBER({column}55),{column}55*'Scoring'!$B$18,0)"
-                f"+IF(ISNUMBER({column}56),{column}56*'Scoring'!$B$19,0),"
+                f"-MIN(IF(ISNUMBER({column}57),{column}57*'Scoring'!$B$18,0)"
+                f"+IF(ISNUMBER({column}58),{column}58*'Scoring'!$B$19,0),"
                 f"'Scoring'!$B$21)"
-                f"-IF(ISNUMBER({column}65),MIN({column}65*'Scoring'!$B$20,"
+                f"-IF(ISNUMBER({column}62),MIN({column}62*'Scoring'!$B$20,"
                 f"'Scoring'!$B$21),0)))"
             ),
         )
@@ -2688,11 +2687,11 @@ def create_elaborate_health_workbook(
             (
                 f"=IF({column}17<>\"Yes\",\"Unreachable\","
                 f"IF({column}7<'Scoring'!$B$4,\"Insufficient Data\","
-                f"IF(OR({column}35>0,{column}56>0,"
+                f"IF(OR({column}35>0,{column}58>0,"
                 f"{column}6<'Scoring'!$B$15),\"Critical\","
                 f"IF(OR({column}6<'Scoring'!$B$14,{column}34>0,"
-                f"{column}25>0,{column}27>0,{column}43>0,{column}47>0,"
-                f"{column}49>0,{column}55>0,{column}60>0,{column}65>0),"
+                f"{column}25>0,{column}27>0,{column}46>0,{column}49>0,"
+                f"{column}51>0,{column}57>0,{column}40>0,{column}62>0),"
                 f"\"Watch\",\"Healthy\"))))"
             ),
         )
@@ -2705,7 +2704,7 @@ def create_elaborate_health_workbook(
         )
         overview.column_dimensions[column].width = 29
 
-        for row in range(5, 70):
+        for row in range(5, 67):
             if row in section_rows:
                 continue
             cell = overview.cell(row, index)
@@ -2717,11 +2716,11 @@ def create_elaborate_health_workbook(
     overview.row_dimensions[26].height = 45
     overview.row_dimensions[29].height = 45
     overview.row_dimensions[39].height = 60
-    overview.row_dimensions[50].height = 60
-    overview.row_dimensions[57].height = 60
-    overview.row_dimensions[62].height = 60
-    overview.row_dimensions[67].height = 60
-    overview.row_dimensions[69].height = 72
+    overview.row_dimensions[42].height = 60
+    overview.row_dimensions[52].height = 60
+    overview.row_dimensions[59].height = 60
+    overview.row_dimensions[64].height = 60
+    overview.row_dimensions[66].height = 72
     overview.freeze_panes = "A5"
 
     for column in range(2, last_column + 1):
@@ -2730,7 +2729,7 @@ def create_elaborate_health_workbook(
         overview.cell(18, column).number_format = "yyyy-mm-dd hh:mm"
         overview.cell(21, column).number_format = "0.0%"
         overview.cell(36, column).number_format = "0.0%"
-        overview.cell(42, column).number_format = "0.0%"
+        overview.cell(45, column).number_format = "0.0%"
 
     status_cells = f"B5:{last_column_letter}5"
     for status, color in {
@@ -2763,14 +2762,14 @@ def create_elaborate_health_workbook(
         (27, red),
         (34, amber),
         (35, red),
-        (43, amber),
-        (47, amber),
+        (46, amber),
         (49, amber),
-        (55, amber),
-        (56, red),
-        (60, red),
-        (65, amber),
-        (66, amber),
+        (51, amber),
+        (57, amber),
+        (58, red),
+        (40, red),
+        (62, amber),
+        (63, amber),
     ):
         overview.conditional_formatting.add(
             f"B{row}:{last_column_letter}{row}",
@@ -2786,26 +2785,26 @@ def create_elaborate_health_workbook(
         "Network Automation",
     )
 
-    overview["A48"].comment = Comment(
+    overview["A50"].comment = Comment(
         "Sum of parsed cumulative error/drop counters; use Issue Details to see "
         "the counter type and interface.",
         "Network Automation",
     )
-    overview["A54"].comment = Comment(
+    overview["A56"].comment = Comment(
         "Cumulative spanning-tree topology changes reported by all parsed instances.",
         "Network Automation",
     )
-    overview["A66"].comment = Comment(
+    overview["A63"].comment = Comment(
         "Cumulative parsed CoPP, DAI, and DHCP-snooping drop counters.",
         "Network Automation",
     )
-    overview["A69"].comment = Comment(
+    overview["A66"].comment = Comment(
         "Device cells in detail and Engineering Notes rows show a short preview. "
         "Hover over or select the noted device cell to read its complete text.",
         "Network Automation",
     )
 
-    summary_start = 72
+    summary_start = 69
     overview[f"A{summary_start}"] = "Fleet Summary"
     overview.merge_cells(
         start_row=summary_start,
@@ -2852,7 +2851,7 @@ def create_elaborate_health_workbook(
         f'=IFERROR(AVERAGE(B6:{last_column_letter}6),"")',
     )
     for offset, source_row in enumerate(
-        (32, 34, 35, 25, 27, 47, 49, 55, 56, 60, 65),
+        (32, 34, 35, 25, 27, 49, 51, 57, 58, 40, 62),
         start=8,
     ):
         overview.cell(
@@ -2875,7 +2874,7 @@ def create_elaborate_health_workbook(
     overview.print_area = (
         f"A1:{last_column_letter}{summary_start + len(summary_labels)}"
     )
-    overview.row_breaks.append(Break(id=68))
+    overview.row_breaks.append(Break(id=65))
     overview.row_breaks.append(Break(id=summary_start - 1))
 
     details.merge_cells("A1:I1")
