@@ -534,7 +534,7 @@ def run_first_supported(
         output = str(result.result or "")
         if output.strip() and not _is_invalid_command(output):
             return output, command
-        errors.append(f"{command}: unsupported or empty output")
+        errors.append(f"{command}: contained an empty output or was unable to collect at this time!")
 
     raise RuntimeError("; ".join(errors) or f"No {label} command succeeded")
 
@@ -1427,7 +1427,7 @@ def collect_device_health(
         except Exception:  # noqa: BLE001 - deep detail is platform-dependent.
             if channels:
                 record.notes.append(
-                    "Deep EtherChannel detail was unavailable; summary member flags "
+                    "EtherChannel detail was unavailable; summary member flags "
                     "were still collected."
                 )
         record.etherchannels = [channel.to_dict() for channel in channels]
@@ -3088,7 +3088,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     console.print(
         "Collecting firmware, interface quality/instability, spanning-tree, "
-        "deep EtherChannel, security/control-plane, CPU, and environment health..."
+        "EtherChannel details, security/control-plane, CPU, and environment health..."
     )
     results = targets.run(
         name="Collect network health",
