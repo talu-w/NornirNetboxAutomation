@@ -508,8 +508,10 @@ def run_first_supported(
     label: str,
     commands: Sequence[str],
     read_timeout: float = DEFAULT_READ_TIMEOUT,
+    *,
+    allow_empty: bool = False,
 ) -> tuple[str, str]:
-    """Run commands in order and return the first usable output and command."""
+    """Return the first usable command output, optionally accepting no findings."""
 
     errors: list[str] = []
     for command in commands:
@@ -530,7 +532,7 @@ def run_first_supported(
             continue
 
         output = str(result.result or "")
-        if output.strip() and not _is_invalid_command(output):
+        if not _is_invalid_command(output) and (output.strip() or allow_empty):
             return output, command
         errors.append(f"{command}: contained an empty output or was unable to collect at this time!")
 
@@ -1379,17 +1381,20 @@ def collect_device_health(
 
     try:
         errdisabled_output, _ = run_first_supported(
-            task, "Err-disabled interfaces", profile["err_disabled"], read_timeout
+            task,
+            "Err-disabled interfaces",
+            profile["err_disabled"],
+            read_timeout,
+            allow_empty=True,
         )
         record.err_disabled_interfaces = merge_interface_issues(
             record.err_disabled_interfaces,
             parse_err_disabled_interfaces(errdisabled_output),
         )
         record.err_disabled_count = len(record.err_disabled_interfaces)
-    except Exception as exc:  # noqa: BLE001 - unsupported commands vary by platform.
+    except Exception:  # noqa: BLE001 - unsupported commands vary by platform.
         if record.total_interfaces is not None:
             record.err_disabled_count = len(record.err_disabled_interfaces)
-        record.notes.append(f"Err-disabled interface detail unavailable: {exc}")
 
     try:
         etherchannel_output, _ = run_first_supported(
