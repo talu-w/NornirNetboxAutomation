@@ -73,11 +73,9 @@ MAX_ETHERCHANNEL_PENALTY = 50
 INTERFACE_QUALITY_PENALTY = 1
 INTERFACE_INSTABILITY_PENALTY = 2
 MAX_INTERFACE_PENALTY = 10
-SECURITY_EXCEPTION_PENALTY = 5
-MAX_ENGINEERING_EXCEPTION_PENALTY = 30
 HEALTHY_SCORE = 85
 WATCH_SCORE = 70
-HEALTH_COMPONENT_COUNT = 7
+HEALTH_COMPONENT_COUNT = 6
 ETHERCHANNEL_CRITICAL_DOWN_RATIO = 0.75
 RECENT_EVENT_SECONDS = 3_600
 
@@ -1733,7 +1731,7 @@ def build_collection_notes(record: Mapping[str, Any]) -> list[str]:
             and isinstance(issue.get("count", 0), (int, float))
         )
         add(
-            f"Health impact: {len(security_exceptions)} security/control-plane "
+            f"Informational: {len(security_exceptions)} security/control-plane "
             f"exceptions with {drop_total:,} cumulative drops: "
             f"{', '.join(object_names)}."
         )
@@ -1746,7 +1744,6 @@ def build_collection_notes(record: Mapping[str, Any]) -> list[str]:
             "err_disabled_count",
             "etherchannels_total",
             "interfaces_with_errors",
-            "security_control_exception_count",
         )
     )
     coverage_pct = available_components / HEALTH_COMPONENT_COUNT * 100
@@ -2434,7 +2431,7 @@ def create_elaborate_health_workbook(
         "Current Firmware": 16,
         "Reachable": 17,
         "Collected UTC": 18,
-        "Interface Health": 20,
+        "Interface State / Use": 20,
         "Interface Usage": 21,
         "Connected Interfaces": 22,
         "Not Connected Interfaces": 23,
@@ -2456,19 +2453,17 @@ def create_elaborate_health_workbook(
         "Min-link Risks": 40,
         "Hot-standby Members": 41,
         "Member State Details": 42,
-        "System and Collection Health": 44,
+        "System Environmental Health": 44,
         "CPU Utilization": 45,
         "Environment Alerts": 46,
-        "Interface Quality and Instability": 48,
+        "Interface Health": 48,
         "Interfaces with Errors": 49,
         "Error Counter Sum": 50,
         "Instability Indicators": 51,
         "Interface Quality Details": 52,
-        "Security and Control Plane Exceptions": 54,
-        "Additional Exceptions": 55,
-        "Drop Counter Sum": 56,
-        "Security / Control Plane Details": 57,
-        "Engineering Notes": 59,
+        "Security Details": 54,
+        "Security / Control Plane Details": 55,
+        "Engineering Notes": 57,
     }
     section_rows = {20, 31, 44, 48, 54}
 
@@ -2476,7 +2471,7 @@ def create_elaborate_health_workbook(
     for label, row in metric_rows.items():
         overview.cell(row, 1, label)
 
-    for row in range(4, 60):
+    for row in range(4, 58):
         cell = overview.cell(row, 1)
         if row in section_rows:
             cell.fill = _fill(teal)
@@ -2520,8 +2515,6 @@ def create_elaborate_health_workbook(
         "Instability Indicators": "interface_instability_count",
         "Min-link Risks": "etherchannel_min_link_risks",
         "Hot-standby Members": "etherchannel_members_standby",
-        "Additional Exceptions": "security_control_exception_count",
-        "Drop Counter Sum": "security_control_drop_count",
     }
 
     for index, record in enumerate(records, start=2):
@@ -2537,8 +2530,8 @@ def create_elaborate_health_workbook(
             (39, _etherchannel_issue_text(record), 120),
             (42, _etherchannel_member_state_text(record), 120),
             (52, _interface_quality_text(record), 120),
-            (57, _security_control_text(record), 120),
-            (59, "\n".join(build_collection_notes(record)), 150),
+            (55, _security_control_text(record), 120),
+            (57, "\n".join(build_collection_notes(record)), 150),
         ):
             _set_compact_detail_cell(
                 overview.cell(row, index),
@@ -2560,7 +2553,7 @@ def create_elaborate_health_workbook(
             (
                 f'=(IF({column}17="Yes",1,0)+'
                 f'COUNT({column}45,{column}46,{column}25,'
-                f'{column}32,{column}49,{column}55))/'
+                f'{column}32,{column}49))/'
                 f"{HEALTH_COMPONENT_COUNT}"
             ),
         )
@@ -2580,9 +2573,7 @@ def create_elaborate_health_workbook(
                 f"'Scoring'!$B$17)"
                 f"-MIN(IF(ISNUMBER({column}34),{column}34*'Scoring'!$B$9,0)"
                 f"+IF(ISNUMBER({column}35),{column}35*'Scoring'!$B$10,0),"
-                f"'Scoring'!$B$12)"
-                f"-IF(ISNUMBER({column}55),MIN({column}55*'Scoring'!$B$18,"
-                f"'Scoring'!$B$19),0)))"
+                f"'Scoring'!$B$12)))"
             ),
         )
         overview.cell(
@@ -2594,12 +2585,11 @@ def create_elaborate_health_workbook(
                 f"IF(OR(AND(ISNUMBER({column}45),"
                 f"{column}45>='Scoring'!$B$3),"
                 f"AND({column}32>0,{column}35>="
-                f"{column}32*'Scoring'!$B$20)),\"Critical\","
+                f"{column}32*'Scoring'!$B$18)),\"Critical\","
                 f"IF(OR(AND(ISNUMBER({column}45),"
                 f"{column}45>='Scoring'!$B$2),{column}46>0,"
                 f"{column}25>0,{column}34>0,{column}35>0,"
-                f"{column}40>0,{column}55>0,"
-                f"{column}6<'Scoring'!$B$13),"
+                f"{column}40>0,{column}6<'Scoring'!$B$13),"
                 f"\"Watch\",\"Healthy\"))))"
             ),
         )
@@ -2612,7 +2602,7 @@ def create_elaborate_health_workbook(
         )
         overview.column_dimensions[column].width = 29
 
-        for row in range(5, 60):
+        for row in range(5, 58):
             if row in section_rows:
                 continue
             cell = overview.cell(row, index)
@@ -2626,8 +2616,8 @@ def create_elaborate_health_workbook(
     overview.row_dimensions[39].height = 60
     overview.row_dimensions[42].height = 60
     overview.row_dimensions[52].height = 60
-    overview.row_dimensions[57].height = 60
-    overview.row_dimensions[59].height = 72
+    overview.row_dimensions[55].height = 60
+    overview.row_dimensions[57].height = 72
     overview.freeze_panes = "A5"
 
     for column in range(2, last_column + 1):
@@ -2667,7 +2657,7 @@ def create_elaborate_health_workbook(
     overview.conditional_formatting.add(
         f"B35:{last_column_letter}35",
         FormulaRule(
-            formula=["AND(B32>0,B35>=B32*'Scoring'!$B$20)"],
+            formula=["AND(B32>0,B35>=B32*'Scoring'!$B$18)"],
             fill=_fill(red),
             stopIfTrue=True,
         ),
@@ -2680,8 +2670,6 @@ def create_elaborate_health_workbook(
         (49, amber),
         (51, amber),
         (40, amber),
-        (55, amber),
-        (56, amber),
     ):
         overview.conditional_formatting.add(
             f"B{row}:{last_column_letter}{row}",
@@ -2702,17 +2690,13 @@ def create_elaborate_health_workbook(
         "the counter type and interface.",
         "Network Automation",
     )
-    overview["A56"].comment = Comment(
-        "Cumulative parsed CoPP, DAI, and DHCP-snooping drop counters.",
-        "Network Automation",
-    )
-    overview["A59"].comment = Comment(
+    overview["A57"].comment = Comment(
         "Device cells in detail and Engineering Notes rows show a short preview. "
         "Hover over or select the noted device cell to read its complete text.",
         "Network Automation",
     )
 
-    summary_start = 62
+    summary_start = 60
     overview[f"A{summary_start}"] = "Fleet Summary"
     overview.merge_cells(
         start_row=summary_start,
@@ -2738,7 +2722,6 @@ def create_elaborate_health_workbook(
         "Interfaces with Quality Errors",
         "Instability Indicators",
         "EtherChannel Min-link Risks",
-        "Security / Control Exceptions",
     ]
     for row, label in enumerate(summary_labels, start=summary_start + 1):
         overview.cell(row, 1, label)
@@ -2757,7 +2740,7 @@ def create_elaborate_health_workbook(
         f'=IFERROR(AVERAGE(B6:{last_column_letter}6),"")',
     )
     for offset, source_row in enumerate(
-        (32, 34, 35, 25, 27, 49, 51, 40, 55),
+        (32, 34, 35, 25, 27, 49, 51, 40),
         start=8,
     ):
         overview.cell(
@@ -2780,7 +2763,7 @@ def create_elaborate_health_workbook(
     overview.print_area = (
         f"A1:{last_column_letter}{summary_start + len(summary_labels)}"
     )
-    overview.row_breaks.append(Break(id=58))
+    overview.row_breaks.append(Break(id=56))
     overview.row_breaks.append(Break(id=summary_start - 1))
 
     details.merge_cells("A1:I1")
@@ -2905,15 +2888,13 @@ def create_elaborate_health_workbook(
         ("Interface quality penalty", INTERFACE_QUALITY_PENALTY),
         ("Interface instability penalty", INTERFACE_INSTABILITY_PENALTY),
         ("Maximum interface penalty", MAX_INTERFACE_PENALTY),
-        ("Security/control-plane exception penalty", SECURITY_EXCEPTION_PENALTY),
-        ("Maximum engineering exception penalty", MAX_ENGINEERING_EXCEPTION_PENALTY),
         ("Critical EtherChannel down ratio", ETHERCHANNEL_CRITICAL_DOWN_RATIO),
     ]
     for row in scoring_rows:
         scoring.append(row)
     for row in range(2, 5):
         scoring.cell(row, 2).number_format = "0%"
-    scoring.cell(20, 2).number_format = "0%"
+    scoring.cell(18, 2).number_format = "0%"
     scoring.sheet_state = "veryHidden"
 
     workbook.calculation.calcMode = "auto"
