@@ -1,0 +1,14 @@
+---
+
+inventory: 
+    plugin: NetBoxInventory2 #Can use Netbox and Ansible
+    options:
+      nb_url: "https://netboxurlhere.com"
+      ssl_verify: False
+      use_platform_slug: true #Use's built in slugs. Preferred method
+      #filter_parameters: {"platform" : "ios"} #Filter through netbox from the cfg.file
+
+runner:
+   plugin: threaded #Serial will not use concurrent
+   options:
+      num_workers: 10 #How many threads will work with devices. Think of threads like workers
