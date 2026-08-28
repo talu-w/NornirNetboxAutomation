@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bunnyauto"
+version = "0.1.0"
+description = "NetBox-driven, Nornir-executed network automation platform"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+dependencies = [
+    "nornir>=3.4",
+    "nornir-netbox>=0.3",
+    "nornir-netmiko>=1.0",
+    "nornir-utils>=0.2",
+    "netmiko>=4.2",
+    "pynetbox>=7.0",
+    "PyYAML>=6.0",
+    "rich>=13.0",
+    "openpyxl>=3.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.6"]
+
+# The `bunnyauto` console script and the bunnyauto.tools package are added in
+# migration step 2, when cli.py and the first converted tool land.
+
+[tool.setuptools]
+packages = ["bunnyauto"]
+
+[tool.setuptools.package-data]
+bunnyauto = ["py.typed"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+# The pre-bunnyauto scripts are linted only as they are converted into
+# bunnyauto/tools/ during the migration. Remove each entry when its tool lands.
+extend-exclude = [
+    "create_interfaces_netbox.py",
+    "netbox_interfaces_update.py",
+    "network_elaborate_health_report.py",
+    "network_simple_health_report.py",
+    "nornir_hub.py",
+    "perform_backup.py",
+    "perform_backup_safe.py",
+    "send_command.py",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

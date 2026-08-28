@@ -1,0 +1,27 @@
+# bunnyauto environment overlay — copy to bunnyauto.yaml and fill in your URLs.
+#
+# This file is layered on top of the Nornir config.yaml. It defines the named
+# networks bunnyauto can target. Every run must pick one with --env (the hub
+# asks; CI names it per pipeline stage) — there is no default.
+#
+# Each environment bundles the three things that must move together:
+#   nb_url       the NetBox instance for that network
+#   default_tag  the NetBox tag --tag falls back to for that environment
+#   token_env    the environment variable holding that instance's API token
+#   protected    optional; true means an --apply needs a typed confirmation
+#
+# Device credentials (NORNIR_USERNAME / NORNIR_PASSWORD) are shared across
+# environments and are NOT configured here.
+
+environments:
+
+  test:
+    nb_url: https://netbox-lab.example.com
+    default_tag: nornirtest
+    token_env: BUNNYAUTO_TEST_NB_TOKEN
+
+  prod:
+    nb_url: https://netbox.example.com
+    default_tag: networking-active
+    token_env: BUNNYAUTO_PROD_NB_TOKEN
+    protected: true
