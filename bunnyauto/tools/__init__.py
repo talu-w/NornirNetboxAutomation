@@ -7,9 +7,15 @@ command list from ``REGISTRY``, so adding a tool is a one-line change here.
 
 from __future__ import annotations
 
-from bunnyauto.tools import send_command
+from bunnyauto.tools import backup, send_command
 from bunnyauto.tools.base import Tool
 
-REGISTRY: dict[str, Tool] = {tool.name: tool for tool in (send_command.TOOL,)}
+REGISTRY: dict[str, Tool] = {
+    tool.name: tool
+    for tool in (
+        send_command.TOOL,
+        backup.TOOL,
+    )
+}
 
 __all__ = ["REGISTRY", "Tool"]
