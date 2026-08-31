@@ -1,7 +1,7 @@
 """The interactive front door — no command-line knowledge required.
 
-``python -m bunnyauto.hub``, ``bunnyauto`` with no arguments, or the
-``nornir_hub.py`` shim all land here. The hub does exactly what
+``bunnyauto`` with no arguments and ``python -m bunnyauto.hub`` both land here.
+The hub does exactly what
 :mod:`bunnyauto.cli` does — pick an environment, gather a tool's arguments,
 build one Context, run the tool, render the result — except it asks instead of
 reading ``argv``.

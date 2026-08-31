@@ -39,22 +39,6 @@ def test_parser_happy_path():
     assert args.tag == "core"
 
 
-@pytest.mark.parametrize(
-    ("raw", "expected"),
-    [
-        (["--env", "test", "show version"], ["--env", "test", "send-command", "show version"]),
-        (["--env=test", "show x"], ["--env=test", "send-command", "show x"]),
-        (
-            ["--env", "prod", "--json", "--debug", "show y"],
-            ["--env", "prod", "--json", "--debug", "send-command", "show y"],
-        ),
-        (["show version"], ["send-command", "show version"]),
-    ],
-)
-def test_forward_argv(raw, expected):
-    assert cli.forward_argv("send-command", raw) == expected
-
-
 class _FakeTool:
     name = "send-command"
     summary = "fake"

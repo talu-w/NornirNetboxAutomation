@@ -20,9 +20,6 @@ from bunnyauto.reporting import make_reporter
 from bunnyauto.tools import REGISTRY
 from bunnyauto.tools.base import timeouts_from_args
 
-_GLOBAL_VALUE_FLAGS = {"--env", "--env-file"}
-_GLOBAL_BOOL_FLAGS = {"--json", "--debug"}
-
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -69,30 +66,6 @@ def build_parser() -> argparse.ArgumentParser:
             )
         tool.add_arguments(tool_parser)
     return parser
-
-
-def forward_argv(tool_name: str, argv: list[str]) -> list[str]:
-    """Rewrite a shim's ``argv`` into canonical form: globals, then the tool name.
-
-    Lets ``python send_command.py --env test 'show version'`` reach
-    ``bunnyauto --env test send-command 'show version'``.
-    """
-    lead: list[str] = []
-    index = 0
-    while index < len(argv):
-        token = argv[index]
-        if token in _GLOBAL_VALUE_FLAGS:
-            lead.extend(argv[index : index + 2])
-            index += 2
-            continue
-        if token in _GLOBAL_BOOL_FLAGS or any(
-            token.startswith(f"{flag}=") for flag in _GLOBAL_VALUE_FLAGS
-        ):
-            lead.append(token)
-            index += 1
-            continue
-        break
-    return [*lead, tool_name, *argv[index:]]
 
 
 def main(argv: list[str] | None = None) -> int:
