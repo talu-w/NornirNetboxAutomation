@@ -23,11 +23,11 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "ruff>=0.6"]
 
-# The `bunnyauto` console script and the bunnyauto.tools package are added in
-# migration step 2, when cli.py and the first converted tool land.
+[project.scripts]
+bunnyauto = "bunnyauto.cli:main"
 
 [tool.setuptools]
-packages = ["bunnyauto"]
+packages = ["bunnyauto", "bunnyauto.tools"]
 
 [tool.setuptools.package-data]
 bunnyauto = ["py.typed"]
@@ -45,7 +45,6 @@ extend-exclude = [
     "nornir_hub.py",
     "perform_backup.py",
     "perform_backup_safe.py",
-    "send_command.py",
 ]
 
 [tool.ruff.lint]

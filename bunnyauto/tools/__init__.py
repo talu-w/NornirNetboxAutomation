@@ -1,0 +1,15 @@
+"""The tool registry.
+
+Each tool is a small object (see :mod:`bunnyauto.tools.base`) registered here by
+name. Both entry points — the CLI (:mod:`bunnyauto.cli`) and the hub — build their
+command list from ``REGISTRY``, so adding a tool is a one-line change here.
+"""
+
+from __future__ import annotations
+
+from bunnyauto.tools import send_command
+from bunnyauto.tools.base import Tool
+
+REGISTRY: dict[str, Tool] = {tool.name: tool for tool in (send_command.TOOL,)}
+
+__all__ = ["REGISTRY", "Tool"]
