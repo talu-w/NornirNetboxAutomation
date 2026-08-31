@@ -38,7 +38,6 @@ target-version = "py311"
 # The pre-bunnyauto scripts are linted only as they are converted into
 # bunnyauto/tools/ during the migration. Remove each entry when its tool lands.
 extend-exclude = [
-    "create_interfaces_netbox.py",
     "netbox_interfaces_update.py",
     "network_elaborate_health_report.py",
     "network_simple_health_report.py",
