@@ -39,7 +39,6 @@ target-version = "py311"
 # bunnyauto/tools/ during the migration. Remove each entry when its tool lands.
 extend-exclude = [
     "netbox_interfaces_update.py",
-    "network_elaborate_health_report.py",
 ]
 
 [tool.ruff.lint]

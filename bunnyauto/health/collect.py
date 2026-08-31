@@ -139,8 +139,15 @@ def run_first_supported(
     label: str,
     commands: Sequence[str],
     read_timeout: float = DEFAULT_READ_TIMEOUT,
+    *,
+    allow_empty: bool = False,
 ) -> tuple[str, str]:
-    """Run commands in order; return the first usable ``(output, command)``."""
+    """Run commands in order; return the first usable ``(output, command)``.
+
+    ``allow_empty=True`` accepts a command that ran cleanly but produced no
+    output (e.g. ``show interfaces status err-disabled`` when nothing is
+    err-disabled) — a valid "no findings" result rather than an unsupported one.
+    """
     errors: list[str] = []
     for command in commands:
         try:
@@ -157,7 +164,7 @@ def run_first_supported(
             errors.append(f"{command}: {result.exception or result.result}")
             continue
         output = str(result.result or "")
-        if output.strip() and not _is_invalid_command(output):
+        if not _is_invalid_command(output) and (output.strip() or allow_empty):
             return output, command
         errors.append(f"{command}: unsupported or empty output")
     raise RuntimeError("; ".join(errors) or f"No {label} command succeeded")

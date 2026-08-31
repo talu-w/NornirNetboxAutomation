@@ -7,7 +7,13 @@ command list from ``REGISTRY``, so adding a tool is a one-line change here.
 
 from __future__ import annotations
 
-from bunnyauto.tools import backup, create_interfaces, health_simple, send_command
+from bunnyauto.tools import (
+    backup,
+    create_interfaces,
+    health_elaborate,
+    health_simple,
+    send_command,
+)
 from bunnyauto.tools.base import Tool
 
 REGISTRY: dict[str, Tool] = {
@@ -17,6 +23,7 @@ REGISTRY: dict[str, Tool] = {
         backup.TOOL,
         create_interfaces.TOOL,
         health_simple.TOOL,
+        health_elaborate.TOOL,
     )
 }
 
