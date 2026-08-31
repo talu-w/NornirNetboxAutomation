@@ -119,6 +119,8 @@ def _tool_loop(
             reporter.say(exc.friendly())
         except KeyboardInterrupt:
             reporter.say("\ncancelled")
+        except Exception as exc:  # keep the hub alive on an unexpected failure
+            reporter.say(f"bunnyauto: unexpected error: {exc}")
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,71 @@
+name: Nightly backup + health
+
+# 07:00 UTC daily: back up configs (redacted) and generate the health reports
+# for both environments, then commit the results to the backups repository.
+# Read-only against NetBox and the devices — no approval gate.
+
+on:
+  schedule:
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  collect:
+    runs-on: [self-hosted]
+    strategy:
+      fail-fast: false
+      max-parallel: 1   # both jobs push to the backups repo — run them one at a time
+      matrix:
+        env: [test, prod]
+    env:
+      NORNIR_USERNAME: ${{ secrets.NORNIR_USERNAME }}
+      NORNIR_PASSWORD: ${{ secrets.NORNIR_PASSWORD }}
+      BUNNYAUTO_TEST_NB_TOKEN: ${{ secrets.BUNNYAUTO_TEST_NB_TOKEN }}
+      BUNNYAUTO_PROD_NB_TOKEN: ${{ secrets.BUNNYAUTO_PROD_NB_TOKEN }}
+      BUNNYAUTO_TEST_NB_URL: ${{ vars.BUNNYAUTO_TEST_NB_URL }}
+      BUNNYAUTO_PROD_NB_URL: ${{ vars.BUNNYAUTO_PROD_NB_URL }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -e .
+      - name: Prepare config
+        run: |
+          cp config.example.yaml config.yaml
+          python scripts/ci_write_env_file.py
+
+      - name: Check out the backups repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.BACKUPS_REPO_SLUG }}   # e.g. your-org/network-backups
+          ssh-key: ${{ secrets.BACKUPS_DEPLOY_KEY }}   # deploy key with write access
+          path: backups-repo
+
+      - name: Back up configs
+        run: bunnyauto --env ${{ matrix.env }} backup --output-dir "backups-repo/${{ matrix.env }}"
+
+      - name: Generate health reports
+        run: |
+          day="$(date -u +%Y-%m-%d)"
+          dir="backups-repo/${{ matrix.env }}/reports/$day"
+          mkdir -p "$dir"
+          bunnyauto --env ${{ matrix.env }} health-simple    --output "$dir/health-simple.xlsx"
+          bunnyauto --env ${{ matrix.env }} health-elaborate  --output "$dir/health-elaborate.xlsx"
+
+      - name: Commit and push
+        working-directory: backups-repo
+        run: |
+          git config user.name  "bunnyauto-bot"
+          git config user.email "bunnyauto-bot@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to commit for ${{ matrix.env }}."
+          else
+            git commit -m "Nightly ${{ matrix.env }} backup + health ($(date -u +%Y-%m-%d))"
+            git pull --rebase --autostash
+            git push
+          fi

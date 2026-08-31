@@ -1,0 +1,71 @@
+name: Apply (prod)
+
+# On merge to main: plan against the PRODUCTION NetBox and publish it, then wait
+# for a required reviewer to approve the `production` environment before applying.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  plan-prod:
+    runs-on: [self-hosted]
+    env:
+      NORNIR_USERNAME: ${{ secrets.NORNIR_USERNAME }}
+      NORNIR_PASSWORD: ${{ secrets.NORNIR_PASSWORD }}
+      BUNNYAUTO_PROD_NB_TOKEN: ${{ secrets.BUNNYAUTO_PROD_NB_TOKEN }}
+      BUNNYAUTO_TEST_NB_URL: ${{ vars.BUNNYAUTO_TEST_NB_URL }}
+      BUNNYAUTO_PROD_NB_URL: ${{ vars.BUNNYAUTO_PROD_NB_URL }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -e .
+      - name: Prepare config
+        run: |
+          cp config.example.yaml config.yaml
+          python scripts/ci_write_env_file.py
+      - name: Plan against prod
+        run: |
+          python scripts/ci_plan.py --env prod | tee plan.md
+          {
+            echo "## Plan (prod) — approve the deployment below to apply"
+            cat plan.md
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prod-plan
+          path: plan.md
+
+  apply-prod:
+    needs: plan-prod
+    runs-on: [self-hosted]
+    # Configure this environment in repo Settings → Environments with
+    # "Required reviewers". The job pauses here until someone approves,
+    # after reading the plan-prod summary/artifact.
+    environment: production
+    env:
+      NORNIR_USERNAME: ${{ secrets.NORNIR_USERNAME }}
+      NORNIR_PASSWORD: ${{ secrets.NORNIR_PASSWORD }}
+      BUNNYAUTO_PROD_NB_TOKEN: ${{ secrets.BUNNYAUTO_PROD_NB_TOKEN }}
+      BUNNYAUTO_TEST_NB_URL: ${{ vars.BUNNYAUTO_TEST_NB_URL }}
+      BUNNYAUTO_PROD_NB_URL: ${{ vars.BUNNYAUTO_PROD_NB_URL }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -e .
+      - name: Prepare config
+        run: |
+          cp config.example.yaml config.yaml
+          python scripts/ci_write_env_file.py
+      - name: Apply to prod NetBox
+        run: |
+          set -o pipefail
+          bunnyauto --env prod create-interfaces --apply --yes
+          bunnyauto --env prod sync-interfaces --apply --yes

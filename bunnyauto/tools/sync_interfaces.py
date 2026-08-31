@@ -13,8 +13,6 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from nornir_utils.plugins.functions import print_result
-
 from bunnyauto.errors import ToolError
 from bunnyauto.netbox_match import select_tagged_inventory
 from bunnyauto.sync import engine
@@ -122,8 +120,7 @@ class SyncInterfaces:
         for host_name, multi_result in results.items():
             if multi_result.failed:
                 failed_hosts.append(host_name)
-                ctx.reporter.error(f"{host_name}: collection failed")
-                ctx.reporter.info(_result_text(multi_result))
+                ctx.reporter.error(f"{host_name}: collection failed — {_first_error(multi_result)}")
                 continue
             collected = engine.find_collected_result(multi_result)
             if collected is None:
@@ -231,17 +228,12 @@ def _result(
     return ToolResult(status=status, summary=summary, changes=changes, data=data)
 
 
-def _result_text(multi_result: Any) -> str:
-    from contextlib import redirect_stdout
-    from io import StringIO
-
-    buffer = StringIO()
-    try:
-        with redirect_stdout(buffer):
-            print_result(multi_result)
-    except Exception:  # pragma: no cover - defensive
-        return "collection failed (details unavailable)"
-    return buffer.getvalue().strip()
+def _first_error(multi_result: Any) -> str:
+    for item in reversed(list(multi_result)):
+        exc = getattr(item, "exception", None)
+        if exc is not None:
+            return f"{type(exc).__name__}: {exc}"
+    return "collection failed (no exception detail)"
 
 
 TOOL = SyncInterfaces()

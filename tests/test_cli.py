@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import json
+import subprocess
+import sys
+import textwrap
 
 import pytest
 
@@ -128,3 +132,47 @@ def test_main_debug_reraises(monkeypatch, fake_registry):
 
     with pytest.raises(InventoryError):
         cli.main(["--env", "test", "--debug", "send-command", "show version"])
+
+
+def test_json_output_is_always_valid_json_even_on_error(tmp_path):
+    """Regression guard: importing the tool layer must not pollute stdout
+    (nornir_utils pulls in rich, which used to wrap sys.stdout with ANSI)."""
+    env_file = tmp_path / "bunnyauto.yaml"
+    env_file.write_text(
+        textwrap.dedent(
+            """
+            environments:
+              test:
+                nb_url: https://netbox-does-not-resolve.invalid
+                default_tag: nornirtest
+                token_env: BUNNYAUTO_TEST_NB_TOKEN
+            """
+        ).strip(),
+        encoding="utf-8",
+    )
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "bunnyauto",
+            "--env",
+            "test",
+            "--env-file",
+            str(env_file),
+            "--json",
+            "sync-interfaces",
+        ],
+        capture_output=True,
+        text=True,
+        env={
+            "PATH": "/usr/bin:/bin",
+            "NORNIR_USERNAME": "u",
+            "NORNIR_PASSWORD": "p",
+            "BUNNYAUTO_TEST_NB_TOKEN": "t",
+        },
+        cwd=tmp_path,
+        check=False,
+    )
+    payload = json.loads(proc.stdout)  # must not raise
+    assert payload["status"] == "error"
+    assert "\x1b" not in proc.stdout

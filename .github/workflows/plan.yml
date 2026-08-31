@@ -1,0 +1,81 @@
+name: Plan (test)
+
+# On every PR: run the test suite, then plan the mutating tools against the
+# TEST NetBox and post the result as a PR comment. Nothing is written anywhere.
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  quality:
+    # GitHub-hosted is fine here — this job doesn't touch the network.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -e ".[dev]"
+      - run: ruff check .
+      - run: ruff format --check bunnyauto tests scripts
+      - run: pytest -q
+
+  plan:
+    needs: quality
+    # Needs to reach the internal test NetBox + switches. Use a self-hosted
+    # runner inside the network, or swap in `ubuntu-latest` plus a VPN
+    # connect step (Tailscale/WireGuard/OpenVPN) as the first step.
+    runs-on: [self-hosted]
+    environment: test
+    env:
+      NORNIR_USERNAME: ${{ secrets.NORNIR_USERNAME }}
+      NORNIR_PASSWORD: ${{ secrets.NORNIR_PASSWORD }}
+      BUNNYAUTO_TEST_NB_TOKEN: ${{ secrets.BUNNYAUTO_TEST_NB_TOKEN }}
+      BUNNYAUTO_TEST_NB_URL: ${{ vars.BUNNYAUTO_TEST_NB_URL }}
+      BUNNYAUTO_PROD_NB_URL: ${{ vars.BUNNYAUTO_PROD_NB_URL }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -e .
+      - name: Prepare config
+        run: |
+          cp config.example.yaml config.yaml
+          python scripts/ci_write_env_file.py
+      - name: Plan against test
+        id: plan
+        run: |
+          python scripts/ci_plan.py --env test | tee plan.md
+          {
+            echo "## Plan (test)"
+            cat plan.md
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Comment on the PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('plan.md', 'utf8');
+            const marker = '<!-- bunnyauto-plan-test -->';
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const mine = comments.find(c => c.body.includes(marker));
+            const payload = `${marker}\n${body}`;
+            if (mine) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                comment_id: mine.id, body: payload,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: context.issue.number, body: payload,
+              });
+            }

@@ -9,6 +9,7 @@ of ``argv``.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 
 from bunnyauto import __version__
@@ -107,6 +108,17 @@ def main(argv: list[str] | None = None) -> int:
     reporter = make_reporter(json_mode=args.json)
     tool = REGISTRY[args.tool]
 
+    def _fail(message: str, code: int = 1) -> int:
+        if args.json:
+            json.dump(
+                {"status": "error", "summary": message, "exit_code": code, "changes": []},
+                sys.stdout,
+            )
+            sys.stdout.write("\n")
+        else:
+            reporter.error(message)
+        return code
+
     ctx = None
     try:
         ctx = build_context(
@@ -126,11 +138,13 @@ def main(argv: list[str] | None = None) -> int:
     except BunnyautoError as exc:
         if args.debug:
             raise
-        reporter.error(exc.friendly())
-        return 1
+        return _fail(exc.friendly())
     except KeyboardInterrupt:  # pragma: no cover
-        reporter.error("interrupted")
-        return 130
+        return _fail("interrupted", 130)
+    except Exception as exc:  # unexpected — NetBox down, a device library blew up, ...
+        if args.debug:
+            raise
+        return _fail(f"bunnyauto: unexpected error: {exc} (run with --debug for the traceback)")
     finally:
         if ctx is not None:
             ctx.close()
