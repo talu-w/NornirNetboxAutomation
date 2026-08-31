@@ -27,7 +27,13 @@ dev = ["pytest>=8.0", "ruff>=0.6"]
 bunnyauto = "bunnyauto.cli:main"
 
 [tool.setuptools]
-packages = ["bunnyauto", "bunnyauto.tools", "bunnyauto.backup", "bunnyauto.health"]
+packages = [
+    "bunnyauto",
+    "bunnyauto.tools",
+    "bunnyauto.backup",
+    "bunnyauto.health",
+    "bunnyauto.sync",
+]
 
 [tool.setuptools.package-data]
 bunnyauto = ["py.typed"]
@@ -35,11 +41,6 @@ bunnyauto = ["py.typed"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
-# The pre-bunnyauto scripts are linted only as they are converted into
-# bunnyauto/tools/ during the migration. Remove each entry when its tool lands.
-extend-exclude = [
-    "netbox_interfaces_update.py",
-]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B"]

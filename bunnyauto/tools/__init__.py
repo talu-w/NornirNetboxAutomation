@@ -13,6 +13,7 @@ from bunnyauto.tools import (
     health_elaborate,
     health_simple,
     send_command,
+    sync_interfaces,
 )
 from bunnyauto.tools.base import Tool
 
@@ -22,6 +23,7 @@ REGISTRY: dict[str, Tool] = {
         send_command.TOOL,
         backup.TOOL,
         create_interfaces.TOOL,
+        sync_interfaces.TOOL,
         health_simple.TOOL,
         health_elaborate.TOOL,
     )
