@@ -103,7 +103,7 @@ class Reporter:
 
     def render(self, result: ToolResult) -> None:
         if self.json_mode:
-            json.dump(result.as_dict(), self._stream, indent=2, sort_keys=True)
+            json.dump(result.as_dict(), self._stream, indent=2, sort_keys=True, default=str)
             self._stream.write("\n")
             self._stream.flush()
             return

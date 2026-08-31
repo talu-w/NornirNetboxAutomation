@@ -27,7 +27,7 @@ dev = ["pytest>=8.0", "ruff>=0.6"]
 bunnyauto = "bunnyauto.cli:main"
 
 [tool.setuptools]
-packages = ["bunnyauto", "bunnyauto.tools", "bunnyauto.backup"]
+packages = ["bunnyauto", "bunnyauto.tools", "bunnyauto.backup", "bunnyauto.health"]
 
 [tool.setuptools.package-data]
 bunnyauto = ["py.typed"]
@@ -40,7 +40,6 @@ target-version = "py311"
 extend-exclude = [
     "netbox_interfaces_update.py",
     "network_elaborate_health_report.py",
-    "network_simple_health_report.py",
 ]
 
 [tool.ruff.lint]
