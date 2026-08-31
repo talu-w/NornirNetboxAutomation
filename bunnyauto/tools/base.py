@@ -25,9 +25,26 @@ __all__ = [
     "Status",
     "ToolResult",
     "EXIT_CODES",
+    "COMMON_ARG_DESTS",
     "add_common_arguments",
     "timeouts_from_args",
 ]
+
+#: argparse ``dest`` names contributed by :func:`add_common_arguments`. The hub
+#: skips prompting for these (they all have safe defaults / resolve later).
+COMMON_ARG_DESTS = frozenset(
+    {
+        "config",
+        "tag",
+        "force_tag",
+        "legacy_ssh",
+        "connect_timeout",
+        "auth_timeout",
+        "banner_timeout",
+        "read_timeout",
+        "delay_factor",
+    }
+)
 
 
 @runtime_checkable

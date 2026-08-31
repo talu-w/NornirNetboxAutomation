@@ -58,6 +58,18 @@ class Reporter:
             except ImportError:
                 self._console = None
 
+    # -- plain user-facing text (menus, prompts, headers) ----------------------
+
+    def say(self, message: str = "") -> None:
+        """Print text with no log decoration. For interactive chrome only."""
+        if self.json_mode:
+            return
+        if self._console is not None:
+            self._console.print(message)
+        else:
+            self._stream.write(f"{message}\n")
+            self._stream.flush()
+
     # -- lifecycle-style messages ------------------------------------------------
 
     def banner(self, environment: Environment, tag: str) -> None:
@@ -70,7 +82,7 @@ class Reporter:
             colour = "bold white on red" if environment.protected else "bold white on blue"
             self._console.print(line, style=colour)
         else:
-            self._plain(f"[{marker}] {environment.nb_url} tag={tag}")
+            self.say(f"── {marker}  {environment.nb_url}  tag={tag} ──")
 
     def step(self, message: str) -> None:
         self._emit(message, style="dim", level="STEP")

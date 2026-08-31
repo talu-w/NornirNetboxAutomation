@@ -95,8 +95,15 @@ def forward_argv(tool_name: str, argv: list[str]) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    raw = list(sys.argv[1:] if argv is None else argv)
+    if not raw:
+        # `bunnyauto` with no arguments opens the interactive hub.
+        from bunnyauto.hub import main as hub_main
+
+        return hub_main([])
+
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(raw)
     reporter = make_reporter(json_mode=args.json)
     tool = REGISTRY[args.tool]
 

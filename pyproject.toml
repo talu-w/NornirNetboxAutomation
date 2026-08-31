@@ -42,7 +42,6 @@ extend-exclude = [
     "netbox_interfaces_update.py",
     "network_elaborate_health_report.py",
     "network_simple_health_report.py",
-    "nornir_hub.py",
     "perform_backup.py",
     "perform_backup_safe.py",
 ]
