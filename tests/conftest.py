@@ -39,5 +39,9 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "BUNNYAUTO_TEST_NB_TOKEN",
         "BUNNYAUTO_PROD_NB_TOKEN",
         "BUNNYAUTO_ENV_FILE",
+        "BUNNYAUTO_FW_INSECURE",
+        "BUNNYAUTO_PROD_FW_TOKEN",
+        "FW_TOKEN",
+        "OTHER_TOKEN",
     ):
         monkeypatch.delenv(name, raising=False)

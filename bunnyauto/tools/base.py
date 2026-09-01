@@ -58,6 +58,13 @@ class Tool(Protocol):
     #: ``True`` ⇒ the tool builds a direct NetBox client and honours ``--apply``.
     writes: bool
 
+    # Optional, default ``True`` when a tool does not define them — read by both
+    # entry points as ``getattr(tool, "needs_devices", True)`` /
+    # ``getattr(tool, "needs_netbox", True)``:
+    #   needs_devices: bool  -> False skips the NORNIR_USERNAME/PASSWORD check
+    #   needs_netbox:  bool  -> False skips the environment's NetBox-token check
+    # A firewall-only tool sets both to False so it runs with just its own token.
+
     def add_arguments(self, parser: argparse.ArgumentParser) -> None:
         """Register the tool's own options on its subparser."""
         ...

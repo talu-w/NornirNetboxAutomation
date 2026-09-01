@@ -18,6 +18,7 @@ dependencies = [
     "PyYAML>=6.0",
     "rich>=13.0",
     "openpyxl>=3.1",
+    "requests>=2.31",
 ]
 
 [project.optional-dependencies]
@@ -31,6 +32,7 @@ packages = [
     "bunnyauto",
     "bunnyauto.tools",
     "bunnyauto.backup",
+    "bunnyauto.firewall",
     "bunnyauto.health",
     "bunnyauto.sync",
 ]

@@ -43,14 +43,27 @@ def preflight_device_credentials() -> tuple[str, str]:
     return username, password
 
 
-def preflight(environment: Environment) -> Credentials:
-    """Full check for a run against ``environment``; returns ready-to-use creds."""
+def preflight(
+    environment: Environment,
+    *,
+    need_devices: bool = True,
+    need_netbox: bool = True,
+) -> Credentials:
+    """Check for a run against ``environment``; returns ready-to-use creds.
+
+    A tool that touches neither devices nor NetBox (for example a firewall-only
+    query) passes ``need_devices=False`` / ``need_netbox=False`` so its run is
+    not blocked by unrelated, unset variables. Any token that *is* set is still
+    carried through.
+    """
     from bunnyauto.context import Credentials
 
-    username, password = preflight_device_credentials()
+    username, password = ("", "")
+    if need_devices:
+        username, password = preflight_device_credentials()
 
-    token = environment.token
-    if not token:
+    token = environment.token or ""
+    if need_netbox and not token:
         raise EnvVarError(
             f"{environment.token_env} is not set — needed to read the "
             f"{environment.name} NetBox inventory ({environment.nb_url})",

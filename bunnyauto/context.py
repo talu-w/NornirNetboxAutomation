@@ -126,11 +126,14 @@ def build_context(
     legacy_ssh: bool = False,
     output_dir: str | os.PathLike[str] = ".",
     timeouts: Mapping[str, float] | None = None,
+    need_devices: bool = True,
+    need_netbox: bool = True,
 ) -> Context:
     """Resolve the environment, run preflight, and return a ready ``Context``.
 
     ``creds`` may be passed in when the caller (the hub) already ran preflight;
-    otherwise it is run here.
+    otherwise it is run here. ``need_devices`` / ``need_netbox`` let a tool that
+    uses neither (a firewall-only query) run without those variables set.
     """
     environment = resolve_environment(env, env_file)
 
@@ -141,7 +144,7 @@ def build_context(
         raise TagMismatchError(tag_value, environment.name, environment.default_tag)
 
     if creds is None:
-        creds = preflight(environment)
+        creds = preflight(environment, need_devices=need_devices, need_netbox=need_netbox)
 
     config_path = Path(config_file).expanduser()
     raw_options = load_raw_inventory_options(config_path)

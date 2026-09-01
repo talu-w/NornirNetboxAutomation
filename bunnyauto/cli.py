@@ -105,6 +105,8 @@ def main(argv: list[str] | None = None) -> int:
             apply=getattr(args, "apply", False),
             assume_yes=getattr(args, "yes", False),
             timeouts=timeouts_from_args(args),
+            need_devices=getattr(tool, "needs_devices", True),
+            need_netbox=getattr(tool, "needs_netbox", True),
         )
         reporter.banner(ctx.environment, ctx.settings.target_tag)
         result = tool.run(ctx, args)

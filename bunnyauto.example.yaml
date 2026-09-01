@@ -4,14 +4,17 @@
 # networks bunnyauto can target. Every run must pick one with --env (the hub
 # asks; CI names it per pipeline stage) — there is no default.
 #
-# Each environment bundles the three things that must move together:
-#   nb_url       the NetBox instance for that network
-#   default_tag  the NetBox tag --tag falls back to for that environment
-#   token_env    the environment variable holding that instance's API token
-#   protected    optional; true means an --apply needs a typed confirmation
+# Each environment bundles the things that must move together:
+#   nb_url        the NetBox instance for that network
+#   default_tag   the NetBox tag --tag falls back to for that environment
+#   token_env     the environment variable holding that instance's API token
+#   protected     optional; true means an --apply needs a typed confirmation
+#   fw_url        optional; base URL of that network's FortiGate REST API
+#   fw_token_env  optional; env var holding that firewall's API token
+#                 (required if fw_url is set — used by the fw-subnet-check tool)
 #
-# Device credentials (NORNIR_USERNAME / NORNIR_PASSWORD) are shared across
-# environments and are NOT configured here.
+# Device credentials (NORNIR_USERNAME / NORNIR_PASSWORD) and firewall tokens are
+# never written here — only the *names* of the variables that hold them.
 
 environments:
 
@@ -25,3 +28,5 @@ environments:
     default_tag: networking-active
     token_env: BUNNYAUTO_PROD_NB_TOKEN
     protected: true
+    fw_url: https://fortigate.example.com
+    fw_token_env: BUNNYAUTO_PROD_FW_TOKEN

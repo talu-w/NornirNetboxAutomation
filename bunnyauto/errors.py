@@ -81,3 +81,7 @@ class NetBoxError(BunnyautoError):
 
 class ToolError(BunnyautoError):
     """A tool could not complete for an expected, explainable reason."""
+
+
+class FirewallError(BunnyautoError):
+    """A firewall API client could not be built, reached, or authenticated."""

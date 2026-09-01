@@ -34,7 +34,14 @@ from bunnyauto.errors import ConfigError, UnknownEnvironmentError
 DEFAULT_ENV_FILE = "bunnyauto.yaml"
 ENV_FILE_VAR = "BUNNYAUTO_ENV_FILE"
 
-_ALLOWED_KEYS = {"nb_url", "default_tag", "token_env", "protected"}
+_ALLOWED_KEYS = {
+    "nb_url",
+    "default_tag",
+    "token_env",
+    "protected",
+    "fw_url",
+    "fw_token_env",
+}
 
 
 @dataclass(slots=True, frozen=True)
@@ -46,11 +53,23 @@ class Environment:
     default_tag: str
     token_env: str
     protected: bool = False
+    #: Base URL of this network's firewall (FortiGate REST API), if it has one.
+    fw_url: str | None = None
+    #: Name of the env var holding that firewall's API token.
+    fw_token_env: str | None = None
 
     @property
     def token(self) -> str | None:
         """The API token for this environment, read from its own env var."""
         value = os.getenv(self.token_env, "").strip()
+        return value or None
+
+    @property
+    def fw_token(self) -> str | None:
+        """The firewall API token for this environment, read from its own env var."""
+        if not self.fw_token_env:
+            return None
+        value = os.getenv(self.fw_token_env, "").strip()
         return value or None
 
 
@@ -133,10 +152,24 @@ def _build_environment(name: str, body: Any, file_path: Path) -> Environment:
             f"(the name of the env var holding this instance's NetBox token)"
         )
 
+    fw_url = str(body.get("fw_url") or "").strip().rstrip("/") or None
+    if fw_url and not fw_url.startswith(("http://", "https://")):
+        raise ConfigError(
+            f"{file_path}: environment {name!r} fw_url must start with http:// or https://"
+        )
+    fw_token_env = str(body.get("fw_token_env") or "").strip() or None
+    if fw_url and not fw_token_env:
+        raise ConfigError(
+            f"{file_path}: environment {name!r} sets 'fw_url' but is missing 'fw_token_env' "
+            f"(the name of the env var holding that firewall's API token)"
+        )
+
     return Environment(
         name=name,
         nb_url=nb_url,
         default_tag=default_tag,
         token_env=token_env,
         protected=bool(body.get("protected", False)),
+        fw_url=fw_url,
+        fw_token_env=fw_token_env,
     )

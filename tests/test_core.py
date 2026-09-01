@@ -125,6 +125,39 @@ def test_environment_token_reads_its_own_var(env_file, monkeypatch):
     assert env.token == "abc123"
 
 
+def test_firewall_config_is_optional_and_parsed(tmp_path):
+    path = tmp_path / "bunnyauto.yaml"
+    path.write_text(
+        "environments:\n"
+        "  test:\n"
+        "    nb_url: https://nb\n"
+        "    default_tag: t\n"
+        "    token_env: X\n"
+        "  prod:\n"
+        "    nb_url: https://nb2\n"
+        "    default_tag: p\n"
+        "    token_env: Y\n"
+        "    fw_url: https://fw.example.com/\n"
+        "    fw_token_env: FW_TOK\n",
+        encoding="utf-8",
+    )
+    envs = load_environments(path)
+    assert envs["test"].fw_url is None
+    assert envs["prod"].fw_url == "https://fw.example.com"  # trailing slash stripped
+    assert envs["prod"].fw_token_env == "FW_TOK"
+
+
+def test_firewall_url_without_token_env_is_rejected(tmp_path):
+    path = tmp_path / "bunnyauto.yaml"
+    path.write_text(
+        "environments:\n  test:\n    nb_url: https://nb\n    default_tag: t\n"
+        "    token_env: X\n    fw_url: https://fw\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="fw_token_env"):
+        load_environments(path)
+
+
 def test_resolve_unknown_environment(env_file):
     with pytest.raises(UnknownEnvironmentError) as exc:
         resolve_environment("staging", env_file)
@@ -217,6 +250,18 @@ def test_preflight_full_ok(env_file, monkeypatch):
     monkeypatch.setenv("BUNNYAUTO_TEST_NB_TOKEN", "tok")
     creds = preflight(resolve_environment("test", env_file))
     assert creds == Credentials(username="alice", password="secret", nb_token="tok")
+
+
+def test_preflight_can_skip_devices_and_netbox(env_file):
+    """A firewall-only tool runs with neither NORNIR_* nor a NetBox token set."""
+    creds = preflight(resolve_environment("test", env_file), need_devices=False, need_netbox=False)
+    assert creds == Credentials(username="", password="", nb_token="")
+
+
+def test_preflight_carries_token_through_when_not_required(env_file, monkeypatch):
+    monkeypatch.setenv("BUNNYAUTO_TEST_NB_TOKEN", "tok")
+    creds = preflight(resolve_environment("test", env_file), need_devices=False, need_netbox=False)
+    assert creds.nb_token == "tok"
 
 
 # ---------------------------------------------------------------------------

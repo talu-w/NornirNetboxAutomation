@@ -183,6 +183,8 @@ def _run_tool(
         apply=getattr(args, "apply", False),
         assume_yes=True,  # the hub does its own confirming, below
         timeouts=timeouts_from_args(args),
+        need_devices=getattr(tool, "needs_devices", True),
+        need_netbox=getattr(tool, "needs_netbox", True),
     )
     try:
         reporter.banner(ctx.environment, ctx.settings.target_tag)
