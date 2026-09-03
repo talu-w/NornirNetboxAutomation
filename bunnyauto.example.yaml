@@ -12,6 +12,11 @@
 #   fw_url        optional; base URL of that network's FortiGate REST API
 #   fw_token_env  optional; env var holding that firewall's API token
 #                 (required if fw_url is set — used by the fw-subnet-check tool)
+#   aruba_url     optional; base URL of that network's Aruba Mobility Conductor
+#                 REST API (include :4343 if that is the API port). Used by the
+#                 wireless-sync tool. Auth is the shared device login
+#                 (NORNIR_USERNAME / NORNIR_PASSWORD) — no separate token — and
+#                 the Conductor's TLS certificate is always verified.
 #
 # Device credentials (NORNIR_USERNAME / NORNIR_PASSWORD) and firewall tokens are
 # never written here — only the *names* of the variables that hold them.
@@ -30,3 +35,4 @@ environments:
     protected: true
     fw_url: https://fortigate.example.com
     fw_token_env: BUNNYAUTO_PROD_FW_TOKEN
+    aruba_url: https://aruba-conductor.example.com:4343

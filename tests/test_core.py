@@ -147,6 +147,31 @@ def test_firewall_config_is_optional_and_parsed(tmp_path):
     assert envs["prod"].fw_token_env == "FW_TOK"
 
 
+def test_aruba_url_is_optional_and_parsed(tmp_path):
+    path = tmp_path / "bunnyauto.yaml"
+    path.write_text(
+        "environments:\n"
+        "  test:\n    nb_url: https://nb\n    default_tag: t\n    token_env: X\n"
+        "  prod:\n    nb_url: https://nb2\n    default_tag: p\n    token_env: Y\n"
+        "    aruba_url: https://conductor.example.com:4343/\n",
+        encoding="utf-8",
+    )
+    envs = load_environments(path)
+    assert envs["test"].aruba_url is None
+    assert envs["prod"].aruba_url == "https://conductor.example.com:4343"
+
+
+def test_aruba_url_bad_scheme_is_rejected(tmp_path):
+    path = tmp_path / "bunnyauto.yaml"
+    path.write_text(
+        "environments:\n  test:\n    nb_url: https://nb\n    default_tag: t\n"
+        "    token_env: X\n    aruba_url: conductor.example.com\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="aruba_url"):
+        load_environments(path)
+
+
 def test_firewall_url_without_token_env_is_rejected(tmp_path):
     path = tmp_path / "bunnyauto.yaml"
     path.write_text(

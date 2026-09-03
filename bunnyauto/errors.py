@@ -85,3 +85,7 @@ class ToolError(BunnyautoError):
 
 class FirewallError(BunnyautoError):
     """A firewall API client could not be built, reached, or authenticated."""
+
+
+class ArubaError(BunnyautoError):
+    """An Aruba Conductor REST client could not be built, reached, or authenticated."""

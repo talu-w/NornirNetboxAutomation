@@ -41,6 +41,7 @@ _ALLOWED_KEYS = {
     "protected",
     "fw_url",
     "fw_token_env",
+    "aruba_url",
 }
 
 
@@ -57,6 +58,10 @@ class Environment:
     fw_url: str | None = None
     #: Name of the env var holding that firewall's API token.
     fw_token_env: str | None = None
+    #: Base URL of this network's Aruba Mobility Conductor REST API, if it has one.
+    #: Auth is the shared device login (NORNIR_USERNAME / NORNIR_PASSWORD), so
+    #: there is no separate token-env key.
+    aruba_url: str | None = None
 
     @property
     def token(self) -> str | None:
@@ -164,6 +169,12 @@ def _build_environment(name: str, body: Any, file_path: Path) -> Environment:
             f"(the name of the env var holding that firewall's API token)"
         )
 
+    aruba_url = str(body.get("aruba_url") or "").strip().rstrip("/") or None
+    if aruba_url and not aruba_url.startswith(("http://", "https://")):
+        raise ConfigError(
+            f"{file_path}: environment {name!r} aruba_url must start with http:// or https://"
+        )
+
     return Environment(
         name=name,
         nb_url=nb_url,
@@ -172,4 +183,5 @@ def _build_environment(name: str, body: Any, file_path: Path) -> Environment:
         protected=bool(body.get("protected", False)),
         fw_url=fw_url,
         fw_token_env=fw_token_env,
+        aruba_url=aruba_url,
     )

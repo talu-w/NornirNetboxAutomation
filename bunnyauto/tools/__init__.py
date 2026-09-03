@@ -15,6 +15,7 @@ from bunnyauto.tools import (
     health_simple,
     send_command,
     sync_interfaces,
+    wireless_sync,
 )
 from bunnyauto.tools.base import Tool
 
@@ -28,6 +29,7 @@ REGISTRY: dict[str, Tool] = {
         health_simple.TOOL,
         health_elaborate.TOOL,
         fw_subnet_check.TOOL,
+        wireless_sync.TOOL,
     )
 }
 
