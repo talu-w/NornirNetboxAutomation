@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import json
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime
-from typing import TYPE_CHECKING, TextIO
+from typing import TYPE_CHECKING, Any, TextIO
 
 if TYPE_CHECKING:
     from bunnyauto.environments import Environment
@@ -121,6 +123,56 @@ class Reporter:
                 self._plain(f"  - {change}")
             for artifact in result.artifacts:
                 self._plain(f"  saved {artifact}")
+
+    # -- live progress -----------------------------------------------------
+
+    @contextmanager
+    def track(self, nr: Any, *, description: str = "") -> Iterator[Any]:
+        """Run a Nornir task under a live per-host progress bar, if interactive.
+
+        Yields something to call ``.run()`` on. Outside an interactive TTY (CI,
+        ``--json``) this is a no-op that yields ``nr`` unchanged, so callers can
+        use it unconditionally: ``with ctx.reporter.track(targets) as tracked:``.
+        """
+        if self._console is None:
+            yield nr
+            return
+
+        from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
+
+        from bunnyauto.progress import build_host_progress
+
+        if description:
+            self._console.print(description, style="dim")
+
+        progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TimeElapsedColumn(),
+            console=self._console,
+        )
+        with progress:
+            processor = build_host_progress(progress, list(nr.inventory.hosts))
+            yield nr.with_processors([processor])
+
+    @contextmanager
+    def spinner(self, description: str) -> Iterator[None]:
+        """A single indeterminate status line for non-Nornir work (a NetBox call)."""
+        if self._console is None:
+            yield
+            return
+
+        from rich.progress import Progress, SpinnerColumn, TextColumn
+
+        progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=self._console,
+        )
+        with progress:
+            progress.add_task(description, total=None)
+            yield
 
     # -- internals -----------------------------------------------------------
 

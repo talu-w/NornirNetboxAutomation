@@ -83,7 +83,8 @@ class Context:
     def nornir(self) -> Nornir:
         """The NetBox-backed inventory for this environment. Built once, reused."""
         if self._nr is None:
-            self._nr = build_nornir(self.settings, self.creds)
+            with self.reporter.spinner("querying NetBox inventory..."):
+                self._nr = build_nornir(self.settings, self.creds)
         return self._nr
 
     def netbox(self) -> Any:

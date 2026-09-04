@@ -82,12 +82,13 @@ class SendCommand:
             )
 
         ctx.reporter.step(f"running {command!r} on {host_count} device(s)")
-        run_result = targets.run(
-            task=_send,
-            name=f"send-command: {command}",
-            command=command,
-            read_timeout=ctx.settings.read_timeout,
-        )
+        with ctx.reporter.track(targets, description=f"send-command: {command}") as tracked:
+            run_result = tracked.run(
+                task=_send,
+                name=f"send-command: {command}",
+                command=command,
+                read_timeout=ctx.settings.read_timeout,
+            )
 
         devices: dict[str, dict[str, object]] = {}
         failures: list[str] = []
