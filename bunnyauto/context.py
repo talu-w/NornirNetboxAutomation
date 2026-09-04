@@ -146,6 +146,13 @@ def build_context(
     if creds is None:
         creds = preflight(environment, need_devices=need_devices, need_netbox=need_netbox)
 
+    # Silences requests/urllib3's InsecureRequestWarning for the whole process.
+    # Every tool (NetBox via pynetbox, FortiGate, Aruba Conductor) funnels
+    # through this one function, so this is the one place it needs to live.
+    import urllib3
+
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
     config_path = Path(config_file).expanduser()
     raw_options = load_raw_inventory_options(config_path)
     ssl_verify = ssl_verify_setting(raw_options.get("ssl_verify", True))
