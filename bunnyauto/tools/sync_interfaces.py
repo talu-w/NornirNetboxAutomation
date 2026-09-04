@@ -107,13 +107,14 @@ class SyncInterfaces:
         ctx.reporter.step(
             f"collecting interface state from {len(selected.inventory.hosts)} device(s)"
         )
-        results = selected.run(
-            task=engine.collect_device_state,
-            name="sync-interfaces: collect",
-            ambiguous_vlan_ids=ambiguous_vlan_ids,
-            voice_vlan_model=args.voice_vlan_model,
-            access_vlan_placement=args.access_vlan_placement,
-        )
+        with ctx.reporter.track(selected, description="sync-interfaces: collect") as tracked:
+            results = tracked.run(
+                task=engine.collect_device_state,
+                name="sync-interfaces: collect",
+                ambiguous_vlan_ids=ambiguous_vlan_ids,
+                voice_vlan_model=args.voice_vlan_model,
+                access_vlan_placement=args.access_vlan_placement,
+            )
 
         collected_devices: list[Any] = []
         failed_hosts: list[str] = []

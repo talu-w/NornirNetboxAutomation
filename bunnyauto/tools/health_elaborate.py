@@ -61,11 +61,12 @@ class HealthElaborate:
             )
 
         ctx.reporter.step(f"collecting engineer health from {len(hosts)} device(s)")
-        results = targets.run(
-            name="health-elaborate: collect",
-            task=collect_device_health,
-            read_timeout=ctx.settings.read_timeout,
-        )
+        with ctx.reporter.track(targets, description="health-elaborate: collect") as tracked:
+            results = tracked.run(
+                name="health-elaborate: collect",
+                task=collect_device_health,
+                read_timeout=ctx.settings.read_timeout,
+            )
         records = extract_records(results, hosts)
         create_elaborate_health_workbook(records, ctx.settings.target_tag, output_path)
 

@@ -115,9 +115,10 @@ class FwSubnetCheck:
 
         client = FortiGateClient(fw_url, token, vdom=args.vdom, verify=verify)
         try:
-            addresses = client.addresses()
-            groups = client.address_groups()
-            policies = client.policies()
+            with ctx.reporter.spinner(f"querying {fw_url}..."):
+                addresses = client.addresses()
+                groups = client.address_groups()
+                policies = client.policies()
         finally:
             client.close()
 

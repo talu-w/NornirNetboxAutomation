@@ -138,9 +138,12 @@ class WirelessSync:
         # -- pull from the Conductor ---------------------------------------
         ctx.reporter.step(f"querying the Aruba Conductor at {aruba_url}")
         verify = not args.aruba_insecure
-        with ArubaConductorClient(
-            aruba_url, ctx.creds.username, ctx.creds.password, verify=verify
-        ) as client:
+        with (
+            ctx.reporter.spinner(f"querying the Aruba Conductor at {aruba_url}..."),
+            ArubaConductorClient(
+                aruba_url, ctx.creds.username, ctx.creds.password, verify=verify
+            ) as client,
+        ):
             wireless: list[WirelessDevice] = []
             if args.only in ("all", "wlcs"):
                 wireless += parse_switches(client.switches())

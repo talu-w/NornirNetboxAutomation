@@ -159,11 +159,12 @@ class CreateInterfaces:
             raise ToolError("no tagged NetBox devices matched the Nornir inventory")
 
         ctx.reporter.step(f"discovering interfaces on {len(selected.inventory.hosts)} device(s)")
-        run_result = selected.run(
-            task=_collect,
-            name="create-interfaces: discover",
-            include_virtual=args.include_virtual,
-        )
+        with ctx.reporter.track(selected, description="create-interfaces: discover") as tracked:
+            run_result = tracked.run(
+                task=_collect,
+                name="create-interfaces: discover",
+                include_virtual=args.include_virtual,
+            )
 
         changes: list[str] = []
         data: dict[str, Any] = {}

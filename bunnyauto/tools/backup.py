@@ -67,13 +67,14 @@ class Backup:
         note = "" if sanitize else "  [RAW — secrets are NOT redacted]"
         ctx.reporter.step(f"backing up {len(hosts)} device(s) to {dated_dir}{note}")
 
-        run_result = targets.run(
-            name="bunnyauto backup",
-            task=collect_device_backup,
-            output_dir=dated_dir,
-            sanitize=sanitize,
-            read_timeout=ctx.settings.read_timeout,
-        )
+        with ctx.reporter.track(targets, description="backup") as tracked:
+            run_result = tracked.run(
+                name="bunnyauto backup",
+                task=collect_device_backup,
+                output_dir=dated_dir,
+                sanitize=sanitize,
+                read_timeout=ctx.settings.read_timeout,
+            )
 
         devices: dict[str, dict[str, object]] = {}
         artifacts: list[Path] = []
