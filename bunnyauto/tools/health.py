@@ -11,7 +11,9 @@ argument picks the report:
   member state, port-security, and control-plane/DAI/DHCP-snooping drops.
 
 Read-only either way. Output goes to ``--output`` (an exact path), else a dated
-file in ``--output-dir`` / ``$BUNNYAUTO_HEALTH_DIR``, else the working directory.
+file in ``--output-dir``, else the report's own ``$BUNNYAUTO_HEALTH_SIMPLE_DIR`` /
+``$BUNNYAUTO_HEALTH_ELABORATE_DIR``, else the shared ``$BUNNYAUTO_HEALTH_DIR``,
+else the working directory.
 """
 
 from __future__ import annotations
@@ -44,34 +46,44 @@ class _Report:
 
     label: str  # human phrase for the result summary
     stub: str  # default filename stem (a ``_<date>.xlsx`` is appended)
+    dir_env: str  # this report's own output-directory env var
     collect_mod: ModuleType  # exposes ``collect_device_health`` + ``extract_records``
     workbook: Callable[[list[dict], str, Path], object]
 
+
+#: shared fallback, used when a report's own ``dir_env`` is unset
+SHARED_DIR_ENV = "BUNNYAUTO_HEALTH_DIR"
 
 REPORTS: dict[str, _Report] = {
     "simple": _Report(
         label="health scorecard",
         stub="Network_Health_Report",
+        dir_env="BUNNYAUTO_HEALTH_SIMPLE_DIR",
         collect_mod=_simple_collect,
         workbook=create_health_workbook,
     ),
     "elaborate": _Report(
         label="engineer health workbook",
         stub="Network_Elaborate_Health_Report",
+        dir_env="BUNNYAUTO_HEALTH_ELABORATE_DIR",
         collect_mod=_elaborate_collect,
         workbook=create_elaborate_health_workbook,
     ),
 }
 
 
-def _resolve_output(args: argparse.Namespace, stub: str) -> Path:
+def _resolve_output(args: argparse.Namespace, report: _Report) -> Path:
     if getattr(args, "output", None):
         path = Path(args.output).expanduser()
     else:
         date = datetime.now().astimezone().strftime("%Y-%m-%d")
-        directory = getattr(args, "output_dir", None) or os.getenv("BUNNYAUTO_HEALTH_DIR")
+        directory = (
+            getattr(args, "output_dir", None)
+            or os.getenv(report.dir_env)
+            or os.getenv(SHARED_DIR_ENV)
+        )
         base = Path(directory).expanduser() if directory else Path()
-        path = base / f"{stub}_{date}.xlsx"
+        path = base / f"{report.stub}_{date}.xlsx"
     if path.suffix.casefold() != ".xlsx":
         raise ToolError("--output must end in .xlsx")
     return path
@@ -88,7 +100,10 @@ class Health:
         parser.add_argument(
             "report",
             choices=tuple(REPORTS),
-            help="Type either: 'simple'(Basic Device Health/Interface usage) or 'elaborate' (Detailed Health Report)",
+            help=(
+                "Type either: 'simple' (Basic Device Health / Interface usage) "
+                "or 'elaborate' (Detailed Health Report)"
+            ),
         )
         parser.add_argument(
             "--output",
@@ -98,10 +113,11 @@ class Health:
         parser.add_argument(
             "--output-dir",
             dest="output_dir",
-            default=os.getenv("BUNNYAUTO_HEALTH_DIR"),
+            default=None,
             help=(
-                "directory for the dated report file "
-                "(env: BUNNYAUTO_HEALTH_DIR; default: working directory)"
+                "directory for the dated report file. If unset, falls back to "
+                "$BUNNYAUTO_HEALTH_SIMPLE_DIR / $BUNNYAUTO_HEALTH_ELABORATE_DIR, "
+                "then $BUNNYAUTO_HEALTH_DIR, then the working directory"
             ),
         )
 
@@ -113,7 +129,7 @@ class Health:
                 f"unknown report {args.report!r} — choose 'simple' or 'elaborate'"
             ) from None
 
-        output_path = _resolve_output(args, report.stub)
+        output_path = _resolve_output(args, report)
         targets = filter_by_tag(ctx.nornir(), ctx.settings.target_tag)
         hosts = targets.inventory.hosts
         if not hosts:

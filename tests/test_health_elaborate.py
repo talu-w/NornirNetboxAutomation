@@ -280,6 +280,22 @@ def test_tool_writes_workbook(monkeypatch, tmp_path):
     assert result.artifacts == [out]
 
 
+def test_elaborate_dir_env_wins_over_shared(monkeypatch, tmp_path):
+    monkeypatch.setattr(health, "filter_by_tag", lambda nr, tag: _Targets({"sw1": object()}, {}))
+    monkeypatch.setattr(
+        elaborate_collect,
+        "extract_records",
+        lambda results, hosts_: [{"hostname": "sw1", "reachable": True}],
+    )
+    monkeypatch.setenv("BUNNYAUTO_HEALTH_DIR", str(tmp_path / "shared"))
+    monkeypatch.setenv("BUNNYAUTO_HEALTH_ELABORATE_DIR", str(tmp_path / "elab"))
+
+    result = TOOL.run(_ctx(), _args())
+    written = Path(result.data["output"])
+    assert written.parent == tmp_path / "elab"
+    assert written.name.startswith("Network_Elaborate_Health_Report_")
+
+
 def test_tool_no_devices(monkeypatch):
     monkeypatch.setattr(health, "filter_by_tag", lambda nr, tag: _Targets({}, {}))
     result = TOOL.run(_ctx(), _args())

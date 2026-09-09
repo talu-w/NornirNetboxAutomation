@@ -277,21 +277,31 @@ def test_tool_writes_workbook(monkeypatch, tmp_path):
     assert result.artifacts == [out]
 
 
-def test_output_dir_and_env(monkeypatch, tmp_path):
-    hosts = {"sw1": _Host({})}
-    monkeypatch.setattr(health, "filter_by_tag", lambda nr, tag: _Targets(hosts, {}))
+def _run_for_output(monkeypatch, **args) -> Path:
+    monkeypatch.setattr(health, "filter_by_tag", lambda nr, tag: _Targets({"sw1": _Host({})}, {}))
     monkeypatch.setattr(
         collect, "extract_records", lambda results, hosts_: [{"hostname": "sw1", "reachable": True}]
     )
+    result = TOOL.run(_ctx(), _args(**args))
+    return Path(result.data["output"])
 
-    # --output-dir wins over $BUNNYAUTO_HEALTH_DIR
-    monkeypatch.setenv("BUNNYAUTO_HEALTH_DIR", str(tmp_path / "env"))
-    flag_dir = tmp_path / "flag"
-    result = TOOL.run(_ctx(), _args(output_dir=str(flag_dir)))
-    written = Path(result.data["output"])
-    assert written.parent == flag_dir
+
+def test_output_dir_precedence(monkeypatch, tmp_path):
+    monkeypatch.setenv("BUNNYAUTO_HEALTH_DIR", str(tmp_path / "shared"))
+    monkeypatch.setenv("BUNNYAUTO_HEALTH_SIMPLE_DIR", str(tmp_path / "simple"))
+
+    # --output-dir wins over every env var
+    flag = tmp_path / "flag"
+    assert _run_for_output(monkeypatch, output_dir=str(flag)).parent == flag
+
+    # then the report's own var wins over the shared one
+    written = _run_for_output(monkeypatch)
+    assert written.parent == tmp_path / "simple"
     assert written.name.startswith("Network_Health_Report_")
-    assert written.suffix == ".xlsx"
+
+    # shared var is the last resort
+    monkeypatch.delenv("BUNNYAUTO_HEALTH_SIMPLE_DIR")
+    assert _run_for_output(monkeypatch).parent == tmp_path / "shared"
 
 
 def test_tool_no_devices(monkeypatch):
