@@ -80,7 +80,7 @@ def _resolve_output(args: argparse.Namespace, stub: str) -> Path:
 @dataclass(slots=True)
 class Health:
     name: str = "health"
-    summary: str = "Network-health report (Excel): 'simple' scorecard or 'elaborate' workbook"
+    summary: str = "Create Network Health Reports - Reports are written in Excel format"
     writes: bool = False
 
     def add_arguments(self, parser: argparse.ArgumentParser) -> None:
@@ -88,7 +88,7 @@ class Health:
         parser.add_argument(
             "report",
             choices=tuple(REPORTS),
-            help="which report: 'simple' management scorecard or 'elaborate' engineer workbook",
+            help="Type either: 'simple'(Basic Device Health/Interface usage) or 'elaborate' (Detailed Health Report)",
         )
         parser.add_argument(
             "--output",
