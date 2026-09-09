@@ -11,6 +11,7 @@ from openpyxl import load_workbook
 
 from bunnyauto.context import Settings
 from bunnyauto.errors import ToolError
+from bunnyauto.health import elaborate_collect
 from bunnyauto.health.elaborate_collect import (
     _duration_seconds,
     _interface_key,
@@ -28,8 +29,8 @@ from bunnyauto.health.elaborate_workbook import (
 )
 from bunnyauto.reporting import Reporter
 from bunnyauto.result import Status
-from bunnyauto.tools import health_elaborate
-from bunnyauto.tools.health_elaborate import TOOL
+from bunnyauto.tools import health
+from bunnyauto.tools.health import TOOL
 
 # ---------------------------------------------------------------------------
 # small helpers
@@ -248,16 +249,23 @@ def _ctx() -> _Ctx:
     )
 
 
+def _args(**kw):
+    kw.setdefault("report", "elaborate")
+    kw.setdefault("output", None)
+    kw.setdefault("output_dir", None)
+    return argparse.Namespace(**kw)
+
+
 def test_output_must_be_xlsx():
     with pytest.raises(ToolError):
-        TOOL.run(_ctx(), argparse.Namespace(output="report.txt"))
+        TOOL.run(_ctx(), _args(output="report.txt"))
 
 
 def test_tool_writes_workbook(monkeypatch, tmp_path):
     hosts = {"sw1": object(), "sw2": object()}
-    monkeypatch.setattr(health_elaborate, "filter_by_tag", lambda nr, tag: _Targets(hosts, {}))
+    monkeypatch.setattr(health, "filter_by_tag", lambda nr, tag: _Targets(hosts, {}))
     monkeypatch.setattr(
-        health_elaborate,
+        elaborate_collect,
         "extract_records",
         lambda results, hosts_: [
             {"hostname": "sw1", "reachable": True},
@@ -265,13 +273,14 @@ def test_tool_writes_workbook(monkeypatch, tmp_path):
         ],
     )
     out = tmp_path / "e.xlsx"
-    result = TOOL.run(_ctx(), argparse.Namespace(output=str(out)))
+    result = TOOL.run(_ctx(), _args(output=str(out)))
     assert result.status is Status.OK
     assert out.is_file()
+    assert result.data["report"] == "elaborate"
     assert result.artifacts == [out]
 
 
 def test_tool_no_devices(monkeypatch):
-    monkeypatch.setattr(health_elaborate, "filter_by_tag", lambda nr, tag: _Targets({}, {}))
-    result = TOOL.run(_ctx(), argparse.Namespace(output=None))
+    monkeypatch.setattr(health, "filter_by_tag", lambda nr, tag: _Targets({}, {}))
+    result = TOOL.run(_ctx(), _args())
     assert result.status is Status.OK

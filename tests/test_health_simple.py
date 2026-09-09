@@ -24,8 +24,8 @@ from bunnyauto.health.collect import (
 from bunnyauto.health.simple_workbook import build_collection_notes, create_health_workbook
 from bunnyauto.reporting import Reporter
 from bunnyauto.result import Status
-from bunnyauto.tools import health_simple
-from bunnyauto.tools.health_simple import TOOL
+from bunnyauto.tools import health
+from bunnyauto.tools.health import TOOL
 
 # ---------------------------------------------------------------------------
 # parsers
@@ -233,9 +233,21 @@ def _ctx() -> _Ctx:
     )
 
 
+def _args(**kw):
+    kw.setdefault("report", "simple")
+    kw.setdefault("output", None)
+    kw.setdefault("output_dir", None)
+    return argparse.Namespace(**kw)
+
+
 def test_output_must_be_xlsx():
     with pytest.raises(ToolError):
-        TOOL.run(_ctx(), argparse.Namespace(output="report.pdf"))
+        TOOL.run(_ctx(), _args(output="report.pdf"))
+
+
+def test_unknown_report_is_friendly():
+    with pytest.raises(ToolError):
+        TOOL.run(_ctx(), _args(report="sensible"))
 
 
 def test_tool_writes_workbook(monkeypatch, tmp_path):
@@ -245,9 +257,9 @@ def test_tool_writes_workbook(monkeypatch, tmp_path):
         pass
 
     run_result = _Results()
-    monkeypatch.setattr(health_simple, "filter_by_tag", lambda nr, tag: _Targets(hosts, run_result))
+    monkeypatch.setattr(health, "filter_by_tag", lambda nr, tag: _Targets(hosts, run_result))
     monkeypatch.setattr(
-        health_simple,
+        collect,
         "extract_records",
         lambda results, hosts_: [
             {"hostname": "sw1", "reachable": True},
@@ -256,16 +268,34 @@ def test_tool_writes_workbook(monkeypatch, tmp_path):
     )
 
     out = tmp_path / "r.xlsx"
-    result = TOOL.run(_ctx(), argparse.Namespace(output=str(out)))
+    result = TOOL.run(_ctx(), _args(output=str(out)))
 
     assert result.status is Status.PARTIAL  # sw2 unreachable
     assert out.is_file()
+    assert result.data["report"] == "simple"
     assert result.data["reachable"] == 1
     assert result.artifacts == [out]
 
 
+def test_output_dir_and_env(monkeypatch, tmp_path):
+    hosts = {"sw1": _Host({})}
+    monkeypatch.setattr(health, "filter_by_tag", lambda nr, tag: _Targets(hosts, {}))
+    monkeypatch.setattr(
+        collect, "extract_records", lambda results, hosts_: [{"hostname": "sw1", "reachable": True}]
+    )
+
+    # --output-dir wins over $BUNNYAUTO_HEALTH_DIR
+    monkeypatch.setenv("BUNNYAUTO_HEALTH_DIR", str(tmp_path / "env"))
+    flag_dir = tmp_path / "flag"
+    result = TOOL.run(_ctx(), _args(output_dir=str(flag_dir)))
+    written = Path(result.data["output"])
+    assert written.parent == flag_dir
+    assert written.name.startswith("Network_Health_Report_")
+    assert written.suffix == ".xlsx"
+
+
 def test_tool_no_devices(monkeypatch):
-    monkeypatch.setattr(health_simple, "filter_by_tag", lambda nr, tag: _Targets({}, {}))
-    result = TOOL.run(_ctx(), argparse.Namespace(output=None))
+    monkeypatch.setattr(health, "filter_by_tag", lambda nr, tag: _Targets({}, {}))
+    result = TOOL.run(_ctx(), _args())
     assert result.status is Status.OK
     assert "nornirtest" in result.summary

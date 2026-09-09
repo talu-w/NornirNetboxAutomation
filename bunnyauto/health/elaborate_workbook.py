@@ -22,8 +22,8 @@ from openpyxl.worksheet.pagebreak import Break
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
 # Internal scoring values, stored in the very-hidden "Scoring" sheet.
-# NOTE: ERR_DISABLED_PENALTY is 2 here but 10 in health-simple. Left as-is
-# pending the owner's call (CLAUDE.md issue #2) — do not "fix" silently.
+# NOTE: ERR_DISABLED_PENALTY is 2 here but 10 in simple_workbook.py. Left as-is
+# pending the owner's call (CLAUDE.md issue #1) — do not "fix" silently.
 CPU_WARNING_PCT = 75.0
 CPU_CRITICAL_PCT = 90.0
 MIN_DATA_COVERAGE_PCT = 60.0
