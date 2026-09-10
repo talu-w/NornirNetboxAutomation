@@ -141,6 +141,21 @@ def test_subnet_present_but_unreferenced(monkeypatch):
     assert "no policy references it" in result.summary
 
 
+def test_catch_all_object_does_not_flip_the_exit_code(monkeypatch):
+    monkeypatch.setenv("FW_TOKEN", "t")
+    all_obj = {"name": "all", "type": "ipmask", "subnet": "0.0.0.0 0.0.0.0"}
+    policies = [{"policyid": 1, "name": "allow-any", "srcaddr": [{"name": "all"}]}]
+    _fake_client(monkeypatch, addresses=[all_obj, NET_HQ], policies=policies)
+    result = TOOL.run(_Ctx(_environment()), _args(subnet="192.168.32.0/24"))
+    assert result.status is Status.OK
+    assert result.exit_code == 0
+    assert result.data["present"] is False
+    assert result.data["in_use"] is False
+    assert result.data["permitted_by_catch_all"] is True
+    assert result.data["catch_alls"][0]["name"] == "all"
+    assert "catch-all" in result.summary
+
+
 def test_insecure_flag_disables_verify(monkeypatch):
     monkeypatch.setenv("FW_TOKEN", "t")
     captured = _fake_client(monkeypatch, addresses=[VLAN2])

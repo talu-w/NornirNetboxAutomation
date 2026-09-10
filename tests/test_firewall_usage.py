@@ -16,6 +16,14 @@ SUB_2 = {"name": "vlan2", "type": "ipmask", "subnet": "10.1.2.0 255.255.255.0"}
 V6_LAB = {"name": "v6_lab", "type": "ipprefix", "ip6": "2001:db8:1::/64"}
 DHCP_POOL = {"name": "dhcp_pool", "type": "iprange", "start-ip": "10.1.2.10", "end-ip": "10.1.2.50"}
 FQDN = {"name": "ext_host", "type": "fqdn", "fqdn": "example.com"}
+ALL_V4 = {"name": "all", "type": "ipmask", "subnet": "0.0.0.0 0.0.0.0"}
+ALL_V6 = {"name": "all6", "type": "ipprefix", "ip6": "::/0"}
+ALL_RANGE = {
+    "name": "all_range",
+    "type": "iprange",
+    "start-ip": "0.0.0.0",
+    "end-ip": "255.255.255.255",
+}
 
 
 def _policy(pid, name, **fields):
@@ -84,6 +92,53 @@ def test_iprange_inside_query_is_subnet():
 def test_iprange_partial_overlap():
     report = analyze(parse_query("10.1.2.0/28"), [DHCP_POOL], [], [])
     assert report.matches[0].relation == "overlap"
+
+
+# --- match-all / catch-all objects ----------------------------------
+
+
+@pytest.mark.parametrize("obj", [ALL_V4, ALL_RANGE])
+def test_match_all_v4_object_is_not_a_match(obj):
+    pol = _policy(1, "allow-any", srcaddr=["all", "all_range"])
+    report = analyze(parse_query("192.168.32.0/24"), [obj], [], [pol])
+    assert report.present is False
+    assert report.attached is False
+    assert report.matches == []
+    assert [m.name for m in report.catch_alls] == [obj["name"]]
+    assert report.catch_alls[0].relation == "catch-all"
+    assert report.permitted_by_catch_all is True
+
+
+def test_match_all_v6_object_is_not_a_match():
+    pol = _policy(2, "v6-any", srcaddr6=["all6"])
+    report = analyze(parse_query("2001:db8:99::/64"), [ALL_V6], [], [pol])
+    assert report.present is False
+    assert report.catch_alls[0].name == "all6"
+    assert report.permitted_by_catch_all is True
+
+
+def test_match_all_wrong_family_is_dropped_entirely():
+    report = analyze(parse_query("2001:db8::/64"), [ALL_V4], [], [])
+    assert report.catch_alls == []
+    assert report.present is False
+
+
+def test_match_all_alongside_a_real_match_still_drifts():
+    pol = _policy(3, "p", dstaddr=["net_hq"])
+    report = analyze(parse_query("10.1.2.0/24"), [ALL_V4, NET_HQ], [], [pol])
+    assert report.present is True
+    assert report.attached is True
+    assert [m.name for m in report.matches] == ["net_hq"]
+    assert [m.name for m in report.catch_alls] == ["all"]
+
+
+def test_unreferenced_match_all_is_reported_but_not_permitting():
+    report = analyze(parse_query("10.5.5.0/24"), [ALL_V4], [], [])
+    assert report.catch_alls[0].name == "all"
+    assert report.permitted_by_catch_all is False
+    payload = report.as_dict()
+    assert payload["permitted_by_catch_all"] is False
+    assert payload["catch_alls"][0]["name"] == "all"
 
 
 # --- group resolution -------------------------------------------------

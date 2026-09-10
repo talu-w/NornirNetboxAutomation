@@ -14,6 +14,12 @@ The question the ``fw-subnet-check`` tool answers has three outcomes:
 "Overlap" for two IP networks always means one contains the other (networks
 never partially overlap); address *ranges* can partially overlap, and those are
 reported with relation ``"overlap"``.
+
+**Match-all objects** (``0.0.0.0/0`` / ``::/0``, or a range spanning the whole
+family — FortiGate's built-in ``all``) contain *every* query, so counting them
+as a "present" match would make everything look in use. They are pulled out into
+``report.catch_alls`` instead: reported as informational notes, never as a real
+match, and they never move the exit code.
 """
 
 from __future__ import annotations
@@ -51,7 +57,7 @@ class AddressMatch:
     name: str
     cidr: str  # normalised: "10.1.2.0/24", or "10.1.2.10-10.1.2.20" for a range
     kind: str  # "ipmask" | "ipprefix" | "iprange"
-    relation: str  # "exact" | "supernet" | "subnet" | "overlap"
+    relation: str  # "exact" | "supernet" | "subnet" | "overlap" | "catch-all"
     comment: str = ""
     groups: list[str] = field(default_factory=list)
     policies: list[PolicyRef] = field(default_factory=list)
@@ -74,6 +80,7 @@ class UsageReport:
     vdom: str
     family: int
     matches: list[AddressMatch] = field(default_factory=list)
+    catch_alls: list[AddressMatch] = field(default_factory=list)
 
     @property
     def present(self) -> bool:
@@ -82,6 +89,11 @@ class UsageReport:
     @property
     def attached(self) -> bool:
         return any(match.policies for match in self.matches)
+
+    @property
+    def permitted_by_catch_all(self) -> bool:
+        """A ``0.0.0.0/0`` / ``::/0`` object that a policy references covers this query."""
+        return any(match.policies for match in self.catch_alls)
 
     @property
     def exact(self) -> AddressMatch | None:
@@ -98,10 +110,12 @@ class UsageReport:
             "family": self.family,
             "present": self.present,
             "in_use": self.attached,
+            "permitted_by_catch_all": self.permitted_by_catch_all,
             "exact_match": self.exact.name if self.exact else None,
             "match_count": len(self.matches),
             "policy_count": self.policy_count,
             "matches": [m.as_dict() for m in self.matches],
+            "catch_alls": [m.as_dict() for m in self.catch_alls],
         }
 
 
@@ -130,12 +144,22 @@ def _mask_to_network(raw: Any) -> IPNetwork | None:
 
 def _prefix_to_network(raw: Any) -> IPNetwork | None:
     text = str(raw or "").strip()
-    if not text or text in {"::/0"}:
+    if not text:
         return None
     try:
         return ipaddress.ip_network(text, strict=False)
     except ValueError:
         return None
+
+
+def _network_is_match_all(net: IPNetwork) -> bool:
+    """``0.0.0.0/0`` or ``::/0`` — contains every address of its family."""
+    return net.prefixlen == 0
+
+
+def _range_is_match_all(lo: Any, hi: Any) -> bool:
+    """A start/end pair that spans the entire address family."""
+    return int(lo) == 0 and int(hi) == (1 << lo.max_prefixlen) - 1
 
 
 def _range_bounds(obj: dict[str, Any]) -> tuple[Any, Any] | None:
@@ -256,19 +280,28 @@ def analyze(
         net = _mask_to_network(obj.get("subnet"))
         if net is None and obj.get("ip6"):
             net = _prefix_to_network(obj.get("ip6"))
-            kind = kind or "ipprefix"
+            if net is not None:
+                kind = kind or "ipprefix"
 
+        match_all = False
         if net is not None:
-            relation = _network_relation(net, query)
             cidr = str(net)
             kind = kind or "ipmask"
+            if net.version == query.version and _network_is_match_all(net):
+                match_all, relation = True, "catch-all"
+            else:
+                relation = _network_relation(net, query)
         else:
             bounds = _range_bounds(obj)
             if bounds is None:
                 continue  # fqdn / geography / dynamic / mac — no address space
-            relation = _range_relation(bounds[0], bounds[1], query)
-            cidr = f"{bounds[0]}-{bounds[1]}"
+            lo, hi = bounds
+            cidr = f"{lo}-{hi}"
             kind = kind or "iprange"
+            if lo.version == query.version and _range_is_match_all(lo, hi):
+                match_all, relation = True, "catch-all"
+            else:
+                relation = _range_relation(lo, hi, query)
 
         if relation is None:
             continue
@@ -298,9 +331,10 @@ def analyze(
                     match.policies.append(PolicyRef(pid, pname, pol_field, group))
 
         match.policies.sort(key=lambda ref: (ref.policyid, ref.field, ref.via or ""))
-        report.matches.append(match)
+        (report.catch_alls if match_all else report.matches).append(match)
 
     report.matches.sort(key=lambda m: (_RELATION_ORDER.get(m.relation, 9), m.cidr, m.name))
+    report.catch_alls.sort(key=lambda m: (m.cidr, m.name))
     return report
 
 

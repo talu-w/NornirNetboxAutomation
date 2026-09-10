@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING
 from bunnyauto.common import env_flag
 from bunnyauto.errors import FirewallError
 from bunnyauto.firewall.fortigate import FortiGateClient
-from bunnyauto.firewall.usage import AddressMatch, analyze, parse_query
+from bunnyauto.firewall.usage import AddressMatch, PolicyRef, analyze, parse_query
 from bunnyauto.tools.base import Status, ToolResult
 
 if TYPE_CHECKING:
@@ -131,11 +131,17 @@ class FwSubnetCheck:
         changes = [_describe(match) for match in report.matches]
         for line in changes:
             ctx.reporter.info(line)
+        for note in _catch_all_notes(report.catch_alls):
+            ctx.reporter.info(note)
 
         if not report.present:
+            summary = f"{query} is not present on the firewall — no address object overlaps it"
+            if report.permitted_by_catch_all:
+                permitting = sum(1 for m in report.catch_alls if m.policies)
+                summary += f" (but {permitting} catch-all object(s) permit it — see notes)"
             return ToolResult(
                 status=Status.OK,
-                summary=f"{query} is not present on the firewall — no address object overlaps it",
+                summary=summary,
                 data=report.as_dict(),
             )
 
@@ -158,23 +164,43 @@ class FwSubnetCheck:
         )
 
 
+def _format_refs(refs: list[PolicyRef]) -> str:
+    return ", ".join(
+        f"{ref.policyid}"
+        + (f"/{ref.name}" if ref.name else "")
+        + f" [{ref.field}"
+        + (f" via {ref.via}" if ref.via else "")
+        + "]"
+        for ref in refs
+    )
+
+
 def _describe(match: AddressMatch) -> str:
     parts = [f"{match.cidr}  ({match.name})  {match.relation}"]
     if match.groups:
         parts.append(f"groups: {', '.join(match.groups)}")
-    if match.policies:
-        refs = ", ".join(
-            f"{ref.policyid}"
-            + (f"/{ref.name}" if ref.name else "")
-            + f" [{ref.field}"
-            + (f" via {ref.via}" if ref.via else "")
-            + "]"
-            for ref in match.policies
-        )
-        parts.append(f"policies: {refs}")
-    else:
-        parts.append("policies: none")
+    refs = _format_refs(match.policies) if match.policies else "none"
+    parts.append(f"policies: {refs}")
     return "  —  ".join(parts)
+
+
+def _catch_all_notes(catch_alls: list[AddressMatch]) -> list[str]:
+    """Informational lines for ``0.0.0.0/0`` / ``::/0`` objects — never a match."""
+    notes: list[str] = []
+    for match in catch_alls:
+        if match.policies:
+            policy_ids = {ref.policyid for ref in match.policies}
+            notes.append(
+                f"note: the queried subnet is permitted by a catch-all, not a subnet-specific "
+                f"object — {match.name} ({match.cidr}) is referenced by {len(policy_ids)} "
+                f"policy/policies: {_format_refs(match.policies)}"
+            )
+        else:
+            notes.append(
+                f"note: address object {match.name} ({match.cidr}) matches everything "
+                "but no policy references it"
+            )
+    return notes
 
 
 TOOL = FwSubnetCheck()
