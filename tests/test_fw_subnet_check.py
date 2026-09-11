@@ -41,7 +41,7 @@ def _args(subnet="10.1.2.0/24", **over) -> argparse.Namespace:
     return argparse.Namespace(**base)
 
 
-def _fake_client(monkeypatch, *, addresses=(), groups=(), policies=(), boom=None):
+def _fake_client(monkeypatch, *, addresses=(), groups=(), policies=(), interfaces=(), boom=None):
     captured: dict = {}
 
     class FakeClient:
@@ -59,6 +59,9 @@ def _fake_client(monkeypatch, *, addresses=(), groups=(), policies=(), boom=None
 
         def policies(self):
             return list(policies)
+
+        def interfaces(self):
+            return list(interfaces)
 
         def close(self):
             self.closed = True
@@ -154,6 +157,31 @@ def test_catch_all_object_does_not_flip_the_exit_code(monkeypatch):
     assert result.data["permitted_by_catch_all"] is True
     assert result.data["catch_alls"][0]["name"] == "all"
     assert "catch-all" in result.summary
+
+
+def test_interface_address_is_a_note_not_a_match(monkeypatch):
+    monkeypatch.setenv("FW_TOKEN", "t")
+    interfaces = [{"name": "port10", "vdom": "root", "ip": "192.168.32.1 255.255.255.0"}]
+    _fake_client(monkeypatch, interfaces=interfaces)
+    result = TOOL.run(_Ctx(_environment()), _args(subnet="192.168.32.0/24"))
+    assert result.status is Status.OK
+    assert result.exit_code == 0
+    assert result.data["present"] is False
+    assert result.data["in_use"] is False
+    assert result.data["on_interface"] is True
+    assert result.data["interfaces"][0]["name"] == "port10"
+    assert result.data["interfaces"][0]["ip"] == "192.168.32.1/24"
+    assert "interface address" in result.summary
+
+
+def test_interface_note_does_not_flip_a_real_drift(monkeypatch):
+    monkeypatch.setenv("FW_TOKEN", "t")
+    interfaces = [{"name": "port10", "ip": "10.1.2.1 255.255.255.0"}]
+    _fake_client(monkeypatch, addresses=[VLAN2], interfaces=interfaces)
+    result = TOOL.run(_Ctx(_environment()), _args(subnet="10.1.2.0/24"))
+    assert result.status is Status.DRIFT
+    assert result.data["on_interface"] is True
+    assert result.data["in_use"] is False  # unrelated to the interface note
 
 
 def test_insecure_flag_disables_verify(monkeypatch):

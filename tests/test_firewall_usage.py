@@ -141,6 +141,64 @@ def test_unreferenced_match_all_is_reported_but_not_permitting():
     assert payload["catch_alls"][0]["name"] == "all"
 
 
+# --- interface addresses ----------------------------------------------
+
+IFACE_PRIMARY = {"name": "port10", "vdom": "root", "ip": "10.1.2.1 255.255.255.0"}
+IFACE_UNSET = {"name": "port11", "vdom": "root", "ip": "0.0.0.0 0.0.0.0"}
+IFACE_SECONDARY = {
+    "name": "port12",
+    "vdom": "root",
+    "ip": "0.0.0.0 0.0.0.0",
+    "secondaryip": [{"id": 1, "ip": "10.1.2.5 255.255.255.0"}],
+}
+IFACE_V6 = {"name": "port13", "vdom": "root", "ipv6": {"ip6-address": "2001:db8:1::1/64"}}
+IFACE_V6_UNSET = {"name": "port14", "vdom": "root", "ipv6": {"ip6-address": "::/0"}}
+
+
+def test_interface_primary_address_overlapping_query_is_noted():
+    report = analyze(
+        parse_query("10.1.2.0/24"), [], [], [], interfaces=[IFACE_PRIMARY], vdom="root"
+    )
+    assert report.on_interface is True
+    assert report.present is False  # never counts as a real match
+    m = report.interfaces[0]
+    assert m.name == "port10"
+    assert m.kind == "primary"
+    assert m.ip == "10.1.2.1/24"
+    assert m.network == "10.1.2.0/24"
+    assert m.relation == "exact"
+
+
+def test_interface_with_no_address_is_ignored():
+    report = analyze(parse_query("10.1.2.0/24"), [], [], [], interfaces=[IFACE_UNSET])
+    assert report.interfaces == []
+    assert report.on_interface is False
+
+
+def test_interface_secondary_ip_is_matched():
+    report = analyze(parse_query("10.1.2.0/28"), [], [], [], interfaces=[IFACE_SECONDARY])
+    assert report.interfaces[0].kind == "secondary"
+    assert report.interfaces[0].ip == "10.1.2.5/24"
+    assert report.interfaces[0].relation == "supernet"
+
+
+def test_interface_ipv6_address_is_matched():
+    report = analyze(parse_query("2001:db8:1::/64"), [], [], [], interfaces=[IFACE_V6])
+    assert report.interfaces[0].kind == "ipv6"
+    assert report.interfaces[0].relation == "exact"
+
+
+def test_interface_ipv6_unset_and_wrong_family_are_ignored():
+    report = analyze(parse_query("10.1.2.0/24"), [], [], [], interfaces=[IFACE_V6, IFACE_V6_UNSET])
+    assert report.interfaces == []
+
+
+def test_interfaces_default_to_empty_when_omitted():
+    report = analyze(parse_query("10.1.2.0/24"), [NET_HQ], [], [])
+    assert report.interfaces == []
+    assert report.as_dict()["on_interface"] is False
+
+
 # --- group resolution -------------------------------------------------
 
 

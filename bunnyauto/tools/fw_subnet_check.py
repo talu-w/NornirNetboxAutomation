@@ -12,6 +12,12 @@ relates to what is already there:
 * **cannot check** -> ``Status.ERROR`` (exit 1) — bad input, or the firewall was
   unreachable / rejected the token.
 
+It also checks the FortiGate's own configured interfaces (primary, secondary,
+IPv6) for an address already sitting in the queried range. That is reported as
+an informational note only (``data["on_interface"]`` / ``data["interfaces"]``)
+and never changes ``present``/``in_use`` or the exit code — the tool's job is
+the address-object/policy check above, not "is this IP alive on the box".
+
 This tool touches neither devices nor NetBox, so it declares
 ``needs_devices = needs_netbox = False`` and runs with only its own token set.
 The firewall URL and the name of the token's env var come from the environment
@@ -32,7 +38,13 @@ from typing import TYPE_CHECKING
 from bunnyauto.common import env_flag
 from bunnyauto.errors import FirewallError
 from bunnyauto.firewall.fortigate import FortiGateClient
-from bunnyauto.firewall.usage import AddressMatch, PolicyRef, analyze, parse_query
+from bunnyauto.firewall.usage import (
+    AddressMatch,
+    InterfaceMatch,
+    PolicyRef,
+    analyze,
+    parse_query,
+)
 from bunnyauto.tools.base import Status, ToolResult
 
 if TYPE_CHECKING:
@@ -110,7 +122,8 @@ class FwSubnetCheck:
 
         verify = not args.fw_insecure
         ctx.reporter.step(
-            f"querying {fw_url} (vdom={args.vdom}) for address objects, groups and policies"
+            f"querying {fw_url} (vdom={args.vdom}) for address objects, groups, "
+            "policies and interfaces"
         )
 
         client = FortiGateClient(fw_url, token, vdom=args.vdom, verify=verify)
@@ -119,19 +132,22 @@ class FwSubnetCheck:
                 addresses = client.addresses()
                 groups = client.address_groups()
                 policies = client.policies()
+                interfaces = client.interfaces()
         finally:
             client.close()
 
         ctx.reporter.info(
             f"fetched {len(addresses)} address object(s), {len(groups)} group(s), "
-            f"{len(policies)} policy/policies"
+            f"{len(policies)} policy/policies, {len(interfaces)} interface(s)"
         )
 
-        report = analyze(query, addresses, groups, policies, vdom=args.vdom)
+        report = analyze(query, addresses, groups, policies, interfaces=interfaces, vdom=args.vdom)
         changes = [_describe(match) for match in report.matches]
         for line in changes:
             ctx.reporter.info(line)
         for note in _catch_all_notes(report.catch_alls):
+            ctx.reporter.info(note)
+        for note in _interface_notes(report.interfaces):
             ctx.reporter.info(note)
 
         if not report.present:
@@ -139,6 +155,10 @@ class FwSubnetCheck:
             if report.permitted_by_catch_all:
                 permitting = sum(1 for m in report.catch_alls if m.policies)
                 summary += f" (but {permitting} catch-all object(s) permit it — see notes)"
+            if report.on_interface:
+                summary += (
+                    f" ({len(report.interfaces)} interface address(es) in this range — see notes)"
+                )
             return ToolResult(
                 status=Status.OK,
                 summary=summary,
@@ -200,6 +220,27 @@ def _catch_all_notes(catch_alls: list[AddressMatch]) -> list[str]:
                 f"note: address object {match.name} ({match.cidr}) matches everything "
                 "but no policy references it"
             )
+    return notes
+
+
+_RELATION_PHRASE = {
+    "exact": "is exactly",
+    "supernet": "contains",
+    "subnet": "sits inside",
+    "overlap": "overlaps",
+}
+
+
+def _interface_notes(interfaces: list[InterfaceMatch]) -> list[str]:
+    """Informational lines for live interface addresses — never a match/policy hit."""
+    notes: list[str] = []
+    for iface in interfaces:
+        where = f" (vdom {iface.vdom})" if iface.vdom else ""
+        phrase = _RELATION_PHRASE.get(iface.relation, iface.relation)
+        notes.append(
+            f"note: interface {iface.name}{where} has {iface.kind} address {iface.ip} "
+            f"configured — its network {iface.network} {phrase} the queried range"
+        )
     return notes
 
 

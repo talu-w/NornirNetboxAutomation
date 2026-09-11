@@ -54,6 +54,15 @@ class FortiGateClient:
         """IPv4/IPv6 firewall policies (``policyid``, ``srcaddr``, ``dstaddr``, …)."""
         return self._get("firewall/policy")
 
+    def interfaces(self) -> list[dict[str, Any]]:
+        """Configured interfaces — IPv4 ``ip``/``secondaryip``, IPv6 under ``ipv6``.
+
+        Used only for the interface-conflict note in ``fw-subnet-check``: is the
+        queried subnet already assigned to a live interface, not just an address
+        object.
+        """
+        return self._get("system/interface")
+
     def close(self) -> None:
         self._session.close()
 

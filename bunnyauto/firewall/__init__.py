@@ -11,6 +11,7 @@ from __future__ import annotations
 from bunnyauto.firewall.fortigate import FortiGateClient
 from bunnyauto.firewall.usage import (
     AddressMatch,
+    InterfaceMatch,
     PolicyRef,
     UsageReport,
     analyze,
@@ -19,6 +20,7 @@ from bunnyauto.firewall.usage import (
 __all__ = [
     "FortiGateClient",
     "AddressMatch",
+    "InterfaceMatch",
     "PolicyRef",
     "UsageReport",
     "analyze",

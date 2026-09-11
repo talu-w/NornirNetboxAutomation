@@ -20,6 +20,13 @@ family — FortiGate's built-in ``all``) contain *every* query, so counting them
 as a "present" match would make everything look in use. They are pulled out into
 ``report.catch_alls`` instead: reported as informational notes, never as a real
 match, and they never move the exit code.
+
+**Interface addresses** are a separate signal again: the tool's job is "is there
+an address object / policy for this subnet", not "is this IP alive on the box".
+A subnet already configured on a live interface (primary, secondary, or IPv6)
+goes into ``report.interfaces`` and is reported as a note — it never sets
+``present``/``in_use`` and never changes the exit code, even when nothing else
+matched.
 """
 
 from __future__ import annotations
@@ -75,12 +82,39 @@ class AddressMatch:
 
 
 @dataclass(slots=True)
+class InterfaceMatch:
+    """A live FortiGate interface whose configured address overlaps the query.
+
+    Informational only — this is not an address object or a policy, so it never
+    contributes to ``UsageReport.present`` / ``attached``.
+    """
+
+    name: str  # interface name, e.g. "port10"
+    vdom: str
+    kind: str  # "primary" | "secondary" | "ipv6" | "ipv6-secondary"
+    ip: str  # the interface's own address, e.g. "10.1.2.1/24"
+    network: str  # that address's network, e.g. "10.1.2.0/24"
+    relation: str  # "exact" | "supernet" | "subnet"
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "vdom": self.vdom,
+            "kind": self.kind,
+            "ip": self.ip,
+            "network": self.network,
+            "relation": self.relation,
+        }
+
+
+@dataclass(slots=True)
 class UsageReport:
     query: str
     vdom: str
     family: int
     matches: list[AddressMatch] = field(default_factory=list)
     catch_alls: list[AddressMatch] = field(default_factory=list)
+    interfaces: list[InterfaceMatch] = field(default_factory=list)
 
     @property
     def present(self) -> bool:
@@ -94,6 +128,11 @@ class UsageReport:
     def permitted_by_catch_all(self) -> bool:
         """A ``0.0.0.0/0`` / ``::/0`` object that a policy references covers this query."""
         return any(match.policies for match in self.catch_alls)
+
+    @property
+    def on_interface(self) -> bool:
+        """A live interface already has an address in (or containing) this range."""
+        return bool(self.interfaces)
 
     @property
     def exact(self) -> AddressMatch | None:
@@ -116,6 +155,8 @@ class UsageReport:
             "policy_count": self.policy_count,
             "matches": [m.as_dict() for m in self.matches],
             "catch_alls": [m.as_dict() for m in self.catch_alls],
+            "on_interface": self.on_interface,
+            "interfaces": [m.as_dict() for m in self.interfaces],
         }
 
 
@@ -160,6 +201,28 @@ def _network_is_match_all(net: IPNetwork) -> bool:
 def _range_is_match_all(lo: Any, hi: Any) -> bool:
     """A start/end pair that spans the entire address family."""
     return int(lo) == 0 and int(hi) == (1 << lo.max_prefixlen) - 1
+
+
+def _interface_address(raw: Any, *, cidr: bool) -> tuple[Any, IPNetwork] | None:
+    """One interface address -> ``(host, network)``, or ``None`` if unset.
+
+    ``ip`` / ``secondaryip[].ip`` are FortiGate's ``"10.1.2.1 255.255.255.0"``
+    mask form; ``ipv6.ip6-address`` / ``ip6-extra-addr[].prefix`` are already
+    CIDR (``"2001:db8:1::1/64"``). Either way an all-zero host (``0.0.0.0`` /
+    ``::``) means the interface has no address configured — not a match.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    if not cidr:
+        text = text.replace(" ", "/")
+    try:
+        iface = ipaddress.ip_interface(text)
+    except ValueError:
+        return None
+    if int(iface.ip) == 0:
+        return None
+    return iface.ip, iface.network
 
 
 def _range_bounds(obj: dict[str, Any]) -> tuple[Any, Any] | None:
@@ -247,15 +310,70 @@ def _groups_containing(name: str, index: dict[str, list[str]]) -> set[str]:
 # ---------------------------------------------------------------------------
 
 
+def _analyze_interfaces(query: IPNetwork, interfaces: list[dict[str, Any]]) -> list[InterfaceMatch]:
+    """Live interface addresses (primary, secondary, IPv6) that overlap ``query``.
+
+    Field names beyond ``ip`` / ``secondaryip`` / ``ipv6.ip6-address`` (namely
+    ``ipv6.ip6-extra-addr[].prefix`` for secondary IPv6) are a best guess at the
+    FortiOS ``system/interface`` schema and should be eyeballed against a real
+    FortiGate before this is relied on for IPv6 secondary addresses.
+    """
+    found: list[InterfaceMatch] = []
+    for iface in interfaces:
+        name = str(iface.get("name") or "")
+        if not name:
+            continue
+        vdom = str(iface.get("vdom") or "")
+
+        candidates: list[tuple[str, Any, bool]] = [("primary", iface.get("ip"), False)]
+        for sec in iface.get("secondaryip") or []:
+            if isinstance(sec, dict):
+                candidates.append(("secondary", sec.get("ip"), False))
+
+        ipv6 = iface.get("ipv6")
+        if isinstance(ipv6, dict):
+            candidates.append(("ipv6", ipv6.get("ip6-address"), True))
+            for sec6 in ipv6.get("ip6-extra-addr") or []:
+                if isinstance(sec6, dict):
+                    raw6 = sec6.get("prefix") or sec6.get("ip6-address")
+                    candidates.append(("ipv6-secondary", raw6, True))
+
+        for kind, raw, cidr in candidates:
+            parsed = _interface_address(raw, cidr=cidr)
+            if parsed is None:
+                continue
+            host, net = parsed
+            if net.version != query.version:
+                continue
+            relation = _network_relation(net, query)
+            if relation is None:
+                continue
+            found.append(
+                InterfaceMatch(
+                    name=name,
+                    vdom=vdom,
+                    kind=kind,
+                    ip=f"{host}/{net.prefixlen}",
+                    network=str(net),
+                    relation=relation,
+                )
+            )
+
+    found.sort(key=lambda m: (_RELATION_ORDER.get(m.relation, 9), m.name, m.kind))
+    return found
+
+
 def analyze(
     query: IPNetwork,
     addresses: list[dict[str, Any]],
     groups: list[dict[str, Any]],
     policies: list[dict[str, Any]],
     *,
+    interfaces: list[dict[str, Any]] | None = None,
     vdom: str = "root",
 ) -> UsageReport:
     report = UsageReport(query=str(query), vdom=vdom, family=query.version)
+    report.interfaces = _analyze_interfaces(query, interfaces or [])
 
     group_index = _group_index(groups)
 
