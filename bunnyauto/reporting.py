@@ -128,7 +128,13 @@ class Reporter:
 
     @contextmanager
     def track(self, nr: Any, *, description: str = "") -> Iterator[Any]:
-        """Run a Nornir task under a live per-host progress bar, if interactive.
+        """Run a Nornir task under a live progress display, if interactive.
+
+        One pinned "overall" bar (``X/N`` devices) plus one bar per host
+        currently in flight — bounded by Nornir's ``num_workers``, not the size
+        of the inventory, so it always fits the terminal no matter how large
+        the tag-filtered inventory is. Each host's result prints as a normal
+        line in real, scrollable terminal history the moment it finishes.
 
         Yields something to call ``.run()`` on. Outside an interactive TTY (CI,
         ``--json``) this is a no-op that yields ``nr`` unchanged, so callers can
@@ -142,18 +148,19 @@ class Reporter:
 
         from bunnyauto.progress import build_host_progress
 
-        if description:
-            self._console.print(description, style="dim")
-
+        hosts = list(nr.inventory.hosts)
         progress = Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
             BarColumn(),
+            TextColumn("{task.completed}/{task.total}"),
             TimeElapsedColumn(),
             console=self._console,
         )
         with progress:
-            processor = build_host_progress(progress, list(nr.inventory.hosts))
+            processor = build_host_progress(
+                progress, self._console, len(hosts), description or "running"
+            )
             yield nr.with_processors([processor])
 
     @contextmanager
