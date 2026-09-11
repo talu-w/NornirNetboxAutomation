@@ -151,10 +151,10 @@ class FwSubnetCheck:
             ctx.reporter.info(note)
 
         if not report.present:
-            summary = f"{query} is not in use in any policies nor does it overlap/used by any already existing subnets. Please refer to notes if there are any"
+            summary = f"{query} is not in use in any policies nor does it overlap/used by any already existing subnets."
             if report.permitted_by_catch_all:
                 permitting = sum(1 for m in report.catch_alls if m.policies)
-                summary += f" (but {permitting} catch-all object(s) permit it — see notes)"
+                summary += f" ({permitting} catch-all object(s) permit it — see notes)"
             if report.on_interface:
                 summary += (
                     f" ({len(report.interfaces)} interface address(es) in this range — see notes)"
