@@ -151,7 +151,7 @@ class FwSubnetCheck:
             ctx.reporter.info(note)
 
         if not report.present:
-            summary = f"{query} is not in use in any policies nor does it overlap/used by any already existing subnets."
+            summary = f"{query} is not in use in any policies nor pre-existing IP object(s)."
             if report.permitted_by_catch_all:
                 permitting = sum(1 for m in report.catch_alls if m.policies)
                 summary += f" ({permitting} catch-all object(s) permit it — see notes)"
