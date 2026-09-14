@@ -58,7 +58,11 @@ def parse_ap_database(payload: dict[str, Any] | list[dict[str, Any]]) -> list[Wi
                 serial=_get(row, "Serial #", "Serial Number", "serial"),
                 model=_get(row, "AP Type", "Model", "AP Model"),
                 mac=_get(row, "Wired MAC Address", "Wired MAC", "mac", "MAC Address"),
-                ip=_get(row, "IP Address", "IP", "Switch IP"),
+                # Deliberately does NOT fall back to "Switch IP" — that's the
+                # terminating controller's IP, a different device on a different
+                # network. An AP with no recognizable IP field gets ip="" (nothing
+                # to do downstream), never the wrong device's address.
+                ip=_get(row, "IP Address", "IP", "AP IP Address", "AP IP"),
                 kind="ap",
                 status=_get(row, "Status", "State"),
             )

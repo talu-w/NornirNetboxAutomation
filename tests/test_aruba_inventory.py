@@ -61,6 +61,18 @@ def test_parse_switches():
     assert wlcs[0].kind == "wlc"
 
 
+def test_ap_ip_never_falls_back_to_the_switch_ip():
+    """Regression: an AP's IP must never silently become its controller's IP."""
+    row = {
+        "Name": "hq-idf1-ap09",
+        "AP Type": "515",
+        "Serial #": "CN0099",
+        "Switch IP": "10.99.0.1",  # a different device, a different subnet
+    }
+    ap = parse_ap_database([row])[0]
+    assert ap.ip == ""  # not "10.99.0.1"
+
+
 def test_parse_tolerates_list_and_empty():
     assert parse_ap_database([{"Name": "x", "AP Type": "515"}])[0].name == "x"
     assert parse_ap_database({}) == []
