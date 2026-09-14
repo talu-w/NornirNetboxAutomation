@@ -35,9 +35,8 @@ class _Endpoint:
         return list(self._items)
 
     def get(self, **kw):
-        slug = kw.get("slug")
         for item in self._items:
-            if getattr(item, "slug", None) == slug:
+            if all(getattr(item, k, None) == v for k, v in kw.items()):
                 return item
         return None
 
@@ -49,7 +48,7 @@ class _Endpoint:
 
 
 class _NB:
-    def __init__(self, *, roles, sites, types, devices, tags):
+    def __init__(self, *, roles, sites, types, devices, tags, prefixes=(), ip_addresses=()):
         self.version = "4.1"
         self.dcim = SimpleNamespace(
             device_roles=_Endpoint(roles),
@@ -58,9 +57,13 @@ class _NB:
             devices=_Endpoint(devices),
         )
         self.extras = SimpleNamespace(tags=_Endpoint(tags))
+        self.ipam = SimpleNamespace(
+            prefixes=_Endpoint(prefixes),
+            ip_addresses=_Endpoint(ip_addresses),
+        )
 
 
-def _nb(*, devices=(), tags=("wireless",), with_role=True):
+def _nb(*, devices=(), tags=("wireless",), with_role=True, prefixes=(), ip_addresses=()):
     return _NB(
         roles=[_Rec(id=7, slug="wireless", name="Wireless")] if with_role else [],
         sites=[
@@ -73,6 +76,8 @@ def _nb(*, devices=(), tags=("wireless",), with_role=True):
         ],
         devices=list(devices),
         tags=[_Rec(id=3, slug=s, name=s) for s in tags],
+        prefixes=prefixes,
+        ip_addresses=ip_addresses,
     )
 
 
@@ -295,6 +300,108 @@ def test_missing_tag_is_created_on_apply(monkeypatch):
     nb = _nb(tags=())
     TOOL.run(_Ctx(nb, apply=True), _args())
     assert nb.extras.tags.created == [{"name": "wireless", "slug": "wireless"}]
+
+
+# --- IP address creation --------------------------------------------
+
+
+def test_ip_created_when_prefix_exists(monkeypatch):
+    _fake_client(monkeypatch, aps=[AP])
+    nb = _nb(prefixes=[_Rec(id=10, prefix="10.1.1.0/24")])
+
+    plan = TOOL.run(_Ctx(nb), _args())
+    assert any(c == "hq-idf1-ap01: would create IP address 10.1.1.1/24" for c in plan.changes)
+
+    result = TOOL.run(_Ctx(nb, apply=True), _args())
+    assert result.status is Status.CHANGED
+    assert "created 1 IP address" in result.summary
+    (body,) = nb.ipam.ip_addresses.created
+    assert body == {"address": "10.1.1.1/24", "status": "active"}
+    assert result.data["hq-idf1-ap01"]["ip_status"] == "created"
+
+
+def test_ip_prefix_vrf_is_carried_onto_the_created_ip(monkeypatch):
+    _fake_client(monkeypatch, aps=[AP])
+    nb = _nb(prefixes=[_Rec(id=10, prefix="10.1.1.0/24", vrf=_Rec(id=4))])
+    TOOL.run(_Ctx(nb, apply=True), _args())
+    (body,) = nb.ipam.ip_addresses.created
+    assert body == {"address": "10.1.1.1/24", "status": "active", "vrf": 4}
+
+
+def test_narrowest_prefix_wins(monkeypatch):
+    _fake_client(monkeypatch, aps=[AP])
+    nb = _nb(
+        prefixes=[
+            _Rec(id=1, prefix="10.0.0.0/8"),
+            _Rec(id=2, prefix="10.1.1.0/24"),
+        ]
+    )
+    TOOL.run(_Ctx(nb, apply=True), _args())
+    (body,) = nb.ipam.ip_addresses.created
+    assert body["address"] == "10.1.1.1/24"
+
+
+def test_ip_note_when_no_prefix_matches(monkeypatch):
+    _fake_client(monkeypatch, aps=[AP])
+    nb = _nb()  # no prefixes configured
+
+    plan = TOOL.run(_Ctx(nb), _args())
+    assert any(
+        "IP address could not be added/assigned at this time due to lack of an "
+        "established prefix/IP range within NetBox." in c
+        for c in plan.changes
+    )
+
+    result = TOOL.run(_Ctx(nb, apply=True), _args())
+    assert result.status is Status.CHANGED  # the device itself still gets created
+    assert nb.dcim.devices.created  # device created
+    assert nb.ipam.ip_addresses.created == []  # but no IP
+    assert result.data["hq-idf1-ap01"]["ip_note"]
+
+
+def test_unparseable_ip_gets_a_note_not_a_crash(monkeypatch):
+    ap = {**AP, "IP Address": "not-an-ip"}
+    _fake_client(monkeypatch, aps=[ap])
+    nb = _nb(prefixes=[_Rec(id=10, prefix="10.1.1.0/24")])
+    result = TOOL.run(_Ctx(nb), _args())
+    assert result.status is Status.DRIFT
+    assert "unparseable" in result.data["hq-idf1-ap01"]["ip_note"]
+
+
+def test_ip_already_exists_is_not_recreated(monkeypatch):
+    _fake_client(monkeypatch, aps=[AP])
+    nb = _nb(
+        prefixes=[_Rec(id=10, prefix="10.1.1.0/24")],
+        ip_addresses=[_Rec(id=99, address="10.1.1.1/24")],
+    )
+    result = TOOL.run(_Ctx(nb, apply=True), _args())
+    assert result.status is Status.CHANGED
+    assert nb.ipam.ip_addresses.created == []
+    assert result.data["hq-idf1-ap01"]["ip_status"] == "exists"
+
+
+def test_ip_create_failure_is_partial_but_device_still_created(monkeypatch):
+    _fake_client(monkeypatch, aps=[AP])
+    nb = _nb(prefixes=[_Rec(id=10, prefix="10.1.1.0/24")])
+
+    def boom(body):
+        raise RuntimeError("duplicate address")
+
+    nb.ipam.ip_addresses.create = boom
+    result = TOOL.run(_Ctx(nb, apply=True), _args())
+    assert result.status is Status.PARTIAL
+    assert nb.dcim.devices.created  # device creation still succeeded
+    assert "duplicate address" in result.data["hq-idf1-ap01"]["ip_error"]
+
+
+def test_existing_device_ip_is_never_touched(monkeypatch):
+    """The IP step only runs for newly created devices, never matched ones."""
+    wlc_with_ip = {**WLC, "IP Address": "10.1.1.1"}
+    _fake_client(monkeypatch, switches=[wlc_with_ip])
+    existing = _Device(id=1, name="hq-wlc01", serial="CX0009", tags=[])
+    nb = _nb(devices=[existing], prefixes=[_Rec(id=10, prefix="10.1.1.0/24")])
+    TOOL.run(_Ctx(nb, apply=True), _args())
+    assert nb.ipam.ip_addresses.created == []
 
 
 def test_tool_is_registered():

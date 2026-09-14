@@ -8,12 +8,19 @@ then name, and:
   from the Aruba model string, site derived from the hostname prefix — each
   stamped with the ``wireless`` tag;
 * adds the ``wireless`` tag to Conductor devices that already exist in NetBox but
-  are not yet tagged.
+  are not yet tagged;
+* for each **newly created** device that reported an IP, creates that IP in
+  NetBox IPAM (``address/mask``, the mask taken from the most specific NetBox
+  Prefix containing it) — provided such a Prefix exists. No interface is
+  created, so the IP is not attached to the device or set as its primary IP,
+  just recorded. If no Prefix contains the IP, the device is still created;
+  only the IP is skipped, with a note. Existing (already-matched) devices never
+  have their IP touched.
 
-It never updates or deletes an existing device, and never creates a device type
-or a site. A device whose model has no matching NetBox device type, or whose
-hostname maps to no site (and no ``--default-site`` was given), is reported and
-skipped.
+It never updates or deletes an existing device, and never creates a device
+type, a site, or a NetBox Prefix/IP Range. A device whose model has no matching
+NetBox device type, or whose hostname maps to no site (and no ``--default-site``
+was given), is reported and skipped.
 
 Plans by default; ``--apply`` writes. Auth is the shared device login
 (``NORNIR_USERNAME`` / ``NORNIR_PASSWORD``); TLS verification is always on unless
@@ -23,6 +30,7 @@ Plans by default; ``--apply`` writes. Auth is the shared device login
 from __future__ import annotations
 
 import argparse
+import ipaddress
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -31,6 +39,7 @@ from bunnyauto.aruba.inventory import WirelessDevice, parse_ap_database, parse_s
 from bunnyauto.aruba.sitematch import Site, match_site
 from bunnyauto.common import env_flag, normalize_tags
 from bunnyauto.errors import ArubaError, ToolError
+from bunnyauto.ipam_match import Prefix, find_prefix
 from bunnyauto.tools.base import Status, ToolResult
 
 if TYPE_CHECKING:
@@ -47,6 +56,9 @@ class _Outcome:
     site: str = ""
     device_type: str = ""
     reason: str = ""
+    ip_cidr: str = ""  # "10.1.1.11/24" — set only when a containing Prefix was found
+    ip_vrf_id: int | None = None
+    ip_note: str = ""  # why the IP was not created, if it wasn't
 
 
 @dataclass(slots=True)
@@ -164,9 +176,11 @@ class WirelessSync:
             f"({n_wlc} WLC, {len(wireless) - n_wlc} AP)"
         )
 
+        prefixes = _load_prefixes(nb) if any(d.ip for d in wireless) else []
+
         role_key = _role_key(nb)
         outcomes = [
-            self._classify(d, by_serial, by_name, types_by_key, sites, default_site)
+            self._classify(d, by_serial, by_name, types_by_key, sites, default_site, prefixes)
             for d in wireless
         ]
 
@@ -183,9 +197,10 @@ class WirelessSync:
 
         # -- act on each device ---------------------------------------
         data: dict[str, Any] = {}
-        created = tagged = create_planned = tag_planned = 0
+        created = tagged = create_planned = tag_planned = ip_created = 0
         failures: list[str] = []
         blocked: list[str] = []
+        ip_failures: list[str] = []
 
         for out in outcomes:
             d = out.device
@@ -196,6 +211,9 @@ class WirelessSync:
                 "site": out.site,
                 "device_type": out.device_type,
                 "reason": out.reason,
+                "ip": d.ip,
+                "ip_cidr": out.ip_cidr,
+                "ip_note": out.ip_note,
             }
             if out.action == "in-sync":
                 ctx.reporter.info(f"{d.name}: already in NetBox and tagged {_TAG_SLUG!r}")
@@ -222,6 +240,12 @@ class WirelessSync:
                     f"{d.name}: {verb} {d.kind.upper()} in site {out.site!r} "
                     f"(type {out.device_type!r}) tagged {_TAG_SLUG!r}"
                 )
+                if out.ip_cidr:
+                    changes.append(f"{d.name}: {verb} IP address {out.ip_cidr}")
+                elif out.ip_note:
+                    changes.append(f"{d.name}: {out.ip_note}")
+                    ctx.reporter.warn(f"{d.name}: {out.ip_note}")
+
                 if apply:
                     err = _create_device(
                         nb,
@@ -236,6 +260,17 @@ class WirelessSync:
                     if err is None:
                         created += 1
                         ctx.reporter.success(f"{d.name}: created in site {out.site!r}")
+                        if out.ip_cidr:
+                            ip_status = _create_ip(nb, address=out.ip_cidr, vrf_id=out.ip_vrf_id)
+                            if ip_status in ("created", "exists"):
+                                if ip_status == "created":
+                                    ip_created += 1
+                                data[d.name]["ip_status"] = ip_status
+                                ctx.reporter.success(f"{d.name}: IP {out.ip_cidr} {ip_status}")
+                            else:
+                                ip_failures.append(d.name)
+                                data[d.name]["ip_error"] = ip_status
+                                ctx.reporter.error(f"{d.name}: IP create failed — {ip_status}")
                     else:
                         failures.append(d.name)
                         data[d.name]["error"] = err
@@ -253,6 +288,8 @@ class WirelessSync:
             tag_planned=tag_planned,
             failures=failures,
             blocked=blocked,
+            ip_created=ip_created,
+            ip_failures=ip_failures,
             total=len(wireless),
         )
 
@@ -266,6 +303,7 @@ class WirelessSync:
         types_by_key: dict[str, Any],
         sites: list[Site],
         default_site: Site | None,
+        prefixes: list[Prefix],
     ) -> _Outcome:
         match = None
         if d.serial and d.serial.casefold() in by_serial:
@@ -297,12 +335,49 @@ class WirelessSync:
                 device_type=str(getattr(device_type, "model", "")),
                 reason=f"hostname {d.name!r} matched no NetBox site (pass --default-site)",
             )
+
+        ip_cidr = ""
+        ip_vrf_id: int | None = None
+        ip_note = ""
+        if d.ip:
+            try:
+                addr = ipaddress.ip_address(d.ip)
+            except ValueError:
+                ip_note = f"the Conductor reported an unparseable IP address {d.ip!r}"
+            else:
+                prefix = find_prefix(addr, prefixes)
+                if prefix is None:
+                    ip_note = (
+                        "IP address could not be added/assigned at this time due to lack "
+                        "of an established prefix/IP range within NetBox."
+                    )
+                else:
+                    ip_cidr = f"{addr}/{prefix.network.prefixlen}"
+                    ip_vrf_id = prefix.vrf_id
+
         return _Outcome(
             d,
             "create",
             site=site.slug,
             device_type=str(getattr(device_type, "model", "")),
+            ip_cidr=ip_cidr,
+            ip_vrf_id=ip_vrf_id,
+            ip_note=ip_note,
         )
+
+
+def _load_prefixes(nb: Any) -> list[Prefix]:
+    """All NetBox Prefixes, parsed to CIDR networks. Malformed ones are skipped."""
+    prefixes: list[Prefix] = []
+    for p in nb.ipam.prefixes.all():
+        try:
+            network = ipaddress.ip_network(str(p.prefix), strict=False)
+        except ValueError:
+            continue
+        vrf = getattr(p, "vrf", None)
+        vrf_id = int(vrf.id) if vrf is not None else None
+        prefixes.append(Prefix(id=int(p.id), network=network, vrf_id=vrf_id))
+    return prefixes
 
 
 def _role_key(nb: Any) -> str:
@@ -343,6 +418,20 @@ def _create_device(
     return None
 
 
+def _create_ip(nb: Any, *, address: str, vrf_id: int | None) -> str:
+    """Create one NetBox IP address. Returns ``"created"``, ``"exists"``, or the error text."""
+    try:
+        if nb.ipam.ip_addresses.get(address=address) is not None:
+            return "exists"
+        body: dict[str, Any] = {"address": address, "status": "active"}
+        if vrf_id is not None:
+            body["vrf"] = vrf_id
+        nb.ipam.ip_addresses.create(body)
+    except Exception as exc:  # pynetbox RequestError etc.
+        return str(exc)
+    return "created"
+
+
 def _add_tag(device: Any) -> bool | str:
     """Add the ``wireless`` tag to an existing device. ``True`` on success, else error text."""
     try:
@@ -364,10 +453,12 @@ def _result(
     tag_planned: int,
     failures: list[str],
     blocked: list[str],
+    ip_created: int,
+    ip_failures: list[str],
     total: int,
 ) -> ToolResult:
     progressed = bool(created or tagged or create_planned or tag_planned)
-    if failures or blocked:
+    if failures or ip_failures or blocked:
         status = Status.PARTIAL if progressed else Status.ERROR
     elif apply and (created or tagged):
         status = Status.CHANGED
@@ -378,6 +469,8 @@ def _result(
 
     if apply:
         summary = f"created {created} device(s), tagged {tagged} existing device(s)"
+        if ip_created:
+            summary += f", created {ip_created} IP address(es)"
     elif create_planned or tag_planned:
         summary = (
             f"{create_planned} device(s) missing from NetBox, "
@@ -389,6 +482,8 @@ def _result(
         summary += f" ({len(blocked)} skipped)"
     if failures:
         summary += f" ({len(failures)} failed)"
+    if ip_failures:
+        summary += f" ({len(ip_failures)} IP failed)"
 
     return ToolResult(status=status, summary=summary, changes=changes, data=data)
 
