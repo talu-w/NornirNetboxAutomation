@@ -11,16 +11,25 @@ then name, and:
   are not yet tagged;
 * for each **newly created** device that reported an IP, creates that IP in
   NetBox IPAM (``address/mask``, the mask taken from the most specific NetBox
-  Prefix containing it) — provided such a Prefix exists. No interface is
-  created, so the IP is not attached to the device or set as its primary IP,
-  just recorded. If no Prefix contains the IP, the device is still created;
-  only the IP is skipped, with a note. Existing (already-matched) devices never
-  have their IP touched.
+  Prefix containing it) — provided such a Prefix exists — attaches it to an
+  interface (``--ip-interface``, default ``Ethernet0``; created if the device's
+  type didn't already carry it via an interface template), and sets it as the
+  device's primary IPv4. If no Prefix contains the IP, the device is still
+  created; only the IP is skipped, with a note. Existing (already-matched)
+  devices never have their IP touched.
 
 It never updates or deletes an existing device, and never creates a device
-type, a site, or a NetBox Prefix/IP Range. A device whose model has no matching
-NetBox device type, or whose hostname maps to no site (and no ``--default-site``
-was given), is reported and skipped.
+type or a site (interfaces are the one exception: it will create
+``--ip-interface`` on a device it just created, purely as a place to hang the
+IP — nothing else about the interface is populated). It never creates a
+NetBox Prefix/IP Range. A device whose model has no matching NetBox device
+type, or whose hostname maps to no site (and no ``--default-site`` was given),
+is reported and skipped.
+
+**Known limitation**: which physical port actually carries the AP's IP is not
+queried from the Conductor (that would need a per-device interface/association
+call whose command and JSON shape aren't yet confirmed against real hardware);
+``--ip-interface`` is a single fixed guess applied to every device.
 
 Plans by default; ``--apply`` writes. Auth is the shared device login
 (``NORNIR_USERNAME`` / ``NORNIR_PASSWORD``); TLS verification is always on unless
@@ -102,6 +111,13 @@ class WirelessSync:
             "--status",
             default="active",
             help="NetBox status for newly created devices (default: active)",
+        )
+        parser.add_argument(
+            "--ip-interface",
+            dest="ip_interface",
+            default="Ethernet0",
+            help="interface to attach a newly created device's IP to, creating it if "
+            "the device type didn't (default: Ethernet0)",
         )
 
     def run(self, ctx: Context, args: argparse.Namespace) -> ToolResult:
@@ -241,13 +257,16 @@ class WirelessSync:
                     f"(type {out.device_type!r}) tagged {_TAG_SLUG!r}"
                 )
                 if out.ip_cidr:
-                    changes.append(f"{d.name}: {verb} IP address {out.ip_cidr}")
+                    changes.append(
+                        f"{d.name}: {verb} IP address {out.ip_cidr}, attach to "
+                        f"{args.ip_interface!r} and set as primary IPv4"
+                    )
                 elif out.ip_note:
                     changes.append(f"{d.name}: {out.ip_note}")
                     ctx.reporter.warn(f"{d.name}: {out.ip_note}")
 
                 if apply:
-                    err = _create_device(
+                    device, err = _create_device(
                         nb,
                         name=d.name,
                         device_type_id=int(types_by_key[out.device_type.casefold()].id),
@@ -261,12 +280,21 @@ class WirelessSync:
                         created += 1
                         ctx.reporter.success(f"{d.name}: created in site {out.site!r}")
                         if out.ip_cidr:
-                            ip_status = _create_ip(nb, address=out.ip_cidr, vrf_id=out.ip_vrf_id)
+                            ip_status = _assign_ip(
+                                nb,
+                                device=device,
+                                interface_name=args.ip_interface,
+                                address=out.ip_cidr,
+                                vrf_id=out.ip_vrf_id,
+                            )
                             if ip_status in ("created", "exists"):
                                 if ip_status == "created":
                                     ip_created += 1
                                 data[d.name]["ip_status"] = ip_status
-                                ctx.reporter.success(f"{d.name}: IP {out.ip_cidr} {ip_status}")
+                                ctx.reporter.success(
+                                    f"{d.name}: IP {out.ip_cidr} {ip_status}, primary IPv4 "
+                                    f"on {args.ip_interface!r}"
+                                )
                             else:
                                 ip_failures.append(d.name)
                                 data[d.name]["ip_error"] = ip_status
@@ -399,8 +427,8 @@ def _create_device(
     site_id: int,
     serial: str,
     status: str,
-) -> str | None:
-    """Create one NetBox device. Returns ``None`` on success, else the error text."""
+) -> tuple[Any, str | None]:
+    """Create one NetBox device. Returns ``(device, None)``, or ``(None, error text)``."""
     body: dict[str, Any] = {
         "name": name,
         "device_type": device_type_id,
@@ -412,24 +440,59 @@ def _create_device(
     if serial:
         body["serial"] = serial
     try:
-        nb.dcim.devices.create(body)
+        device = nb.dcim.devices.create(body)
     except Exception as exc:  # pynetbox RequestError etc.
-        return str(exc)
-    return None
+        return None, str(exc)
+    return device, None
 
 
-def _create_ip(nb: Any, *, address: str, vrf_id: int | None) -> str:
-    """Create one NetBox IP address. Returns ``"created"``, ``"exists"``, or the error text."""
+def _assign_ip(
+    nb: Any,
+    *,
+    device: Any,
+    interface_name: str,
+    address: str,
+    vrf_id: int | None,
+) -> str:
+    """Create/attach ``address`` to ``interface_name`` on ``device`` and make it primary.
+
+    Creates the interface if the device doesn't already have one by that name.
+    Returns ``"created"`` or ``"exists"`` (the IP address), or the error text.
+    """
     try:
-        if nb.ipam.ip_addresses.get(address=address) is not None:
-            return "exists"
-        body: dict[str, Any] = {"address": address, "status": "active"}
-        if vrf_id is not None:
-            body["vrf"] = vrf_id
-        nb.ipam.ip_addresses.create(body)
+        interface = nb.dcim.interfaces.get(device_id=int(device.id), name=interface_name)
+        if interface is None:
+            interface = nb.dcim.interfaces.create(
+                {"device": int(device.id), "name": interface_name, "type": "other"}
+            )
+
+        existing = nb.ipam.ip_addresses.get(address=address)
+        if existing is None:
+            body: dict[str, Any] = {
+                "address": address,
+                "status": "active",
+                "assigned_object_type": "dcim.interface",
+                "assigned_object_id": int(interface.id),
+            }
+            if vrf_id is not None:
+                body["vrf"] = vrf_id
+            ip_obj = nb.ipam.ip_addresses.create(body)
+            result = "created"
+        else:
+            if getattr(existing, "assigned_object_id", None) != int(interface.id):
+                existing.update(
+                    {
+                        "assigned_object_type": "dcim.interface",
+                        "assigned_object_id": int(interface.id),
+                    }
+                )
+            ip_obj = existing
+            result = "exists"
+
+        device.update({"primary_ip4": int(ip_obj.id)})
     except Exception as exc:  # pynetbox RequestError etc.
         return str(exc)
-    return "created"
+    return result
 
 
 def _add_tag(device: Any) -> bool | str:

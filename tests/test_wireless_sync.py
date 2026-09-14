@@ -17,7 +17,11 @@ from bunnyauto.tools.wireless_sync import TOOL
 
 
 class _Rec(SimpleNamespace):
-    pass
+    def update(self, body):
+        self.updated = body
+        for key, value in body.items():
+            setattr(self, key, value)
+        return True
 
 
 class _Device(SimpleNamespace):
@@ -48,13 +52,25 @@ class _Endpoint:
 
 
 class _NB:
-    def __init__(self, *, roles, sites, types, devices, tags, prefixes=(), ip_addresses=()):
+    def __init__(
+        self,
+        *,
+        roles,
+        sites,
+        types,
+        devices,
+        tags,
+        prefixes=(),
+        ip_addresses=(),
+        interfaces=(),
+    ):
         self.version = "4.1"
         self.dcim = SimpleNamespace(
             device_roles=_Endpoint(roles),
             sites=_Endpoint(sites),
             device_types=_Endpoint(types),
             devices=_Endpoint(devices),
+            interfaces=_Endpoint(interfaces),
         )
         self.extras = SimpleNamespace(tags=_Endpoint(tags))
         self.ipam = SimpleNamespace(
@@ -63,7 +79,15 @@ class _NB:
         )
 
 
-def _nb(*, devices=(), tags=("wireless",), with_role=True, prefixes=(), ip_addresses=()):
+def _nb(
+    *,
+    devices=(),
+    tags=("wireless",),
+    with_role=True,
+    prefixes=(),
+    ip_addresses=(),
+    interfaces=(),
+):
     return _NB(
         roles=[_Rec(id=7, slug="wireless", name="Wireless")] if with_role else [],
         sites=[
@@ -78,6 +102,7 @@ def _nb(*, devices=(), tags=("wireless",), with_role=True, prefixes=(), ip_addre
         tags=[_Rec(id=3, slug=s, name=s) for s in tags],
         prefixes=prefixes,
         ip_addresses=ip_addresses,
+        interfaces=interfaces,
     )
 
 
@@ -129,6 +154,7 @@ def _args(**over) -> argparse.Namespace:
         only="all",
         device=None,
         status="active",
+        ip_interface="Ethernet0",
     )
     base.update(over)
     return argparse.Namespace(**base)
@@ -310,14 +336,53 @@ def test_ip_created_when_prefix_exists(monkeypatch):
     nb = _nb(prefixes=[_Rec(id=10, prefix="10.1.1.0/24")])
 
     plan = TOOL.run(_Ctx(nb), _args())
-    assert any(c == "hq-idf1-ap01: would create IP address 10.1.1.1/24" for c in plan.changes)
+    assert any(
+        c == "hq-idf1-ap01: would create IP address 10.1.1.1/24, "
+        "attach to 'Ethernet0' and set as primary IPv4"
+        for c in plan.changes
+    )
 
     result = TOOL.run(_Ctx(nb, apply=True), _args())
     assert result.status is Status.CHANGED
     assert "created 1 IP address" in result.summary
+
+    (iface,) = nb.dcim.interfaces.created
+    assert iface == {"device": 999, "name": "Ethernet0", "type": "other"}
+
     (body,) = nb.ipam.ip_addresses.created
-    assert body == {"address": "10.1.1.1/24", "status": "active"}
+    assert body["address"] == "10.1.1.1/24"
+    assert body["status"] == "active"
+    assert body["assigned_object_type"] == "dcim.interface"
+    assert body["assigned_object_id"] == 999  # the interface just created
+
     assert result.data["hq-idf1-ap01"]["ip_status"] == "created"
+
+
+def test_ip_set_as_device_primary_ipv4(monkeypatch):
+    _fake_client(monkeypatch, aps=[AP])
+    nb = _nb(prefixes=[_Rec(id=10, prefix="10.1.1.0/24")])
+    TOOL.run(_Ctx(nb, apply=True), _args())
+    (device,) = nb.dcim.devices._items
+    assert device.updated == {"primary_ip4": 999}
+
+
+def test_ip_reuses_an_existing_interface_instead_of_recreating(monkeypatch):
+    """If the device type's interface template already made Ethernet0, reuse it."""
+    _fake_client(monkeypatch, aps=[AP])
+    nb = _nb(prefixes=[_Rec(id=10, prefix="10.1.1.0/24")])
+    nb.dcim.interfaces._items.append(_Rec(id=42, device_id=999, name="Ethernet0"))
+    TOOL.run(_Ctx(nb, apply=True), _args())
+    assert nb.dcim.interfaces.created == []  # not recreated
+    (body,) = nb.ipam.ip_addresses.created
+    assert body["assigned_object_id"] == 42
+
+
+def test_custom_ip_interface_flag(monkeypatch):
+    _fake_client(monkeypatch, aps=[AP])
+    nb = _nb(prefixes=[_Rec(id=10, prefix="10.1.1.0/24")])
+    TOOL.run(_Ctx(nb, apply=True), _args(ip_interface="Ethernet1"))
+    (iface,) = nb.dcim.interfaces.created
+    assert iface["name"] == "Ethernet1"
 
 
 def test_ip_prefix_vrf_is_carried_onto_the_created_ip(monkeypatch):
@@ -325,7 +390,7 @@ def test_ip_prefix_vrf_is_carried_onto_the_created_ip(monkeypatch):
     nb = _nb(prefixes=[_Rec(id=10, prefix="10.1.1.0/24", vrf=_Rec(id=4))])
     TOOL.run(_Ctx(nb, apply=True), _args())
     (body,) = nb.ipam.ip_addresses.created
-    assert body == {"address": "10.1.1.1/24", "status": "active", "vrf": 4}
+    assert body["vrf"] == 4
 
 
 def test_narrowest_prefix_wins(monkeypatch):
@@ -370,14 +435,33 @@ def test_unparseable_ip_gets_a_note_not_a_crash(monkeypatch):
 
 def test_ip_already_exists_is_not_recreated(monkeypatch):
     _fake_client(monkeypatch, aps=[AP])
+    existing_ip = _Rec(id=99, address="10.1.1.1/24")
     nb = _nb(
         prefixes=[_Rec(id=10, prefix="10.1.1.0/24")],
-        ip_addresses=[_Rec(id=99, address="10.1.1.1/24")],
+        ip_addresses=[existing_ip],
     )
     result = TOOL.run(_Ctx(nb, apply=True), _args())
     assert result.status is Status.CHANGED
     assert nb.ipam.ip_addresses.created == []
     assert result.data["hq-idf1-ap01"]["ip_status"] == "exists"
+    # unattached before, so it gets (re)assigned to the newly created interface
+    assert existing_ip.assigned_object_id == 999
+    (device,) = nb.dcim.devices._items
+    assert device.primary_ip4 == 99
+
+
+def test_ip_already_correctly_assigned_is_left_alone(monkeypatch):
+    _fake_client(monkeypatch, aps=[AP])
+    existing_ip = _Rec(
+        id=99, address="10.1.1.1/24", assigned_object_type="dcim.interface", assigned_object_id=42
+    )
+    nb = _nb(
+        prefixes=[_Rec(id=10, prefix="10.1.1.0/24")],
+        ip_addresses=[existing_ip],
+        interfaces=[_Rec(id=42, device_id=999, name="Ethernet0")],
+    )
+    TOOL.run(_Ctx(nb, apply=True), _args())
+    assert not hasattr(existing_ip, "updated")  # already correct — no write issued
 
 
 def test_ip_create_failure_is_partial_but_device_still_created(monkeypatch):
