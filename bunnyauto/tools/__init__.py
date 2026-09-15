@@ -10,6 +10,7 @@ from __future__ import annotations
 from bunnyauto.tools import (
     backup,
     create_interfaces,
+    device_type_import,
     fw_subnet_check,
     health,
     send_command,
@@ -28,6 +29,7 @@ REGISTRY: dict[str, Tool] = {
         health.TOOL,
         fw_subnet_check.TOOL,
         wireless_sync.TOOL,
+        device_type_import.TOOL,
     )
 }
 
