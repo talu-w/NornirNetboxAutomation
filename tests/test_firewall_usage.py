@@ -65,15 +65,36 @@ def test_subnet_field_accepts_mask_or_slash(obj):
 # --- relation classification ------------------------------------------
 
 
-def test_supernet_relation_and_direct_policy():
+def test_broad_supernet_is_not_a_match_but_is_noted():
+    """Owner feedback 2026-09-17: a /16 swallowing a /24 query must not read as a fail."""
     pol = _policy(12, "hq-out", dstaddr=["net_hq"])
     report = analyze(parse_query("10.1.2.0/24"), [NET_HQ], [], [pol])
-    match = report.matches[0]
+    assert report.present is False
+    assert report.matches == []
+    match = report.broad_matches[0]
     assert match.relation == "supernet"
+    assert match.name == "net_hq"
     assert match.policies[0].via is None
     assert match.policies[0].field == "dstaddr"
     assert match.policies[0].policyid == 12
-    assert report.attached is True
+    assert report.attached is False  # attached only looks at real matches
+    assert report.permitted_by_broad_match is True
+
+
+def test_supernet_at_the_threshold_prefixlen_still_counts():
+    """/24 is the floor, not excluded — only *wider* than /24 is treated as broad."""
+    report = analyze(parse_query("10.1.2.8/30"), [SUB_2], [], [])
+    assert report.present is True
+    assert report.broad_matches == []
+    assert report.matches[0].relation == "supernet"
+
+
+def test_exact_match_on_a_broad_object_still_counts():
+    """The broad-supernet filter only applies to the 'supernet' relation, not 'exact'."""
+    report = analyze(parse_query("10.1.0.0/16"), [NET_HQ], [], [])
+    assert report.present is True
+    assert report.broad_matches == []
+    assert report.matches[0].relation == "exact"
 
 
 def test_subnet_relation():
@@ -124,11 +145,11 @@ def test_match_all_wrong_family_is_dropped_entirely():
 
 
 def test_match_all_alongside_a_real_match_still_drifts():
-    pol = _policy(3, "p", dstaddr=["net_hq"])
-    report = analyze(parse_query("10.1.2.0/24"), [ALL_V4, NET_HQ], [], [pol])
+    pol = _policy(3, "p", dstaddr=["vlan2"])
+    report = analyze(parse_query("10.1.2.0/24"), [ALL_V4, SUB_2], [], [pol])
     assert report.present is True
     assert report.attached is True
-    assert [m.name for m in report.matches] == ["net_hq"]
+    assert [m.name for m in report.matches] == ["vlan2"]
     assert [m.name for m in report.catch_alls] == ["all"]
 
 
@@ -282,10 +303,13 @@ def test_report_as_dict_is_json_serialisable():
     payload = report.as_dict()
     json.dumps(payload)  # must not raise
     assert payload["query"] == "10.1.2.0/24"
-    assert payload["in_use"] is True
-    assert payload["policy_count"] == 1
-    # exact match (vlan2) sorts before the supernet (net_hq)
-    assert [m["relation"] for m in payload["matches"]] == ["exact", "supernet"]
+    # net_hq (/16) is a broad supernet -> not a real match, so its policy hit doesn't
+    # count toward in_use/policy_count; sub_2 (/24, exact) is the only real match.
+    assert payload["in_use"] is False
+    assert payload["policy_count"] == 0
+    assert [m["relation"] for m in payload["matches"]] == ["exact"]
+    assert payload["permitted_by_broad_match"] is True
+    assert [m["relation"] for m in payload["broad_matches"]] == ["supernet"]
 
 
 def test_parse_query_bare_host_is_a_single_address():

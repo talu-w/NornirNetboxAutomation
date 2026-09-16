@@ -159,6 +159,46 @@ def test_catch_all_object_does_not_flip_the_exit_code(monkeypatch):
     assert "catch-all" in result.summary
 
 
+def test_broad_supernet_does_not_flip_the_exit_code(monkeypatch):
+    """Owner feedback 2026-09-17: RFC1918 supernets must not read as a fail."""
+    monkeypatch.setenv("FW_TOKEN", "t")
+    rfc1918 = {"name": "rfc1918_all", "type": "ipmask", "subnet": "10.0.0.0 255.0.0.0"}
+    policies = [{"policyid": 5, "name": "deny_private_wan", "dstaddr": [{"name": "rfc1918_all"}]}]
+    _fake_client(monkeypatch, addresses=[rfc1918], policies=policies)
+    result = TOOL.run(_Ctx(_environment()), _args(subnet="10.20.30.0/24"))
+    assert result.status is Status.OK
+    assert result.exit_code == 0
+    assert result.data["present"] is False
+    assert result.data["in_use"] is False
+    assert result.data["permitted_by_broad_match"] is True
+    assert result.data["broad_matches"][0]["name"] == "rfc1918_all"
+    assert "broad supernet" in result.summary
+
+
+def test_broad_supernet_and_notes_block_are_clean_and_indented(monkeypatch):
+    """The redesigned Notes block: one grouped, indented section per category."""
+    monkeypatch.setenv("FW_TOKEN", "t")
+    addresses = [
+        {"name": "rfc1918_all", "type": "ipmask", "subnet": "10.0.0.0 255.0.0.0"},
+        {"name": "all", "type": "ipmask", "subnet": "0.0.0.0 0.0.0.0"},
+    ]
+    policies = [
+        {"policyid": 5, "name": "deny_private_wan", "dstaddr": [{"name": "rfc1918_all"}]},
+        {"policyid": 12, "name": "allow_out", "srcaddr": [{"name": "all"}]},
+    ]
+    interfaces = [{"name": "port10", "vdom": "root", "ip": "10.20.30.1 255.255.255.0"}]
+    _fake_client(monkeypatch, addresses=addresses, policies=policies, interfaces=interfaces)
+    result = TOOL.run(_Ctx(_environment()), _args(subnet="10.20.30.0/24"))
+    assert result.status is Status.OK
+    assert result.data["permitted_by_catch_all"] is True
+    assert result.data["permitted_by_broad_match"] is True
+    assert result.data["on_interface"] is True
+    # all three categories, and the summary points at the block rather than dumping it
+    assert "catch-all object" in result.summary
+    assert "broad supernet object" in result.summary
+    assert "interface address" in result.summary
+
+
 def test_interface_address_is_a_note_not_a_match(monkeypatch):
     monkeypatch.setenv("FW_TOKEN", "t")
     interfaces = [{"name": "port10", "vdom": "root", "ip": "192.168.32.1 255.255.255.0"}]
@@ -211,6 +251,63 @@ def test_firewall_error_propagates(monkeypatch):
     _fake_client(monkeypatch, boom=FirewallError("could not reach the firewall"))
     with pytest.raises(FirewallError, match="could not reach"):
         TOOL.run(_Ctx(_environment()), _args())
+
+
+# --- the Notes block (formatting) -----------------------------------
+
+
+def test_notes_block_is_none_when_nothing_to_show(monkeypatch):
+    monkeypatch.setenv("FW_TOKEN", "t")
+    _fake_client(monkeypatch, addresses=[VLAN2])
+    from bunnyauto.firewall.usage import analyze, parse_query
+    from bunnyauto.tools.fw_subnet_check import _build_notes_block, _notes_aside
+
+    report = analyze(parse_query("10.1.2.0/24"), [VLAN2], [], [])
+    assert _build_notes_block(report) is None
+    assert _notes_aside(report) == ""
+
+
+def test_notes_block_groups_and_indents_each_category():
+    from bunnyauto.firewall.usage import analyze, parse_query
+    from bunnyauto.tools.fw_subnet_check import _build_notes_block, _notes_aside
+
+    addresses = [
+        {"name": "rfc1918_all", "type": "ipmask", "subnet": "10.0.0.0 255.0.0.0"},
+        {"name": "all", "type": "ipmask", "subnet": "0.0.0.0 0.0.0.0"},
+    ]
+    policies = [
+        {"policyid": 5, "name": "deny_private_wan", "dstaddr": [{"name": "rfc1918_all"}]},
+        {"policyid": 12, "name": "allow_out", "srcaddr": [{"name": "all"}]},
+    ]
+    interfaces = [{"name": "port10", "vdom": "root", "ip": "10.20.30.1 255.255.255.0"}]
+    report = analyze(parse_query("10.20.30.0/24"), addresses, [], policies, interfaces=interfaces)
+
+    block = _build_notes_block(report)
+    assert block.startswith("Notes (informational")
+    assert "  catch-all objects" in block
+    assert "  broad address objects (wider than /24" in block
+    assert "  interface addresses" in block
+    # each category's item is a "-" bullet, nested policy lines use "·"
+    assert "    - all (0.0.0.0/0) — referenced by 1 policy:" in block
+    assert "        · 12/allow_out [srcaddr]" in block
+    assert "    - rfc1918_all (10.0.0.0/8) — referenced by 1 policy:" in block
+    assert "        · 5/deny_private_wan [dstaddr]" in block
+    assert "    - port10 (vdom root): primary address" in block
+
+    aside = _notes_aside(report)
+    assert "1 catch-all object(s)" in aside
+    assert "1 broad supernet object(s)" in aside
+    assert "1 interface address(es)" in aside
+
+
+def test_notes_block_unreferenced_object_says_so_without_a_policy_list():
+    from bunnyauto.firewall.usage import analyze, parse_query
+    from bunnyauto.tools.fw_subnet_check import _build_notes_block
+
+    rfc1918 = {"name": "rfc1918_all", "type": "ipmask", "subnet": "10.0.0.0 255.0.0.0"}
+    report = analyze(parse_query("10.20.30.0/24"), [rfc1918], [], [])
+    block = _build_notes_block(report)
+    assert "no policy references it" in block
 
 
 # --- registration --------------------------------------------------

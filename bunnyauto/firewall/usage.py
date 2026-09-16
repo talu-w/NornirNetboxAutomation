@@ -35,6 +35,23 @@ A subnet already configured on a live interface (primary, secondary, or IPv6)
 goes into ``report.interfaces`` and is reported as a note — it never sets
 ``present``/``in_use`` and never changes the exit code, even when nothing else
 matched.
+
+**Broad supernets** (owner feedback, 2026-09-17): when an address object
+*contains* the query (relation ``"supernet"``) and is wider than
+``MIN_MATCH_PREFIXLEN`` for its family, it goes into ``report.broad_matches``
+instead of a real match — informational, never moves the exit code. The
+RFC1918 blocks (``10.0.0.0/8``, ``172.16.0.0/12``, ``192.168.0.0/16``) are the
+classic case: routinely referenced by "deny to all private space"-style
+policies, and they will always contain whatever small, manageable end-device
+subnet is being checked, so counting that as a conflict would make every check
+"fail". The filter is scoped to the "supernet" relation only — an *exact*
+match on a broad object (you queried the ``/8`` itself) or a *subnet* relation
+(a small object nested inside a broad query) are left as real matches; only
+"this huge block happens to contain what I'm checking" is suppressed. The
+owner only specified the IPv4 threshold (``/24`` — "usual smaller/manageable
+subnets ... to support end-devices"); ``/64`` is used for IPv6 as the closest
+equivalent (conventional LAN allocation size) but hasn't been confirmed —
+revisit if wrong.
 """
 
 from __future__ import annotations
@@ -45,6 +62,12 @@ from typing import Any
 
 IPNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
 _POLICY_ADDR_FIELDS = ("srcaddr", "dstaddr", "srcaddr6", "dstaddr6")
+
+# Minimum specificity (smallest /prefix) an address object's own network must have
+# to count as a real "present" match, keyed by IP version. Anything broader — a
+# supernet like 10.0.0.0/8 — goes to UsageReport.broad_matches instead: a note, not
+# a match. See the module docstring ("Broad supernets").
+MIN_MATCH_PREFIXLEN = {4: 24, 6: 64}
 
 
 @dataclass(slots=True)
@@ -124,6 +147,7 @@ class UsageReport:
     family: int
     matches: list[AddressMatch] = field(default_factory=list)
     catch_alls: list[AddressMatch] = field(default_factory=list)
+    broad_matches: list[AddressMatch] = field(default_factory=list)
     interfaces: list[InterfaceMatch] = field(default_factory=list)
 
     @property
@@ -138,6 +162,11 @@ class UsageReport:
     def permitted_by_catch_all(self) -> bool:
         """A ``0.0.0.0/0`` / ``::/0`` object that a policy references covers this query."""
         return any(match.policies for match in self.catch_alls)
+
+    @property
+    def permitted_by_broad_match(self) -> bool:
+        """A supernet wider than MIN_MATCH_PREFIXLEN that a policy references covers this query."""
+        return any(match.policies for match in self.broad_matches)
 
     @property
     def on_interface(self) -> bool:
@@ -165,6 +194,8 @@ class UsageReport:
             "policy_count": self.policy_count,
             "matches": [m.as_dict() for m in self.matches],
             "catch_alls": [m.as_dict() for m in self.catch_alls],
+            "permitted_by_broad_match": self.permitted_by_broad_match,
+            "broad_matches": [m.as_dict() for m in self.broad_matches],
             "on_interface": self.on_interface,
             "interfaces": [m.as_dict() for m in self.interfaces],
         }
@@ -211,6 +242,20 @@ def _network_is_match_all(net: IPNetwork) -> bool:
 def _range_is_match_all(lo: Any, hi: Any) -> bool:
     """A start/end pair that spans the entire address family."""
     return int(lo) == 0 and int(hi) == (1 << lo.max_prefixlen) - 1
+
+
+def _is_broad(net: IPNetwork) -> bool:
+    """Wider than MIN_MATCH_PREFIXLEN for its family — a supernet, not a real match."""
+    threshold = MIN_MATCH_PREFIXLEN.get(net.version)
+    return threshold is not None and net.prefixlen < threshold
+
+
+def _range_is_broad(lo: Any, hi: Any) -> bool:
+    """A range spanning more addresses than MIN_MATCH_PREFIXLEN allows for its family."""
+    threshold = MIN_MATCH_PREFIXLEN.get(lo.version)
+    if threshold is None:
+        return False
+    return (int(hi) - int(lo) + 1) > (1 << (lo.max_prefixlen - threshold))
 
 
 def _interface_address(raw: Any, *, cidr: bool) -> tuple[Any, IPNetwork] | None:
@@ -413,6 +458,7 @@ def analyze(
                 kind = kind or "ipprefix"
 
         match_all = False
+        broad = False
         if net is not None:
             cidr = str(net)
             kind = kind or "ipmask"
@@ -420,6 +466,8 @@ def analyze(
                 match_all, relation = True, "catch-all"
             else:
                 relation = _network_relation(net, query)
+                if relation == "supernet" and _is_broad(net):
+                    broad = True
         else:
             bounds = _range_bounds(obj)
             if bounds is None:
@@ -431,6 +479,8 @@ def analyze(
                 match_all, relation = True, "catch-all"
             else:
                 relation = _range_relation(lo, hi, query)
+                if relation == "supernet" and _range_is_broad(lo, hi):
+                    broad = True
 
         if relation is None:
             continue
@@ -460,10 +510,16 @@ def analyze(
                     match.policies.append(PolicyRef(pid, pname, pol_field, group, source))
 
         match.policies.sort(key=lambda ref: (ref.policyid, ref.field, ref.via or ""))
-        (report.catch_alls if match_all else report.matches).append(match)
+        if match_all:
+            report.catch_alls.append(match)
+        elif broad:
+            report.broad_matches.append(match)
+        else:
+            report.matches.append(match)
 
     report.matches.sort(key=lambda m: (_RELATION_ORDER.get(m.relation, 9), m.cidr, m.name))
     report.catch_alls.sort(key=lambda m: (m.cidr, m.name))
+    report.broad_matches.sort(key=lambda m: (_RELATION_ORDER.get(m.relation, 9), m.cidr, m.name))
     return report
 
 

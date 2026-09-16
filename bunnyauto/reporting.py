@@ -25,6 +25,23 @@ if TYPE_CHECKING:
     from bunnyauto.environments import Environment
     from bunnyauto.result import ToolResult
 
+
+def _escape(text: str) -> str:
+    """Escape literal ``[...]`` before handing text to Rich.
+
+    Rich's ``Console.print`` treats ``[...]`` as markup by default, and silently
+    *drops* anything that isn't a recognised style name — so dynamic tool/hub
+    content containing brackets (a policy field annotation like ``[dstaddr]``, a
+    menu label like ``[test]``) vanishes outright instead of printing literally.
+    Every place that hands tool- or config-derived text to the console must
+    escape it first; only hand-authored markup we write ourselves (style tags
+    like ``[dim]``/``[green]`` wrapped around already-escaped content) is exempt.
+    """
+    from rich.markup import escape
+
+    return escape(str(text))
+
+
 _STATUS_STYLE = {
     "ok": ("green", "OK"),
     "drift": ("yellow", "DRIFT"),
@@ -67,7 +84,7 @@ class Reporter:
         if self.json_mode:
             return
         if self._console is not None:
-            self._console.print(message)
+            self._console.print(_escape(message))
         else:
             self._stream.write(f"{message}\n")
             self._stream.flush()
@@ -82,7 +99,7 @@ class Reporter:
         line = f" {marker}  {environment.nb_url}  tag={tag} "
         if self._console is not None:
             colour = "bold white on red" if environment.protected else "bold white on blue"
-            self._console.print(line, style=colour)
+            self._console.print(_escape(line), style=colour)
         else:
             self.say(f"── {marker}  {environment.nb_url}  tag={tag} ──")
 
@@ -112,11 +129,11 @@ class Reporter:
 
         colour, label = _STATUS_STYLE.get(result.status.value, ("white", result.status.value))
         if self._console is not None:
-            self._console.print(f"\n[{colour}]● {label}[/] {result.summary}")
+            self._console.print(f"\n[{colour}]● {label}[/] {_escape(result.summary)}")
             for change in result.changes:
-                self._console.print(f"  [dim]·[/] {change}")
+                self._console.print(f"  [dim]·[/] {_escape(change)}")
             for artifact in result.artifacts:
-                self._console.print(f"  [dim]saved[/] {artifact}")
+                self._console.print(f"  [dim]saved[/] {_escape(artifact)}")
         else:
             self._plain(f"{label}: {result.summary}")
             for change in result.changes:
@@ -197,7 +214,8 @@ class Reporter:
             return
         if self._console is not None:
             target = self._console
-            text = f"[{style}]{message}[/]" if style else message
+            escaped = _escape(message)
+            text = f"[{style}]{escaped}[/]" if style else escaped
             target.print(text, style=None)
         else:
             self._plain(f"{level}: {message}", err=err)

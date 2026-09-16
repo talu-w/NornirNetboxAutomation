@@ -22,6 +22,14 @@ an informational note only (``data["on_interface"]`` / ``data["interfaces"]``)
 and never changes ``present``/``in_use`` or the exit code — the tool's job is
 the address-object/policy check above, not "is this IP alive on the box".
 
+An address object wider than :data:`~bunnyauto.firewall.usage.MIN_MATCH_PREFIXLEN`
+that merely *contains* the query (e.g. an RFC1918 supernet like ``10.0.0.0/8``)
+is likewise never counted as a match — it always would be, making every check
+"fail". See ``data["broad_matches"]`` / ``data["permitted_by_broad_match"]``.
+
+All three of the above (catch-alls, broad supernets, interfaces) print as one
+clean, indented "Notes" block rather than a dense run-on line.
+
 This tool touches neither devices nor NetBox, so it declares
 ``needs_devices = needs_netbox = False`` and runs with only its own token set.
 The firewall URL and the name of the token's env var come from the environment
@@ -43,9 +51,11 @@ from bunnyauto.common import env_flag
 from bunnyauto.errors import FirewallError
 from bunnyauto.firewall.fortigate import FortiGateClient
 from bunnyauto.firewall.usage import (
+    MIN_MATCH_PREFIXLEN,
     AddressMatch,
     InterfaceMatch,
     PolicyRef,
+    UsageReport,
     analyze,
     parse_query,
 )
@@ -149,55 +159,52 @@ class FwSubnetCheck:
         changes = [_describe(match) for match in report.matches]
         for line in changes:
             ctx.reporter.info(line)
-        for note in _catch_all_notes(report.catch_alls):
-            ctx.reporter.info(note)
-        for note in _interface_notes(report.interfaces):
-            ctx.reporter.info(note)
+
+        notes_block = _build_notes_block(report)
+        if notes_block:
+            ctx.reporter.info(notes_block)
 
         if not report.present:
             summary = f"{query} is not in use in any policies nor pre-existing IP object(s)."
-            if report.permitted_by_catch_all:
-                permitting = sum(1 for m in report.catch_alls if m.policies)
-                summary += f" ({permitting} catch-all object(s) permit it — see notes)"
-            if report.on_interface:
-                summary += (
-                    f" ({len(report.interfaces)} interface address(es) in this range — see notes)"
-                )
-            return ToolResult(
-                status=Status.OK,
-                summary=summary,
-                data=report.as_dict(),
-            )
-
-        noun = "object" if len(report.matches) == 1 else "objects"
-        if report.attached:
-            summary = (
-                f"{query} is IN USE — {len(report.matches)} overlapping address {noun}, "
-                f"referenced by {report.policy_count} policy/policies"
-            )
         else:
-            summary = (
-                f"{query} exists on the firewall ({len(report.matches)} overlapping address "
-                f"{noun}) but no policy references it"
-            )
+            noun = "object" if len(report.matches) == 1 else "objects"
+            if report.attached:
+                summary = (
+                    f"{query} is IN USE — {len(report.matches)} overlapping address {noun}, "
+                    f"referenced by {report.policy_count} policy/policies"
+                )
+            else:
+                summary = (
+                    f"{query} exists on the firewall ({len(report.matches)} overlapping "
+                    f"address {noun}) but no policy references it"
+                )
+
+        aside = _notes_aside(report)
+        if aside:
+            summary += f" ({aside} — see notes)"
+
         return ToolResult(
-            status=Status.DRIFT,
+            status=Status.DRIFT if report.present else Status.OK,
             summary=summary,
             changes=changes,
             data=report.as_dict(),
         )
 
 
+def _format_policy_line(ref: PolicyRef) -> str:
+    label = f"{ref.policyid}"
+    if ref.name:
+        label += f"/{ref.name}"
+    field = ref.field
+    if ref.via:
+        field += f" via {ref.via}"
+    tag = " (security-policy)" if ref.source == "security-policy" else ""
+    return f"{label} [{field}]{tag}"
+
+
 def _format_refs(refs: list[PolicyRef]) -> str:
-    return ", ".join(
-        f"{ref.policyid}"
-        + (f"/{ref.name}" if ref.name else "")
-        + f" [{ref.field}"
-        + (f" via {ref.via}" if ref.via else "")
-        + "]"
-        + (" (security-policy)" if ref.source == "security-policy" else "")
-        for ref in refs
-    )
+    """Compact, comma-joined form — used in the dense plan-mode 'changes' list."""
+    return ", ".join(_format_policy_line(ref) for ref in refs)
 
 
 def _describe(match: AddressMatch) -> str:
@@ -209,24 +216,11 @@ def _describe(match: AddressMatch) -> str:
     return "  —  ".join(parts)
 
 
-def _catch_all_notes(catch_alls: list[AddressMatch]) -> list[str]:
-    """Informational lines for ``0.0.0.0/0`` / ``::/0`` objects — never a match."""
-    notes: list[str] = []
-    for match in catch_alls:
-        if match.policies:
-            policy_ids = {ref.policyid for ref in match.policies}
-            notes.append(
-                f"note: the queried subnet is permitted by a catch-all, not a subnet-specific "
-                f"object — {match.name} ({match.cidr}) is referenced by {len(policy_ids)} "
-                f"policy/policies: {_format_refs(match.policies)}"
-            )
-        else:
-            notes.append(
-                f"note: address object {match.name} ({match.cidr}) matches everything "
-                "but no policy references it"
-            )
-    return notes
-
+# --- the Notes block: everything informational-only, never a match/policy hit --------
+#
+# Printed as one indented, hierarchical block (one reporter.info() call) instead of a
+# long run-on line per object — a catch-all or broad supernet referenced by a dozen
+# policies used to render as one dense, hard-to-read comma list.
 
 _RELATION_PHRASE = {
     "exact": "is exactly",
@@ -236,17 +230,78 @@ _RELATION_PHRASE = {
 }
 
 
-def _interface_notes(interfaces: list[InterfaceMatch]) -> list[str]:
-    """Informational lines for live interface addresses — never a match/policy hit."""
-    notes: list[str] = []
+def _address_note_lines(matches: list[AddressMatch], indent: str) -> list[str]:
+    lines: list[str] = []
+    for match in matches:
+        if match.policies:
+            policy_ids = {ref.policyid for ref in match.policies}
+            noun = "policy" if len(policy_ids) == 1 else "policy/policies"
+            lines.append(
+                f"{indent}- {match.name} ({match.cidr}) — referenced by {len(policy_ids)} {noun}:"
+            )
+            lines.extend(f"{indent}    · {_format_policy_line(ref)}" for ref in match.policies)
+        else:
+            lines.append(f"{indent}- {match.name} ({match.cidr}) — no policy references it")
+    return lines
+
+
+def _interface_note_lines(interfaces: list[InterfaceMatch], indent: str) -> list[str]:
+    lines = []
     for iface in interfaces:
         where = f" (vdom {iface.vdom})" if iface.vdom else ""
         phrase = _RELATION_PHRASE.get(iface.relation, iface.relation)
-        notes.append(
-            f"note: interface {iface.name}{where} has {iface.kind} address {iface.ip} "
-            f"configured — its network {iface.network} {phrase} the queried range"
+        lines.append(
+            f"{indent}- {iface.name}{where}: {iface.kind} address {iface.ip} — its network "
+            f"{iface.network} {phrase} the queried range"
         )
-    return notes
+    return lines
+
+
+def _build_notes_block(report: UsageReport) -> str | None:
+    """One clean block for catch-alls, broad supernets and interface addresses.
+
+    All three are informational only — never present/in_use, never the exit code.
+    Returns ``None`` when there's nothing to show.
+    """
+    indent = "    "
+    sections: list[str] = []
+
+    if report.catch_alls:
+        sections.append(
+            "  catch-all objects (match everything, not subnet-specific):\n"
+            + "\n".join(_address_note_lines(report.catch_alls, indent))
+        )
+
+    if report.broad_matches:
+        threshold = MIN_MATCH_PREFIXLEN.get(report.family)
+        floor = f"/{threshold}" if threshold is not None else "the configured floor"
+        sections.append(
+            f"  broad address objects (wider than {floor} — e.g. RFC1918 supernets, "
+            "not counted as a match):\n"
+            + "\n".join(_address_note_lines(report.broad_matches, indent))
+        )
+
+    if report.interfaces:
+        sections.append(
+            "  interface addresses (live config, not an address object or policy):\n"
+            + "\n".join(_interface_note_lines(report.interfaces, indent))
+        )
+
+    if not sections:
+        return None
+    return "Notes (informational — do not affect the pass/fail result):\n" + "\n".join(sections)
+
+
+def _notes_aside(report: UsageReport) -> str:
+    """Short summary-line clause pointing at the Notes block, or "" if there's nothing."""
+    parts = []
+    if report.catch_alls:
+        parts.append(f"{len(report.catch_alls)} catch-all object(s)")
+    if report.broad_matches:
+        parts.append(f"{len(report.broad_matches)} broad supernet object(s)")
+    if report.interfaces:
+        parts.append(f"{len(report.interfaces)} interface address(es)")
+    return ", ".join(parts)
 
 
 TOOL = FwSubnetCheck()
