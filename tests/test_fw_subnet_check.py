@@ -184,6 +184,19 @@ def test_interface_note_does_not_flip_a_real_drift(monkeypatch):
     assert result.data["in_use"] is False  # unrelated to the interface note
 
 
+def test_security_policy_hit_is_detected_and_labeled(monkeypatch):
+    """A 900G/901G-style box: policy-based NGFW mode, hit only via security-policy."""
+    monkeypatch.setenv("FW_TOKEN", "t")
+    pol = {"policyid": 12, "name": "allow-out", "dstaddr": [{"name": "vlan2"}]}
+    pol["_bunnyauto_policy_source"] = "security-policy"
+    _fake_client(monkeypatch, addresses=[VLAN2], policies=[pol])
+    result = TOOL.run(_Ctx(_environment()), _args(subnet="10.1.2.0/24"))
+    assert result.status is Status.DRIFT
+    assert result.data["in_use"] is True
+    assert result.data["matches"][0]["policies"][0]["source"] == "security-policy"
+    assert "(security-policy)" in result.changes[0]
+
+
 def test_insecure_flag_disables_verify(monkeypatch):
     monkeypatch.setenv("FW_TOKEN", "t")
     captured = _fake_client(monkeypatch, addresses=[VLAN2])

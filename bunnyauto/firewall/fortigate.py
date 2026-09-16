@@ -1,9 +1,10 @@
 """A minimal, read-only FortiGate REST API client.
 
-Only the three CMDB collections the subnet-usage check needs are exposed:
-address objects, address groups, and firewall policies (IPv4 + IPv6 in each
-case). Every failure is turned into a :class:`~bunnyauto.errors.FirewallError`
-so the entry points render one line, never a traceback.
+Only the CMDB collections the subnet-usage check needs are exposed: address
+objects, address groups, and firewall policies (IPv4 + IPv6 in each case, and
+both policy CMDB endpoints — see :meth:`FortiGateClient.policies`). Every
+failure is turned into a :class:`~bunnyauto.errors.FirewallError` so the entry
+points render one line, never a traceback.
 
 Auth is a FortiOS REST API token sent as ``Authorization: Bearer <token>``.
 The token never appears in a URL or in argv — the tool reads it from an
@@ -51,8 +52,25 @@ class FortiGateClient:
         return self._get("firewall/addrgrp") + self._get("firewall/addrgrp6", optional=True)
 
     def policies(self) -> list[dict[str, Any]]:
-        """IPv4/IPv6 firewall policies (``policyid``, ``srcaddr``, ``dstaddr``, …)."""
-        return self._get("firewall/policy")
+        """IPv4/IPv6 firewall policies (``policyid``, ``srcaddr``, ``dstaddr``, …).
+
+        A FortiGate runs in either *profile-based* NGFW mode (policies under
+        ``firewall/policy`` — GUI: "Policy") or *policy-based* NGFW mode
+        (``firewall/security-policy`` — GUI: "Security Policy", the factory
+        default on some higher-end models, e.g. the 900G/901G series). Only one
+        is ever populated on a given box, so both are queried and merged;
+        ``firewall/security-policy`` is tolerant of a 404 for older firmware
+        that predates the endpoint entirely. Each row is tagged with which
+        endpoint it came from so :func:`bunnyauto.firewall.usage.analyze` can
+        report it (``PolicyRef.source``).
+        """
+        policy = self._get("firewall/policy")
+        for row in policy:
+            row["_bunnyauto_policy_source"] = "policy"
+        security_policy = self._get("firewall/security-policy", optional=True)
+        for row in security_policy:
+            row["_bunnyauto_policy_source"] = "security-policy"
+        return policy + security_policy
 
     def interfaces(self) -> list[dict[str, Any]]:
         """Configured interfaces — IPv4 ``ip``/``secondaryip``, IPv6 under ``ipv6``.

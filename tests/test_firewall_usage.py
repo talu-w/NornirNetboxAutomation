@@ -234,6 +234,33 @@ def test_duplicate_policy_references_are_deduped():
     assert {r.field for r in refs} == {"srcaddr", "dstaddr"}
 
 
+# --- policy-based NGFW mode ("Security Policy" on the box's GUI) ------
+
+
+def test_security_policy_source_is_the_default_policy_when_untagged():
+    """A dict with no source tag (e.g. hand-built in a test) is plain 'policy'."""
+    pol = _policy(1, "p", dstaddr=["net_hq"])
+    report = analyze(parse_query("10.1.0.0/16"), [NET_HQ], [], [pol])
+    assert report.matches[0].policies[0].source == "policy"
+
+
+def test_security_policy_hit_is_tagged_and_still_counts_as_in_use():
+    pol = _policy(12, "allow-out", dstaddr=["net_hq"])
+    pol["_bunnyauto_policy_source"] = "security-policy"
+    report = analyze(parse_query("10.1.0.0/16"), [NET_HQ], [], [pol])
+    assert report.attached is True
+    assert report.matches[0].policies[0].source == "security-policy"
+
+
+def test_mixed_policy_and_security_policy_hits_on_one_object():
+    profile_pol = _policy(1, "profile", srcaddr=["net_hq"])
+    ngfw_pol = _policy(2, "ngfw", dstaddr=["net_hq"])
+    ngfw_pol["_bunnyauto_policy_source"] = "security-policy"
+    report = analyze(parse_query("10.1.0.0/16"), [NET_HQ], [], [profile_pol, ngfw_pol])
+    sources = {ref.policyid: ref.source for ref in report.matches[0].policies}
+    assert sources == {1: "policy", 2: "security-policy"}
+
+
 # --- IPv6 -----------------------------------------------------------
 
 

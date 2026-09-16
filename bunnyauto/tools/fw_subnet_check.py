@@ -1,8 +1,12 @@
 """``fw-subnet-check`` — is a subnet already on the firewall, and in which policies?
 
 Read-only. Connects to one FortiGate's REST API, pulls its address objects,
-address groups and firewall policies, and reports how a user-supplied subnet
-relates to what is already there:
+address groups and firewall policies — both policy CMDB endpoints, since a
+FortiGate is in either profile-based NGFW mode (``firewall/policy``, GUI:
+"Policy") or policy-based NGFW mode (``firewall/security-policy``, GUI:
+"Security Policy" — the factory default on some higher-end models, e.g. the
+900G/901G series); see :meth:`~bunnyauto.firewall.fortigate.FortiGateClient.policies` —
+and reports how a user-supplied subnet relates to what is already there:
 
 * **not present**  -> ``Status.OK``  (exit 0)  — nothing overlaps it; free to use.
 * **present**      -> ``Status.DRIFT`` (exit 10) — an address object exists that is
@@ -191,6 +195,7 @@ def _format_refs(refs: list[PolicyRef]) -> str:
         + f" [{ref.field}"
         + (f" via {ref.via}" if ref.via else "")
         + "]"
+        + (" (security-policy)" if ref.source == "security-policy" else "")
         for ref in refs
     )
 

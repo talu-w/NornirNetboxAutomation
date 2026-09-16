@@ -15,6 +15,14 @@ The question the ``fw-subnet-check`` tool answers has three outcomes:
 never partially overlap); address *ranges* can partially overlap, and those are
 reported with relation ``"overlap"``.
 
+A FortiGate is in either *profile-based* NGFW mode (policies under
+``firewall/policy``, GUI calls them "Policy") or *policy-based* NGFW mode
+(``firewall/security-policy``, GUI calls them "Security Policy" — the factory
+default on some higher-end models, e.g. the 900G/901G series). Only one is ever
+populated on a given box, but ``FortiGateClient.policies()`` queries both and
+tags each row with where it came from, so this module never has to care which
+mode the box is in — ``PolicyRef.source`` just carries the tag through.
+
 **Match-all objects** (``0.0.0.0/0`` / ``::/0``, or a range spanning the whole
 family — FortiGate's built-in ``all``) contain *every* query, so counting them
 as a "present" match would make everything look in use. They are pulled out into
@@ -47,6 +55,7 @@ class PolicyRef:
     name: str
     field: str  # srcaddr / dstaddr / srcaddr6 / dstaddr6
     via: str | None  # group name the reference goes through, or None if direct
+    source: str = "policy"  # "policy" | "security-policy" — which CMDB endpoint
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -54,6 +63,7 @@ class PolicyRef:
             "name": self.name,
             "field": self.field,
             "via": self.via,
+            "source": self.source,
         }
 
 
@@ -377,17 +387,18 @@ def analyze(
 
     group_index = _group_index(groups)
 
-    # name -> [(policyid, policy name, field), ...]
-    references: dict[str, list[tuple[int, str, str]]] = {}
+    # name -> [(policyid, policy name, field, source), ...]
+    references: dict[str, list[tuple[int, str, str, str]]] = {}
     for policy in policies:
         try:
             pid = int(policy.get("policyid", 0))
         except (TypeError, ValueError):
             pid = 0
         pname = str(policy.get("name", "") or "")
+        source = str(policy.get("_bunnyauto_policy_source") or "policy")
         for pol_field in _POLICY_ADDR_FIELDS:
             for ref_name in _member_names(policy.get(pol_field)):
-                references.setdefault(ref_name, []).append((pid, pname, pol_field))
+                references.setdefault(ref_name, []).append((pid, pname, pol_field, source))
 
     for obj in addresses:
         name = str(obj.get("name") or "")
@@ -436,17 +447,17 @@ def analyze(
         match.groups = sorted(containing)
 
         seen: set[tuple[int, str, str, str | None]] = set()
-        for pid, pname, pol_field in references.get(name, []):
+        for pid, pname, pol_field, source in references.get(name, []):
             key = (pid, pname, pol_field, None)
             if key not in seen:
                 seen.add(key)
-                match.policies.append(PolicyRef(pid, pname, pol_field, None))
+                match.policies.append(PolicyRef(pid, pname, pol_field, None, source))
         for group in sorted(containing):
-            for pid, pname, pol_field in references.get(group, []):
+            for pid, pname, pol_field, source in references.get(group, []):
                 key = (pid, pname, pol_field, group)
                 if key not in seen:
                     seen.add(key)
-                    match.policies.append(PolicyRef(pid, pname, pol_field, group))
+                    match.policies.append(PolicyRef(pid, pname, pol_field, group, source))
 
         match.policies.sort(key=lambda ref: (ref.policyid, ref.field, ref.via or ""))
         (report.catch_alls if match_all else report.matches).append(match)
