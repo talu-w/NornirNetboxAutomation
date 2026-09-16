@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 
 import pytest
 
 from bunnyauto import hub
 from bunnyauto.environments import Environment
+from bunnyauto.errors import ToolError
 from bunnyauto.result import Status, ToolResult
+from bunnyauto.tools.device_type_import import TOOL as IMPORT_DEVICE_TYPE
 from bunnyauto.tools.send_command import TOOL as SEND_COMMAND
 
 
@@ -103,6 +106,27 @@ def test_prompt_for_args_send_command():
 def test_prompt_for_args_config_mode_yes():
     args = hub.prompt_for_args(SEND_COMMAND, input_fn=_Script("reload", "y"))
     assert args.config_mode is True
+
+
+def test_prompt_for_args_applies_positional_type_conversion():
+    # import-device-type's `file` positional is declared type=Path; the hub must
+    # apply that converter itself since it builds the Namespace by hand rather
+    # than going through argparse.parse_args().
+    args = hub.prompt_for_args(IMPORT_DEVICE_TYPE, input_fn=_Script("devicetype.yaml", "n"))
+    assert args.file == Path("devicetype.yaml")
+    assert isinstance(args.file, Path)
+
+
+def test_prompt_for_args_invalid_positional_type_raises_friendly_error():
+    class _IntTool(_FakeTool):
+        name = "needs-int"
+
+        def add_arguments(self, parser: argparse.ArgumentParser) -> None:
+            parser.add_argument("count", type=int)
+
+    tool = _IntTool(ToolResult(status=Status.OK, summary="x"))
+    with pytest.raises(ToolError):
+        hub.prompt_for_args(tool, input_fn=_Script("not-a-number"))
 
 
 def test_prompt_for_args_write_tool_asks_apply():

@@ -14,7 +14,7 @@ from collections.abc import Callable, Mapping
 
 from bunnyauto.context import build_context
 from bunnyauto.environments import Environment, load_environments
-from bunnyauto.errors import BunnyautoError
+from bunnyauto.errors import BunnyautoError, ToolError
 from bunnyauto.preflight import preflight_device_credentials
 from bunnyauto.reporting import Reporter, make_reporter
 from bunnyauto.tools import REGISTRY
@@ -151,7 +151,15 @@ def prompt_for_args(tool: Tool, *, input_fn: InputFn = input) -> argparse.Namesp
         if dest in ("help", "yes"):
             continue
         if not action.option_strings:  # positional
-            setattr(namespace, dest, _ask(action.help or dest, input_fn=input_fn))
+            raw = _ask(action.help or dest, input_fn=input_fn)
+            if action.type is not None:
+                try:
+                    value = action.type(raw)
+                except Exception as exc:
+                    raise ToolError(f"invalid value for {dest!r}: {raw!r} ({exc})") from exc
+            else:
+                value = raw
+            setattr(namespace, dest, value)
         elif dest in COMMON_ARG_DESTS:
             continue
         elif action.nargs == 0:  # store_true / store_false flag
