@@ -175,6 +175,18 @@ def build_nornir(settings: Settings, creds: Credentials) -> Nornir:
     options["nb_url"] = settings.nb_url
     options["nb_token"] = creds.nb_token
 
+    # --region / --site narrow the inventory pull itself via NetBox's own
+    # devices API filters, layered on top of whatever config.yaml already sets.
+    # NetBox's region filter is hierarchical (a parent region matches its
+    # descendants too), so this needs no tree-walking on our side.
+    filter_parameters = dict(options.get("filter_parameters") or {})
+    if settings.region:
+        filter_parameters["region"] = settings.region
+    if settings.site:
+        filter_parameters["site"] = settings.site
+    if filter_parameters:
+        options["filter_parameters"] = filter_parameters
+
     try:
         nr = InitNornir(
             config_file=str(settings.config_file),
@@ -199,9 +211,16 @@ def build_nornir(settings: Settings, creds: Credentials) -> Nornir:
         _apply_netmiko_extras(host, legacy_extras if is_legacy else default_extras)
 
     if not nr.inventory.hosts:
+        scope = ", ".join(
+            f"{key}={value!r}"
+            for key, value in (("region", settings.region), ("site", settings.site))
+            if value
+        )
         raise InventoryError(
-            f"the {settings.environment!r} NetBox returned no devices",
-            fix="confirm devices exist in that NetBox and the API token can read them",
+            f"the {settings.environment!r} NetBox returned no devices"
+            + (f" matching {scope}" if scope else ""),
+            fix="confirm devices exist in that NetBox and the API token can read them"
+            + (" for that region/site" if scope else ""),
         )
     return nr
 

@@ -48,6 +48,8 @@ class Settings:
     nb_url: str
     config_file: Path
     target_tag: str
+    region: str | None = None
+    site: str | None = None
     protected: bool = False
     ssl_verify: bool | str = True
     legacy_ssh: bool = False
@@ -122,6 +124,8 @@ def build_context(
     env_file: str | os.PathLike[str] | None = None,
     tag: str | None = None,
     force_tag: bool = False,
+    region: str | None = None,
+    site: str | None = None,
     apply: bool = False,
     assume_yes: bool = False,
     legacy_ssh: bool = False,
@@ -166,6 +170,8 @@ def build_context(
         nb_url=environment.nb_url,
         config_file=config_path,
         target_tag=tag_value,
+        region=(region or "").strip() or None,
+        site=(site or "").strip() or None,
         protected=environment.protected,
         ssl_verify=ssl_verify,
         legacy_ssh=legacy_ssh,

@@ -11,25 +11,32 @@ then name, and:
   are not yet tagged;
 * for each **newly created** device that reported an IP, creates that IP in
   NetBox IPAM (``address/mask``, the mask taken from the most specific NetBox
-  Prefix containing it) — provided such a Prefix exists — attaches it to an
-  interface (``--ip-interface``, default ``Ethernet0``; created if the device's
-  type didn't already carry it via an interface template), and sets it as the
-  device's primary IPv4. If no Prefix contains the IP, the device is still
-  created; only the IP is skipped, with a note. Existing (already-matched)
-  devices never have their IP touched.
+  Prefix containing it) — provided such a Prefix exists — attaches it to a
+  wired interface and sets it as the device's primary IPv4. If no Prefix
+  contains the IP, the device is still created; only the IP is skipped, with a
+  note. Existing (already-matched) devices never have their IP touched.
+
+The interface an IP is attached to is never a guessed literal name: a real
+NetBox device type (e.g. one imported from NetBox Data Exchange) carries an
+interface template with wired ports (``E0``, ``E1``, ...) alongside any Wi-Fi/
+Bluetooth/Zigbee radios (``6GHz WiFi``, ``Bluetooth``, ...), and NetBox
+auto-creates those interfaces along with the device. This tool reads that
+device's *actual* interfaces and picks the first wired one, alphabetically by
+name (see ``bunnyauto/interface_match.py``) — radio and virtual/lag/bridge
+interfaces are never candidates, so an IP never lands on a radio. Pass
+``--ip-interface`` to force a specific interface by name instead (created if
+the device doesn't have it); a device type with no interface template at all
+(no wired candidates found) falls back to creating one named ``Ethernet0``.
 
 It never updates or deletes an existing device, and never creates a device
-type or a site (interfaces are the one exception: it will create
-``--ip-interface`` on a device it just created, purely as a place to hang the
-IP — nothing else about the interface is populated). It never creates a
-NetBox Prefix/IP Range. A device whose model has no matching NetBox device
-type, or whose hostname maps to no site (and no ``--default-site`` was given),
-is reported and skipped.
+type or a site (interfaces are the one exception, and only as a last resort —
+see above). It never creates a NetBox Prefix/IP Range. A device whose model
+has no matching NetBox device type, or whose hostname maps to no site (and no
+``--default-site`` was given), is reported and skipped.
 
 **Known limitation**: which physical port actually carries the AP's IP is not
-queried from the Conductor (that would need a per-device interface/association
-call whose command and JSON shape aren't yet confirmed against real hardware);
-``--ip-interface`` is a single fixed guess applied to every device.
+queried live from the Conductor — the pick is the device type's first wired
+interface by name, not necessarily the port that's actually up.
 
 Plans by default; ``--apply`` writes. Auth is the shared device login
 (``NORNIR_USERNAME`` / ``NORNIR_PASSWORD``); TLS verification is always on unless
@@ -48,6 +55,7 @@ from bunnyauto.aruba.inventory import WirelessDevice, parse_ap_database, parse_s
 from bunnyauto.aruba.sitematch import Site, match_site
 from bunnyauto.common import env_flag, normalize_tags
 from bunnyauto.errors import ArubaError, ToolError
+from bunnyauto.interface_match import pick_wired_interface
 from bunnyauto.ipam_match import Prefix, find_prefix
 from bunnyauto.tools.base import Status, ToolResult
 
@@ -56,6 +64,9 @@ if TYPE_CHECKING:
 
 _TAG_SLUG = "wireless"
 _ROLE_SLUG = "wireless"
+#: Used only when a device has no wired interface at all — no template, and no
+#: --ip-interface override. Should be rare once device types carry real templates.
+_FALLBACK_INTERFACE_NAME = "Ethernet0"
 
 
 @dataclass(slots=True)
@@ -68,6 +79,7 @@ class _Outcome:
     ip_cidr: str = ""  # "10.1.1.11/24" — set only when a containing Prefix was found
     ip_vrf_id: int | None = None
     ip_note: str = ""  # why the IP was not created, if it wasn't
+    ip_interface: str = ""  # preview of the interface it would attach to
 
 
 @dataclass(slots=True)
@@ -115,9 +127,10 @@ class WirelessSync:
         parser.add_argument(
             "--ip-interface",
             dest="ip_interface",
-            default="Ethernet0",
-            help="interface to attach a newly created device's IP to, creating it if "
-            "the device type didn't (default: Ethernet0)",
+            default=None,
+            help="force the interface a newly created device's IP is attached to "
+            "(created if the device doesn't have it) instead of auto-picking the "
+            "device's first wired interface",
         )
 
     def run(self, ctx: Context, args: argparse.Namespace) -> ToolResult:
@@ -192,11 +205,23 @@ class WirelessSync:
             f"({n_wlc} WLC, {len(wireless) - n_wlc} AP)"
         )
 
-        prefixes = _load_prefixes(nb) if any(d.ip for d in wireless) else []
+        need_ip_work = any(d.ip for d in wireless)
+        prefixes = _load_prefixes(nb) if need_ip_work else []
+        templates_by_type = _load_interface_templates(nb) if need_ip_work else {}
 
         role_key = _role_key(nb)
         outcomes = [
-            self._classify(d, by_serial, by_name, types_by_key, sites, default_site, prefixes)
+            self._classify(
+                d,
+                by_serial,
+                by_name,
+                types_by_key,
+                sites,
+                default_site,
+                prefixes,
+                templates_by_type,
+                args.ip_interface,
+            )
             for d in wireless
         ]
 
@@ -259,7 +284,7 @@ class WirelessSync:
                 if out.ip_cidr:
                     changes.append(
                         f"{d.name}: {verb} IP address {out.ip_cidr}, attach to "
-                        f"{args.ip_interface!r} and set as primary IPv4"
+                        f"{out.ip_interface!r} and set as primary IPv4"
                     )
                 elif out.ip_note:
                     changes.append(f"{d.name}: {out.ip_note}")
@@ -280,25 +305,26 @@ class WirelessSync:
                         created += 1
                         ctx.reporter.success(f"{d.name}: created in site {out.site!r}")
                         if out.ip_cidr:
-                            ip_status = _assign_ip(
+                            ip_status, ip_detail = _assign_ip(
                                 nb,
                                 device=device,
                                 interface_name=args.ip_interface,
                                 address=out.ip_cidr,
                                 vrf_id=out.ip_vrf_id,
                             )
-                            if ip_status in ("created", "exists"):
+                            if ip_status == "error":
+                                ip_failures.append(d.name)
+                                data[d.name]["ip_error"] = ip_detail
+                                ctx.reporter.error(f"{d.name}: IP create failed — {ip_detail}")
+                            else:
                                 if ip_status == "created":
                                     ip_created += 1
                                 data[d.name]["ip_status"] = ip_status
+                                data[d.name]["ip_interface"] = ip_detail
                                 ctx.reporter.success(
                                     f"{d.name}: IP {out.ip_cidr} {ip_status}, primary IPv4 "
-                                    f"on {args.ip_interface!r}"
+                                    f"on {ip_detail!r}"
                                 )
-                            else:
-                                ip_failures.append(d.name)
-                                data[d.name]["ip_error"] = ip_status
-                                ctx.reporter.error(f"{d.name}: IP create failed — {ip_status}")
                     else:
                         failures.append(d.name)
                         data[d.name]["error"] = err
@@ -332,6 +358,8 @@ class WirelessSync:
         sites: list[Site],
         default_site: Site | None,
         prefixes: list[Prefix],
+        templates_by_type: dict[int, list[tuple[str, str]]],
+        ip_interface_override: str | None,
     ) -> _Outcome:
         match = None
         if d.serial and d.serial.casefold() in by_serial:
@@ -367,6 +395,7 @@ class WirelessSync:
         ip_cidr = ""
         ip_vrf_id: int | None = None
         ip_note = ""
+        ip_interface = ""
         if d.ip:
             try:
                 addr = ipaddress.ip_address(d.ip)
@@ -382,6 +411,11 @@ class WirelessSync:
                 else:
                     ip_cidr = f"{addr}/{prefix.network.prefixlen}"
                     ip_vrf_id = prefix.vrf_id
+                    if ip_interface_override:
+                        ip_interface = ip_interface_override
+                    else:
+                        rows = templates_by_type.get(int(device_type.id), [])
+                        ip_interface = pick_wired_interface(rows) or _FALLBACK_INTERFACE_NAME
 
         return _Outcome(
             d,
@@ -391,6 +425,7 @@ class WirelessSync:
             ip_cidr=ip_cidr,
             ip_vrf_id=ip_vrf_id,
             ip_note=ip_note,
+            ip_interface=ip_interface,
         )
 
 
@@ -406,6 +441,30 @@ def _load_prefixes(nb: Any) -> list[Prefix]:
         vrf_id = int(vrf.id) if vrf is not None else None
         prefixes.append(Prefix(id=int(p.id), network=network, vrf_id=vrf_id))
     return prefixes
+
+
+def _load_interface_templates(nb: Any) -> dict[int, list[tuple[str, str]]]:
+    """device_type id -> [(interface name, type), ...] from its interface templates.
+
+    This is what lets plan mode preview the interface an IP would attach to
+    without creating anything: NetBox auto-creates a device's interfaces from
+    its device type's interface template, so the template is a faithful
+    preview of what the device will actually have.
+    """
+    by_type: dict[int, list[tuple[str, str]]] = {}
+    for t in nb.dcim.interface_templates.all():
+        dt = getattr(t, "device_type", None)
+        dt_id = int(dt.id) if dt is not None else None
+        if dt_id is None:
+            continue
+        by_type.setdefault(dt_id, []).append((str(getattr(t, "name", "")), _type_value(t)))
+    return by_type
+
+
+def _type_value(record: Any) -> str:
+    """Normalize a pynetbox choice field: a nested ``{value, label}`` record or a plain string."""
+    t = getattr(record, "type", "")
+    return str(getattr(t, "value", t))
 
 
 def _role_key(nb: Any) -> str:
@@ -450,21 +509,46 @@ def _assign_ip(
     nb: Any,
     *,
     device: Any,
-    interface_name: str,
+    interface_name: str | None,
     address: str,
     vrf_id: int | None,
-) -> str:
-    """Create/attach ``address`` to ``interface_name`` on ``device`` and make it primary.
+) -> tuple[str, str]:
+    """Create/attach ``address`` on ``device`` and make it the primary IPv4.
 
-    Creates the interface if the device doesn't already have one by that name.
-    Returns ``"created"`` or ``"exists"`` (the IP address), or the error text.
+    ``interface_name``, if given, is used exactly (created if the device
+    doesn't have it — an explicit override, so it's trusted as-is). Otherwise
+    the device's own interfaces — normally already populated from its NetBox
+    device type's interface template (wired ports alongside any radios) — are
+    searched for the first wired-Ethernet interface by name
+    (:func:`bunnyauto.interface_match.pick_wired_interface`); a device with no
+    wired interface at all (no template) gets a generic one created as a last
+    resort.
+
+    Returns ``(status, detail)``: ``status`` is ``"created"``, ``"exists"``, or
+    ``"error"``; ``detail`` is the interface name used on success, or the error
+    text on failure.
     """
     try:
-        interface = nb.dcim.interfaces.get(device_id=int(device.id), name=interface_name)
-        if interface is None:
-            interface = nb.dcim.interfaces.create(
-                {"device": int(device.id), "name": interface_name, "type": "other"}
+        interfaces = list(nb.dcim.interfaces.filter(device_id=int(device.id)))
+        if interface_name:
+            interface = next((i for i in interfaces if str(i.name) == interface_name), None)
+            if interface is None:
+                interface = nb.dcim.interfaces.create(
+                    {"device": int(device.id), "name": interface_name, "type": "other"}
+                )
+        else:
+            picked = pick_wired_interface([(str(i.name), _type_value(i)) for i in interfaces])
+            interface = (
+                next((i for i in interfaces if str(i.name) == picked), None) if picked else None
             )
+            if interface is None:
+                interface = nb.dcim.interfaces.create(
+                    {
+                        "device": int(device.id),
+                        "name": _FALLBACK_INTERFACE_NAME,
+                        "type": "other",
+                    }
+                )
 
         existing = nb.ipam.ip_addresses.get(address=address)
         if existing is None:
@@ -491,8 +575,8 @@ def _assign_ip(
 
         device.update({"primary_ip4": int(ip_obj.id)})
     except Exception as exc:  # pynetbox RequestError etc.
-        return str(exc)
-    return result
+        return "error", str(exc)
+    return result, str(interface.name)
 
 
 def _add_tag(device: Any) -> bool | str:

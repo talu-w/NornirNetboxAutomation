@@ -37,6 +37,8 @@ COMMON_ARG_DESTS = frozenset(
         "config",
         "tag",
         "force_tag",
+        "region",
+        "site",
         "legacy_ssh",
         "connect_timeout",
         "auth_timeout",
@@ -91,6 +93,19 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
         "--force-tag",
         action="store_true",
         help="allow a --tag that is not the selected environment's default_tag",
+    )
+    selection.add_argument(
+        "--region",
+        default=os.getenv("BUNNYAUTO_REGION"),
+        help=(
+            "further narrow to devices whose site is in this NetBox region "
+            "(slug; includes descendant regions)"
+        ),
+    )
+    selection.add_argument(
+        "--site",
+        default=os.getenv("BUNNYAUTO_SITE"),
+        help="further narrow to devices at this NetBox site (slug)",
     )
 
     ssh = parser.add_argument_group("SSH tuning")

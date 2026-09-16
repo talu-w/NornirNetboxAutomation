@@ -91,17 +91,29 @@ class Reporter:
 
     # -- lifecycle-style messages ------------------------------------------------
 
-    def banner(self, environment: Environment, tag: str) -> None:
+    def banner(
+        self,
+        environment: Environment,
+        tag: str,
+        *,
+        region: str | None = None,
+        site: str | None = None,
+    ) -> None:
         """The environment header shown before any work begins."""
         if self.json_mode:
             return
         marker = "PRODUCTION" if environment.protected else environment.name.upper()
-        line = f" {marker}  {environment.nb_url}  tag={tag} "
+        scope = f"  tag={tag}"
+        if region:
+            scope += f"  region={region}"
+        if site:
+            scope += f"  site={site}"
+        line = f" {marker}  {environment.nb_url}{scope} "
         if self._console is not None:
             colour = "bold white on red" if environment.protected else "bold white on blue"
             self._console.print(_escape(line), style=colour)
         else:
-            self.say(f"── {marker}  {environment.nb_url}  tag={tag} ──")
+            self.say(f"──{line}──")
 
     def step(self, message: str) -> None:
         self._emit(message, style="dim", level="STEP")

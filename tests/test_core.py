@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from bunnyauto.common import (
     LEGACY_NETMIKO_EXTRAS,
     build_netmiko_extras,
+    build_nornir,
     env_flag,
     normalize_tags,
     ssl_verify_setting,
@@ -19,6 +21,7 @@ from bunnyauto.errors import (
     BunnyautoError,
     ConfigError,
     EnvVarError,
+    InventoryError,
     TagMismatchError,
     UnknownEnvironmentError,
 )
@@ -396,6 +399,101 @@ def test_build_context_applies_timeout_overrides(env_file, nornir_config, _creds
     )
     assert ctx.settings.read_timeout == 300.0
     assert not hasattr(ctx.settings, "bogus")
+
+
+def test_build_context_defaults_region_and_site_to_none(env_file, nornir_config, _creds_env):
+    ctx = build_context(
+        env="test",
+        reporter=make_reporter(),
+        config_file=nornir_config,
+        env_file=env_file,
+    )
+    assert ctx.settings.region is None
+    assert ctx.settings.site is None
+
+
+def test_build_context_applies_region_and_site(env_file, nornir_config, _creds_env):
+    ctx = build_context(
+        env="test",
+        reporter=make_reporter(),
+        config_file=nornir_config,
+        env_file=env_file,
+        region="south",
+        site="  ",  # blank after stripping -> treated as unset
+    )
+    assert ctx.settings.region == "south"
+    assert ctx.settings.site is None
+
+
+# ---------------------------------------------------------------------------
+# build_nornir — region/site -> filter_parameters
+# ---------------------------------------------------------------------------
+
+
+def _fake_init_nornir_factory(hosts: dict):
+    """A stand-in for InitNornir that records the options it was called with."""
+    captured: dict = {}
+
+    def fake_init_nornir(*, config_file, inventory):
+        captured["options"] = inventory["options"]
+        inv = SimpleNamespace(hosts=hosts, defaults=SimpleNamespace(username=None, password=None))
+        return SimpleNamespace(inventory=inv)
+
+    return fake_init_nornir, captured
+
+
+def test_build_nornir_merges_region_and_site_into_filter_parameters(nornir_config, monkeypatch):
+    fake_init_nornir, captured = _fake_init_nornir_factory(
+        {"h1": SimpleNamespace(data={"tags": []}, connection_options={})}
+    )
+    monkeypatch.setattr("bunnyauto.common.InitNornir", fake_init_nornir)
+
+    settings = Settings(
+        environment="test",
+        nb_url="https://nb.example.com",
+        config_file=nornir_config,
+        target_tag="nornirtest",
+        region="south",
+        site="dallas",
+    )
+    build_nornir(settings, Credentials(username="u", password="p", nb_token="t"))
+
+    assert captured["options"]["filter_parameters"] == {"region": "south", "site": "dallas"}
+
+
+def test_build_nornir_omits_filter_parameters_when_region_and_site_unset(
+    nornir_config, monkeypatch
+):
+    fake_init_nornir, captured = _fake_init_nornir_factory(
+        {"h1": SimpleNamespace(data={"tags": []}, connection_options={})}
+    )
+    monkeypatch.setattr("bunnyauto.common.InitNornir", fake_init_nornir)
+
+    settings = Settings(
+        environment="test",
+        nb_url="https://nb.example.com",
+        config_file=nornir_config,
+        target_tag="nornirtest",
+    )
+    build_nornir(settings, Credentials(username="u", password="p", nb_token="t"))
+
+    assert "filter_parameters" not in captured["options"]
+
+
+def test_build_nornir_empty_inventory_error_names_the_region_and_site(nornir_config, monkeypatch):
+    fake_init_nornir, _captured = _fake_init_nornir_factory({})
+    monkeypatch.setattr("bunnyauto.common.InitNornir", fake_init_nornir)
+
+    settings = Settings(
+        environment="test",
+        nb_url="https://nb.example.com",
+        config_file=nornir_config,
+        target_tag="nornirtest",
+        region="south",
+        site="dallas",
+    )
+    with pytest.raises(InventoryError, match="region='south', site='dallas'"):
+        build_nornir(settings, Credentials(username="u", password="p", nb_token="t"))
 
 
 def test_reporter_json_render(capsys):

@@ -44,6 +44,11 @@ class _Endpoint:
                 return item
         return None
 
+    def filter(self, **kw):
+        return [
+            item for item in self._items if all(getattr(item, k, None) == v for k, v in kw.items())
+        ]
+
     def create(self, body):
         self.created.append(body)
         rec = _Rec(id=999, **{k: v for k, v in body.items() if k != "tags"})
@@ -63,6 +68,7 @@ class _NB:
         prefixes=(),
         ip_addresses=(),
         interfaces=(),
+        interface_templates=(),
     ):
         self.version = "4.1"
         self.dcim = SimpleNamespace(
@@ -71,6 +77,7 @@ class _NB:
             device_types=_Endpoint(types),
             devices=_Endpoint(devices),
             interfaces=_Endpoint(interfaces),
+            interface_templates=_Endpoint(interface_templates),
         )
         self.extras = SimpleNamespace(tags=_Endpoint(tags))
         self.ipam = SimpleNamespace(
@@ -87,6 +94,7 @@ def _nb(
     prefixes=(),
     ip_addresses=(),
     interfaces=(),
+    interface_templates=(),
 ):
     return _NB(
         roles=[_Rec(id=7, slug="wireless", name="Wireless")] if with_role else [],
@@ -103,6 +111,7 @@ def _nb(
         prefixes=prefixes,
         ip_addresses=ip_addresses,
         interfaces=interfaces,
+        interface_templates=interface_templates,
     )
 
 
@@ -154,7 +163,7 @@ def _args(**over) -> argparse.Namespace:
         only="all",
         device=None,
         status="active",
-        ip_interface="Ethernet0",
+        ip_interface=None,
     )
     base.update(over)
     return argparse.Namespace(**base)
@@ -367,14 +376,59 @@ def test_ip_set_as_device_primary_ipv4(monkeypatch):
 
 
 def test_ip_reuses_an_existing_interface_instead_of_recreating(monkeypatch):
-    """If the device type's interface template already made Ethernet0, reuse it."""
+    """If the device already has a wired interface (from its device type's
+    template), reuse it instead of creating a redundant one."""
     _fake_client(monkeypatch, aps=[AP])
     nb = _nb(prefixes=[_Rec(id=10, prefix="10.1.1.0/24")])
-    nb.dcim.interfaces._items.append(_Rec(id=42, device_id=999, name="Ethernet0"))
+    nb.dcim.interfaces._items.append(
+        _Rec(id=42, device_id=999, name="Ethernet0", type="1000base-t")
+    )
     TOOL.run(_Ctx(nb, apply=True), _args())
     assert nb.dcim.interfaces.created == []  # not recreated
     (body,) = nb.ipam.ip_addresses.created
     assert body["assigned_object_id"] == 42
+
+
+def test_auto_pick_uses_real_ap655_style_interfaces_not_a_radio(monkeypatch):
+    """The AP-655 NDX device type: wired E0/E1 alongside Wi-Fi/BT/Zigbee radios.
+
+    Plan mode previews from the device type's interface *template*; apply picks
+    from the device's *actual* interfaces. Both must land on 'E0', never a radio.
+    """
+    _fake_client(monkeypatch, aps=[AP])
+    ap655_rows = [
+        ("E0", "5gbase-t"),
+        ("E1", "5gbase-t"),
+        ("6GHz WiFi", "ieee802.11ax"),
+        ("5GHz WiFi", "ieee802.11ax"),
+        ("2.4GHz WiFi", "ieee802.11ax"),
+        ("Bluetooth", "ieee802.15.1"),
+        ("Zigbee", "other-wireless"),
+    ]
+    nb = _nb(
+        prefixes=[_Rec(id=10, prefix="10.1.1.0/24")],
+        interface_templates=[_Rec(device_type=_Rec(id=50), name=n, type=t) for n, t in ap655_rows],
+    )
+
+    plan = TOOL.run(_Ctx(nb), _args())
+    assert any(
+        c == "hq-idf1-ap01: would create IP address 10.1.1.1/24, "
+        "attach to 'E0' and set as primary IPv4"
+        for c in plan.changes
+    )
+
+    # apply sees the device's *actual* interfaces (as NetBox would auto-create
+    # them from the same template) — simulated here since the fake doesn't
+    # auto-provision components on device creation.
+    nb.dcim.interfaces._items.extend(
+        _Rec(id=100 + i, device_id=999, name=n, type=t) for i, (n, t) in enumerate(ap655_rows)
+    )
+    result = TOOL.run(_Ctx(nb, apply=True), _args())
+    assert result.status is Status.CHANGED
+    assert nb.dcim.interfaces.created == []  # E0 already existed — never recreated
+    (body,) = nb.ipam.ip_addresses.created
+    assert body["assigned_object_id"] == 100  # E0's id, not a radio's
+    assert result.data["hq-idf1-ap01"]["ip_interface"] == "E0"
 
 
 def test_custom_ip_interface_flag(monkeypatch):
@@ -458,7 +512,7 @@ def test_ip_already_correctly_assigned_is_left_alone(monkeypatch):
     nb = _nb(
         prefixes=[_Rec(id=10, prefix="10.1.1.0/24")],
         ip_addresses=[existing_ip],
-        interfaces=[_Rec(id=42, device_id=999, name="Ethernet0")],
+        interfaces=[_Rec(id=42, device_id=999, name="Ethernet0", type="other")],
     )
     TOOL.run(_Ctx(nb, apply=True), _args())
     assert not hasattr(existing_ip, "updated")  # already correct — no write issued

@@ -101,6 +101,8 @@ def main(argv: list[str] | None = None) -> int:
             config_file=getattr(args, "config", "config.yaml"),
             tag=getattr(args, "tag", None),
             force_tag=getattr(args, "force_tag", False),
+            region=getattr(args, "region", None),
+            site=getattr(args, "site", None),
             legacy_ssh=getattr(args, "legacy_ssh", False),
             apply=getattr(args, "apply", False),
             assume_yes=getattr(args, "yes", False),
@@ -108,7 +110,12 @@ def main(argv: list[str] | None = None) -> int:
             need_devices=getattr(tool, "needs_devices", True),
             need_netbox=getattr(tool, "needs_netbox", True),
         )
-        reporter.banner(ctx.environment, ctx.settings.target_tag)
+        reporter.banner(
+            ctx.environment,
+            ctx.settings.target_tag,
+            region=ctx.settings.region,
+            site=ctx.settings.site,
+        )
         result = tool.run(ctx, args)
     except BunnyautoError as exc:
         if args.debug:

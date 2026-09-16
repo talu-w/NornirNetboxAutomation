@@ -55,7 +55,11 @@ class _FakeCtx:
     def __init__(self, environment: Environment, *, apply: bool = False):
         self.environment = environment
         self.settings = argparse.Namespace(
-            target_tag=environment.default_tag, apply=apply, protected=environment.protected
+            target_tag=environment.default_tag,
+            region=None,
+            site=None,
+            apply=apply,
+            protected=environment.protected,
         )
         self.closed = False
 

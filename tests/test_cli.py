@@ -39,6 +39,24 @@ def test_parser_happy_path():
     assert args.tag == "core"
 
 
+def test_parser_accepts_region_and_site():
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            "--env",
+            "test",
+            "send-command",
+            "show version",
+            "--region",
+            "south",
+            "--site",
+            "dallas-metro-it-services",
+        ]
+    )
+    assert args.region == "south"
+    assert args.site == "dallas-metro-it-services"
+
+
 class _FakeTool:
     name = "send-command"
     summary = "fake"
@@ -62,7 +80,7 @@ class _FakeTool:
 class _FakeCtx:
     def __init__(self):
         self.environment = argparse.Namespace(name="test", nb_url="https://nb", protected=False)
-        self.settings = argparse.Namespace(target_tag="nornirtest")
+        self.settings = argparse.Namespace(target_tag="nornirtest", region=None, site=None)
         self.closed = False
 
     def close(self):

@@ -187,6 +187,8 @@ def _run_tool(
         env_file=env_file,
         tag=getattr(args, "tag", None),
         force_tag=getattr(args, "force_tag", False),
+        region=getattr(args, "region", None),
+        site=getattr(args, "site", None),
         legacy_ssh=getattr(args, "legacy_ssh", False),
         apply=getattr(args, "apply", False),
         assume_yes=True,  # the hub does its own confirming, below
@@ -195,7 +197,12 @@ def _run_tool(
         need_netbox=getattr(tool, "needs_netbox", True),
     )
     try:
-        reporter.banner(ctx.environment, ctx.settings.target_tag)
+        reporter.banner(
+            ctx.environment,
+            ctx.settings.target_tag,
+            region=ctx.settings.region,
+            site=ctx.settings.site,
+        )
         if ctx.settings.apply and not _confirm_apply(ctx.environment, reporter, input_fn):
             reporter.say("not applying — nothing was changed")
             return
