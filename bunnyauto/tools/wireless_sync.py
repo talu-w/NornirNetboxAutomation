@@ -5,8 +5,11 @@ Reads the Conductor's device inventory over its read-only REST API
 then name, and:
 
 * creates every WLC/AP NetBox is missing — role ``wireless``, device type matched
-  from the Aruba model string, site derived from the hostname prefix — each
-  stamped with the ``wireless`` tag;
+  from the Aruba model string (e.g. Aruba's bare ``"655"`` against a device
+  type with model ``"Aruba AP-655"`` / slug ``"hpe-aruba-ap-655"`` — a
+  token-boundary *contains*, not an exact match; see
+  ``bunnyauto/devicetype_match.py``), site derived from the hostname prefix —
+  each stamped with the ``wireless`` tag;
 * adds the ``wireless`` tag to Conductor devices that already exist in NetBox but
   are not yet tagged;
 * for each **newly created** device that reported an IP, creates that IP in
@@ -54,6 +57,7 @@ from bunnyauto.aruba.conductor import ArubaConductorClient
 from bunnyauto.aruba.inventory import WirelessDevice, parse_ap_database, parse_switches
 from bunnyauto.aruba.sitematch import Site, match_site
 from bunnyauto.common import env_flag, normalize_tags
+from bunnyauto.devicetype_match import match_device_type
 from bunnyauto.errors import ArubaError, ToolError
 from bunnyauto.interface_match import pick_wired_interface
 from bunnyauto.ipam_match import Prefix, find_prefix
@@ -74,7 +78,8 @@ class _Outcome:
     device: WirelessDevice
     action: str  # "in-sync" | "tag" | "create" | "blocked"
     site: str = ""
-    device_type: str = ""
+    device_type: str = ""  # display string, e.g. "Aruba AP-655"
+    device_type_id: int = 0
     reason: str = ""
     ip_cidr: str = ""  # "10.1.1.11/24" — set only when a containing Prefix was found
     ip_vrf_id: int | None = None
@@ -166,11 +171,7 @@ class WirelessSync:
             if default_site is None:
                 raise ToolError(f"--default-site {args.default_site!r} is not a NetBox site slug")
 
-        types_by_key: dict[str, Any] = {}
-        for dt in nb.dcim.device_types.all():
-            for key in (getattr(dt, "model", ""), getattr(dt, "slug", "")):
-                if key:
-                    types_by_key.setdefault(str(key).casefold(), dt)
+        device_types = list(nb.dcim.device_types.all())
 
         devices = list(nb.dcim.devices.all())
         by_serial = {str(d.serial).casefold(): d for d in devices if getattr(d, "serial", "")}
@@ -215,7 +216,7 @@ class WirelessSync:
                 d,
                 by_serial,
                 by_name,
-                types_by_key,
+                device_types,
                 sites,
                 default_site,
                 prefixes,
@@ -294,7 +295,7 @@ class WirelessSync:
                     device, err = _create_device(
                         nb,
                         name=d.name,
-                        device_type_id=int(types_by_key[out.device_type.casefold()].id),
+                        device_type_id=out.device_type_id,
                         role_key=role_key,
                         role_id=int(role.id),
                         site_id=int(sites_by_slug[out.site.casefold()].id),
@@ -354,7 +355,7 @@ class WirelessSync:
         d: WirelessDevice,
         by_serial: dict[str, Any],
         by_name: dict[str, Any],
-        types_by_key: dict[str, Any],
+        device_types: list[Any],
         sites: list[Site],
         default_site: Site | None,
         prefixes: list[Prefix],
@@ -372,14 +373,7 @@ class WirelessSync:
                 return _Outcome(d, "in-sync")
             return _Outcome(d, "tag")
 
-        device_type = next(
-            (
-                types_by_key[c.casefold()]
-                for c in d.model_candidates
-                if c.casefold() in types_by_key
-            ),
-            None,
-        )
+        device_type = match_device_type(d.model_candidates, device_types)
         if device_type is None:
             return _Outcome(d, "blocked", reason=f"no NetBox device type matches model {d.model!r}")
 
@@ -389,6 +383,7 @@ class WirelessSync:
                 d,
                 "blocked",
                 device_type=str(getattr(device_type, "model", "")),
+                device_type_id=int(device_type.id),
                 reason=f"hostname {d.name!r} matched no NetBox site (pass --default-site)",
             )
 
@@ -422,6 +417,7 @@ class WirelessSync:
             "create",
             site=site.slug,
             device_type=str(getattr(device_type, "model", "")),
+            device_type_id=int(device_type.id),
             ip_cidr=ip_cidr,
             ip_vrf_id=ip_vrf_id,
             ip_note=ip_note,

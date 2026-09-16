@@ -273,6 +273,24 @@ def test_match_by_name_when_serial_differs(monkeypatch):
     assert result.status is Status.OK
 
 
+# --- device-type matching ------------------------------------------
+
+
+def test_ndx_style_device_type_is_matched_by_bare_model_number(monkeypatch):
+    """Regression: NetBox Data Exchange device types (model "Aruba AP-655",
+    slug "hpe-aruba-ap-655") were never matched by Aruba's bare "655" model
+    report — exact-string matching required "655" or "AP-655" to equal the
+    whole model/slug, which they never do for a real imported device type."""
+    ap = {"Name": "hq-idf1-ap02", "AP Type": "655", "Serial #": "CN0655"}
+    _fake_client(monkeypatch, aps=[ap])
+    nb = _nb()
+    nb.dcim.device_types._items.append(_Rec(id=52, model="Aruba AP-655", slug="hpe-aruba-ap-655"))
+    result = TOOL.run(_Ctx(nb, apply=True), _args())
+    assert result.status is Status.CHANGED
+    (body,) = nb.dcim.devices.created
+    assert body["device_type"] == 52
+
+
 # --- blocked devices ----------------------------------------------
 
 
