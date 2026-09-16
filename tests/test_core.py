@@ -16,7 +16,7 @@ from bunnyauto.common import (
     ssl_verify_setting,
 )
 from bunnyauto.context import Credentials, Settings, build_context
-from bunnyauto.environments import load_environments, resolve_environment
+from bunnyauto.environments import Environment, load_environments, resolve_environment
 from bunnyauto.errors import (
     BunnyautoError,
     ConfigError,
@@ -148,6 +148,40 @@ def test_firewall_config_is_optional_and_parsed(tmp_path):
     assert envs["test"].fw_url is None
     assert envs["prod"].fw_url == "https://fw.example.com"  # trailing slash stripped
     assert envs["prod"].fw_token_env == "FW_TOK"
+
+
+def test_device_credential_override_is_optional_and_parsed(tmp_path):
+    path = tmp_path / "bunnyauto.yaml"
+    path.write_text(
+        "environments:\n"
+        "  test:\n"
+        "    nb_url: https://nb\n"
+        "    default_tag: t\n"
+        "    token_env: X\n"
+        "  sandbox:\n"
+        "    nb_url: https://nb2\n"
+        "    default_tag: s\n"
+        "    token_env: Y\n"
+        "    device_username_env: BUNNYAUTO_SANDBOX_USERNAME\n"
+        "    device_password_env: BUNNYAUTO_SANDBOX_PASSWORD\n",
+        encoding="utf-8",
+    )
+    envs = load_environments(path)
+    assert envs["test"].device_username_env is None
+    assert envs["test"].device_password_env is None
+    assert envs["sandbox"].device_username_env == "BUNNYAUTO_SANDBOX_USERNAME"
+    assert envs["sandbox"].device_password_env == "BUNNYAUTO_SANDBOX_PASSWORD"
+
+
+def test_device_credential_override_requires_both_vars(tmp_path):
+    path = tmp_path / "bunnyauto.yaml"
+    path.write_text(
+        "environments:\n  test:\n    nb_url: https://nb\n    default_tag: t\n"
+        "    token_env: X\n    device_username_env: BUNNYAUTO_SANDBOX_USERNAME\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="device_username_env"):
+        load_environments(path)
 
 
 def test_aruba_url_is_optional_and_parsed(tmp_path):
@@ -290,6 +324,36 @@ def test_preflight_carries_token_through_when_not_required(env_file, monkeypatch
     monkeypatch.setenv("BUNNYAUTO_TEST_NB_TOKEN", "tok")
     creds = preflight(resolve_environment("test", env_file), need_devices=False, need_netbox=False)
     assert creds.nb_token == "tok"
+
+
+def test_preflight_uses_environments_own_device_credential_override(monkeypatch):
+    # The shared vars are deliberately left unset/wrong here to prove the
+    # environment's own device_username_env/device_password_env win instead.
+    monkeypatch.setenv("NORNIR_USERNAME", "wrong-shared-user")
+    monkeypatch.setenv("NORNIR_PASSWORD", "wrong-shared-pass")
+    monkeypatch.setenv("BUNNYAUTO_SANDBOX_USERNAME", "nmtrooper1319")
+    monkeypatch.setenv("BUNNYAUTO_SANDBOX_PASSWORD", "sandbox-secret")
+    monkeypatch.setenv("BUNNYAUTO_SANDBOX_NB_TOKEN", "tok")
+
+    env = Environment(
+        name="sandbox",
+        nb_url="https://nb.example.com",
+        default_tag="devnet-sandbox",
+        token_env="BUNNYAUTO_SANDBOX_NB_TOKEN",
+        device_username_env="BUNNYAUTO_SANDBOX_USERNAME",
+        device_password_env="BUNNYAUTO_SANDBOX_PASSWORD",
+    )
+    creds = preflight(env)
+    assert creds.username == "nmtrooper1319"
+    assert creds.password == "sandbox-secret"
+
+
+def test_preflight_falls_back_to_shared_vars_when_no_override_set(env_file, monkeypatch):
+    monkeypatch.setenv("NORNIR_USERNAME", "alice")
+    monkeypatch.setenv("NORNIR_PASSWORD", "secret")
+    monkeypatch.setenv("BUNNYAUTO_TEST_NB_TOKEN", "tok")
+    creds = preflight(resolve_environment("test", env_file))
+    assert creds.username == "alice"
 
 
 # ---------------------------------------------------------------------------

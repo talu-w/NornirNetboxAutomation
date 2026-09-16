@@ -10,12 +10,13 @@ reading ``argv``.
 from __future__ import annotations
 
 import argparse
+import os
 from collections.abc import Callable, Mapping
 
 from bunnyauto.context import build_context
 from bunnyauto.environments import Environment, load_environments
 from bunnyauto.errors import BunnyautoError, ToolError
-from bunnyauto.preflight import preflight_device_credentials
+from bunnyauto.preflight import USERNAME_VAR
 from bunnyauto.reporting import Reporter, make_reporter
 from bunnyauto.tools import REGISTRY
 from bunnyauto.tools.base import COMMON_ARG_DESTS, Tool, timeouts_from_args
@@ -35,16 +36,24 @@ def main(argv: list[str] | None = None, *, input_fn: InputFn = input) -> int:
     reporter.say("bunnyauto — interactive hub")
 
     try:
-        username, _ = preflight_device_credentials()
         environments = load_environments(args.env_file)
     except BunnyautoError as exc:
         reporter.say(exc.friendly())
         return 1
 
-    reporter.say(f"  device login: {username}")
+    # Informational only — device creds may be per-environment now (a DevNet
+    # sandbox with its own realm), so a tool that actually needs them is what
+    # validates for real, at run time, one environment at a time.
     for env in environments.values():
-        state = "set" if env.token else "NOT set — reads/writes to this network will fail"
-        reporter.say(f"  {env.token_env}: {state}")
+        username_var = env.device_username_env or USERNAME_VAR
+        device_user = os.getenv(username_var, "").strip()
+        device_state = (
+            f"{device_user} ({username_var})" if device_user else f"NOT set ({username_var})"
+        )
+        token_state = "set" if env.token else "NOT set — reads/writes to this network will fail"
+        reporter.say(
+            f"  [{env.name}] device login: {device_state}  |  {env.token_env}: {token_state}"
+        )
 
     while True:
         try:

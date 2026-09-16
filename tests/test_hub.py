@@ -174,10 +174,16 @@ def test_choose_environment_reprompts_on_junk(env_file):
 # ---------------------------------------------------------------------------
 
 
-def test_main_missing_credentials_exits_1(env_file, capsys):
+def test_main_shows_missing_credentials_but_still_opens_the_menu(env_file, capsys):
+    # No device creds set anywhere: the hub no longer hard-fails at startup
+    # (creds may be per-environment now) — it shows status and still opens
+    # the network menu; an actual tool run is what enforces for real.
     code = hub.main(["--env-file", str(env_file)], input_fn=_Script())
-    assert code == 1
-    assert "NORNIR_USERNAME" in capsys.readouterr().out
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "NORNIR_USERNAME" in out
+    assert "NOT set" in out
+    assert "Which network?" in out
 
 
 def test_main_runs_a_tool_then_quits(env_file, creds, monkeypatch):

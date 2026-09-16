@@ -42,6 +42,8 @@ _ALLOWED_KEYS = {
     "fw_url",
     "fw_token_env",
     "aruba_url",
+    "device_username_env",
+    "device_password_env",
 }
 
 
@@ -62,6 +64,12 @@ class Environment:
     #: Auth is the shared device login (NORNIR_USERNAME / NORNIR_PASSWORD), so
     #: there is no separate token-env key.
     aruba_url: str | None = None
+    #: Names of the env vars holding this environment's device login, when it
+    #: has its own realm distinct from the shared NORNIR_USERNAME/PASSWORD
+    #: (e.g. a Cisco DevNet sandbox with its own fixed creds). Unset means
+    #: "use the shared vars" — the common case for test/prod, one AAA realm.
+    device_username_env: str | None = None
+    device_password_env: str | None = None
 
     @property
     def token(self) -> str | None:
@@ -175,6 +183,15 @@ def _build_environment(name: str, body: Any, file_path: Path) -> Environment:
             f"{file_path}: environment {name!r} aruba_url must start with http:// or https://"
         )
 
+    device_username_env = str(body.get("device_username_env") or "").strip() or None
+    device_password_env = str(body.get("device_password_env") or "").strip() or None
+    if bool(device_username_env) != bool(device_password_env):
+        raise ConfigError(
+            f"{file_path}: environment {name!r} sets one of 'device_username_env' / "
+            f"'device_password_env' but not the other — set both, or neither to use "
+            f"the shared NORNIR_USERNAME/NORNIR_PASSWORD"
+        )
+
     return Environment(
         name=name,
         nb_url=nb_url,
@@ -184,4 +201,6 @@ def _build_environment(name: str, body: Any, file_path: Path) -> Environment:
         fw_url=fw_url,
         fw_token_env=fw_token_env,
         aruba_url=aruba_url,
+        device_username_env=device_username_env,
+        device_password_env=device_password_env,
     )
