@@ -123,6 +123,10 @@ def main() -> None:
             print(f"Content-Type: {resp.headers.get('Content-Type')!r}")
             print(f"Content-Encoding: {resp.headers.get('Content-Encoding')!r}")
 
+            request_count += 1
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            file_stem = f"{timestamp}_{request_count:02d}"
+
             try:
                 body = resp.json()
             except ValueError:
@@ -137,20 +141,21 @@ def main() -> None:
                             "_first_bytes_hex": raw[:32].hex(),
                         }
                 else:
+                    html_file = OUTPUT_DIR / f"{file_stem}.html"
+                    html_file.write_bytes(raw)
                     body = {
-                        "_non_json_response_text": resp.text,
+                        "_non_json_response_text_saved_to": str(html_file),
+                        "_first_300_chars": resp.text[:300],
                         "_first_bytes_hex": raw[:32].hex(),
                     }
 
-            request_count += 1
             record = {
                 "request": {"url": url, "params": params},
                 "status_code": resp.status_code,
                 "response": body,
             }
 
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            out_file = OUTPUT_DIR / f"{timestamp}_{request_count:02d}.json"
+            out_file = OUTPUT_DIR / f"{file_stem}.json"
             with out_file.open("w") as f:
                 json.dump(record, f, indent=2)
 
