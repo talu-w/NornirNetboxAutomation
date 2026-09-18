@@ -13,6 +13,7 @@ both printed and saved to a file.
 """
 
 import getpass
+import gzip
 import json
 import sys
 from datetime import datetime
@@ -103,7 +104,14 @@ def main() -> None:
                 resp = session.get(
                     url,
                     params=params,
-                    headers={"Accept": "application/json", "Content-Type": "application/json"},
+                    headers={
+                        "Accept": "application/json",
+                        "Content-Type": "application/json",
+                        # Some Conductor firmware mislabels its gzip Content-Encoding,
+                        # which makes requests hand back raw compressed bytes as "text"
+                        # (looks like gibberish). Ask it not to compress at all.
+                        "Accept-Encoding": "identity",
+                    },
                     verify=verify,
                     timeout=30,
                 )
@@ -112,11 +120,27 @@ def main() -> None:
                 continue
 
             print(f"Status: {resp.status_code}")
+            print(f"Content-Type: {resp.headers.get('Content-Type')!r}")
+            print(f"Content-Encoding: {resp.headers.get('Content-Encoding')!r}")
 
             try:
                 body = resp.json()
             except ValueError:
-                body = {"_non_json_response_text": resp.text}
+                raw = resp.content
+                if raw[:2] == b"\x1f\x8b":  # gzip magic bytes slipped through anyway
+                    try:
+                        body = json.loads(gzip.decompress(raw))
+                    except Exception:
+                        body = {
+                            "_non_json_response_text": resp.text,
+                            "_note": "looked gzip-compressed but failed to decompress/parse",
+                            "_first_bytes_hex": raw[:32].hex(),
+                        }
+                else:
+                    body = {
+                        "_non_json_response_text": resp.text,
+                        "_first_bytes_hex": raw[:32].hex(),
+                    }
 
             request_count += 1
             record = {
