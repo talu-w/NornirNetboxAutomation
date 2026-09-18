@@ -72,6 +72,10 @@ def main() -> None:
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
     session = requests.Session()
+    # The Conductor returns HTML instead of JSON unless the client explicitly
+    # asks for JSON — the login POST stays form-encoded (Content-Type: application/json
+    # there would mislabel the form body), but every GET explicitly requests JSON.
+    session.headers.update({"Accept": "application/json"})
 
     print("\nLogging in...")
     token = login(session, base_url, username, password, verify)
@@ -96,7 +100,13 @@ def main() -> None:
             print(f"params: {params}")
 
             try:
-                resp = session.get(url, params=params, verify=verify, timeout=30)
+                resp = session.get(
+                    url,
+                    params=params,
+                    headers={"Accept": "application/json", "Content-Type": "application/json"},
+                    verify=verify,
+                    timeout=30,
+                )
             except requests.RequestException as exc:
                 print(f"Request failed: {exc}")
                 continue
