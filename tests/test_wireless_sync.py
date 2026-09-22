@@ -91,13 +91,19 @@ def _nb(
     devices=(),
     tags=("wireless",),
     with_role=True,
+    with_wlc_role=True,
     prefixes=(),
     ip_addresses=(),
     interfaces=(),
     interface_templates=(),
 ):
+    roles = []
+    if with_role:
+        roles.append(_Rec(id=7, slug="wireless", name="Wireless"))
+    if with_wlc_role:
+        roles.append(_Rec(id=8, slug="wireless-controller", name="Wireless Controller"))
     return _NB(
-        roles=[_Rec(id=7, slug="wireless", name="Wireless")] if with_role else [],
+        roles=roles,
         sites=[
             _Rec(id=1, slug="hq", name="Headquarters"),
             _Rec(id=2, slug="branch-north", name="Branch North"),
@@ -186,6 +192,29 @@ def test_missing_role(monkeypatch):
     _fake_client(monkeypatch, aps=[AP])
     with pytest.raises(ToolError, match="device role with slug 'wireless'"):
         TOOL.run(_Ctx(_nb(with_role=False)), _args())
+
+
+def test_missing_wlc_role_blocks_wlc_creation(monkeypatch):
+    _fake_client(monkeypatch, switches=[WLC])
+    with pytest.raises(ToolError, match="device role with slug 'wireless-controller'"):
+        TOOL.run(_Ctx(_nb(with_wlc_role=False)), _args())
+
+
+def test_missing_wlc_role_does_not_block_an_ap_only_run(monkeypatch):
+    """The wireless-controller role is only required when a run actually
+    needs to create one — an AP-only run needs neither it nor a lookup."""
+    _fake_client(monkeypatch, aps=[AP])
+    result = TOOL.run(_Ctx(_nb(with_wlc_role=False)), _args())
+    assert result.status is Status.DRIFT
+
+
+def test_wlc_creation_uses_the_controller_role(monkeypatch):
+    _fake_client(monkeypatch, switches=[WLC])
+    nb = _nb()
+    result = TOOL.run(_Ctx(nb, apply=True), _args())
+    assert result.status is Status.CHANGED
+    (body,) = nb.dcim.devices.created
+    assert body["role"] == 8
 
 
 def test_login_failure_propagates(monkeypatch):

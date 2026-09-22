@@ -2,6 +2,14 @@
 
 Pure — no I/O. AOS field names drift between versions, so every lookup tries a
 list of spellings and tolerates missing keys.
+
+``WirelessDevice.os_version``'s candidate field names are provisional —
+unlike the LLDP command name in :mod:`bunnyauto.aruba.lldp` (confirmed
+2026-09-22 against real hardware), no live AOS 8 ``show ap database long``
+output has been checked for its actual software-version column name yet. An
+AP with no recognized version field just gets ``os_version=""`` (skipped
+downstream, never a guess) — same rule as the AP-IP-never-falls-back-to-the-
+switch-IP fix below.
 """
 
 from __future__ import annotations
@@ -24,6 +32,11 @@ class WirelessDevice:
     ip: str
     kind: str  # "ap" | "wlc"
     status: str
+    #: Raw software/image version string as the Conductor reports it (e.g. an
+    #: AOS 8 build string) — matched against existing NetBox Platforms by
+    #: wireless-enrich, never used to create one. Empty if no recognized
+    #: version field was present on this row.
+    os_version: str = ""
 
     @property
     def model_candidates(self) -> list[str]:
@@ -65,6 +78,9 @@ def parse_ap_database(payload: dict[str, Any] | list[dict[str, Any]]) -> list[Wi
                 ip=_get(row, "IP Address", "IP", "AP IP Address", "AP IP"),
                 kind="ap",
                 status=_get(row, "Status", "State"),
+                os_version=_get(
+                    row, "Software Version", "AP Image Version", "Image Version", "Version"
+                ),
             )
         )
     return devices

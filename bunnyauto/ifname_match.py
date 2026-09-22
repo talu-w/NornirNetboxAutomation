@@ -1,0 +1,74 @@
+"""Match an LLDP-reported remote port name to a switch's actual NetBox interface.
+
+Pure — no I/O. An LLDP neighbor's port field can be the exact interface name
+(``GigabitEthernet1/0/24``) or a switch-vendor abbreviation of it
+(``Gi1/0/24``, ``gi 1/0/24``) — which one depends on the neighboring switch's
+own LLDP configuration, not on anything Aruba controls. An exact
+(case-insensitive) match is tried first; failing that, both sides are
+normalized by expanding known family abbreviations before comparing. No match,
+or more than one NetBox interface normalizing the same way, returns ``None`` —
+same "never guess" rule as the rest of this project's matching helpers.
+"""
+
+from __future__ import annotations
+
+import re
+
+_LEADING_ALPHA = re.compile(r"^([a-z]+)\s*(.*)$")
+
+#: Cisco-style port-family abbreviations, longest/most-specific first so e.g.
+#: "te" is not swallowed by a shorter alias that doesn't apply to it.
+_FAMILY_ALIASES: tuple[tuple[str, str], ...] = (
+    ("hundredgigabitethernet", "hundredgigabitethernet"),
+    ("twentyfivegigabitethernet", "twentyfivegigabitethernet"),
+    ("tengigabitethernet", "tengigabitethernet"),
+    ("gigabitethernet", "gigabitethernet"),
+    ("fastethernet", "fastethernet"),
+    ("hu", "hundredgigabitethernet"),
+    ("twe", "twentyfivegigabitethernet"),
+    ("te", "tengigabitethernet"),
+    ("gi", "gigabitethernet"),
+    ("ge", "gigabitethernet"),
+    ("fa", "fastethernet"),
+    ("fe", "fastethernet"),
+    ("eth", "ethernet"),
+    ("et", "ethernet"),
+)
+
+
+def normalize_port_name(value: str) -> str:
+    """Lowercase, strip whitespace/separators, expand a known family alias.
+
+    ``"Gi1/0/24"`` and ``"GigabitEthernet 1/0/24"`` both normalize to
+    ``"gigabitethernet1/0/24"``. A prefix that matches no known alias is kept
+    as-is (lowercased), so an exact match still works for anything this
+    module doesn't know about.
+    """
+    text = str(value).strip().casefold()
+    match = _LEADING_ALPHA.match(text)
+    if not match:
+        return text
+    prefix, rest = match.group(1), match.group(2).strip()
+    for alias, expansion in _FAMILY_ALIASES:
+        if prefix == alias:
+            return f"{expansion}{rest}"
+    return f"{prefix}{rest}"
+
+
+def match_interface(remote_port: str, interface_names: list[str]) -> str | None:
+    """Return the one interface name matching ``remote_port``, or ``None``."""
+    target = str(remote_port).strip().casefold()
+    if not target:
+        return None
+
+    exact = [name for name in interface_names if name.strip().casefold() == target]
+    if len(exact) == 1:
+        return exact[0]
+    if len(exact) > 1:
+        return None
+
+    normalized_target = normalize_port_name(remote_port)
+    normalized_matches = [
+        name for name in interface_names if normalize_port_name(name) == normalized_target
+    ]
+    return normalized_matches[0] if len(normalized_matches) == 1 else None

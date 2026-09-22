@@ -112,3 +112,14 @@ def test_showcommand_http_error():
     client = ArubaConductorClient("https://c:4343", "u", "p")
     with pytest.raises(ArubaError, match="HTTP 500"):
         client.switches()
+
+
+def test_ap_lldp_neighbors_returns_rows():
+    _FakeSession.script["login"] = _ok_login()
+    _FakeSession.script["get"] = _Resp(
+        200, {"AP LLDP Neighbors": [{"AP Name": "ap1", "Neighbor System Name": "sw1"}]}
+    )
+    client = ArubaConductorClient("https://c:4343", "u", "p")
+    rows = client.ap_lldp_neighbors()
+    assert rows == [{"AP Name": "ap1", "Neighbor System Name": "sw1"}]
+    assert ("GET", "https://c:4343/v1/configuration/showcommand") in client._session.calls

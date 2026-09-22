@@ -4,7 +4,11 @@ Reads the Conductor's device inventory over its read-only REST API
 (``show switches`` + ``show ap database long``), compares it to NetBox by serial
 then name, and:
 
-* creates every WLC/AP NetBox is missing — role ``wireless``, device type matched
+* creates every WLC/AP NetBox is missing — a WLC gets the ``wireless-controller``
+  role, an AP gets the ``wireless`` role (split 2026-09-22 so a tool like
+  ``wireless-enrich`` can select just the controllers; only whichever role a
+  run actually needs to create is required to pre-exist — a run that only
+  tags already-existing devices needs neither). Device type matched
   from the Aruba model string (e.g. Aruba's bare ``"655"`` against a device
   type with model ``"Aruba AP-655"`` / slug ``"hpe-aruba-ap-655"`` — a
   token-boundary *contains*, not an exact match; see
@@ -67,7 +71,9 @@ if TYPE_CHECKING:
     from bunnyauto.context import Context
 
 _TAG_SLUG = "wireless"
-_ROLE_SLUG = "wireless"
+_AP_ROLE_SLUG = "wireless"
+_WLC_ROLE_SLUG = "wireless-controller"
+_ROLE_SLUG_BY_KIND = {"ap": _AP_ROLE_SLUG, "wlc": _WLC_ROLE_SLUG}
 #: Used only when a device has no wired interface at all — no template, and no
 #: --ip-interface override. Should be rare once device types carry real templates.
 _FALLBACK_INTERFACE_NAME = "Ethernet0"
@@ -154,13 +160,6 @@ class WirelessSync:
         nb = ctx.netbox()
         apply = ctx.settings.apply
 
-        role = nb.dcim.device_roles.get(slug=_ROLE_SLUG)
-        if role is None:
-            raise ToolError(
-                f"NetBox has no device role with slug {_ROLE_SLUG!r}",
-                fix=f"create a {_ROLE_SLUG!r} device role in NetBox first",
-            )
-
         sites = [
             Site(slug=str(s.slug), id=int(s.id), name=str(s.name)) for s in nb.dcim.sites.all()
         ]
@@ -225,6 +224,15 @@ class WirelessSync:
             )
             for d in wireless
         ]
+
+        # Only require a role to exist if this run actually needs to create a
+        # device of that kind — a run that only tags or is all in-sync needs
+        # neither, and one that only ever creates APs doesn't need the WLC
+        # role (or vice versa).
+        role_by_kind: dict[str, Any] = {}
+        for kind in ("ap", "wlc"):
+            if any(o.action == "create" and o.device.kind == kind for o in outcomes):
+                role_by_kind[kind] = _require_role(nb, _ROLE_SLUG_BY_KIND[kind])
 
         # -- ensure the tag exists --------------------------------------
         changes: list[str] = []
@@ -297,7 +305,7 @@ class WirelessSync:
                         name=d.name,
                         device_type_id=out.device_type_id,
                         role_key=role_key,
-                        role_id=int(role.id),
+                        role_id=int(role_by_kind[d.kind].id),
                         site_id=int(sites_by_slug[out.site.casefold()].id),
                         serial=d.serial,
                         status=args.status,
@@ -423,6 +431,16 @@ class WirelessSync:
             ip_note=ip_note,
             ip_interface=ip_interface,
         )
+
+
+def _require_role(nb: Any, slug: str) -> Any:
+    role = nb.dcim.device_roles.get(slug=slug)
+    if role is None:
+        raise ToolError(
+            f"NetBox has no device role with slug {slug!r}",
+            fix=f"create a {slug!r} device role in NetBox first",
+        )
+    return role
 
 
 def _load_prefixes(nb: Any) -> list[Prefix]:

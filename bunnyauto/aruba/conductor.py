@@ -5,6 +5,13 @@ commands, log out. Only that is exposed here. Every failure is turned into an
 :class:`~bunnyauto.errors.ArubaError` so the entry points render one line, never
 a traceback.
 
+Despite the name, this class talks to any AOS 8 box running this API — the
+Conductor itself, or one of its managed WLCs directly (each runs the identical
+``/v1/api/login`` -> ``UIDARUBA`` -> ``/v1/configuration/showcommand`` service).
+``wireless-enrich`` points one at a WLC's own NetBox-recorded IP to reach
+per-AP data (LLDP neighbors, software version) that the Conductor's own
+aggregated view doesn't carry.
+
 Auth is the shared device login (``NORNIR_USERNAME`` / ``NORNIR_PASSWORD``). The
 password is sent as POST form data — never in a URL or in argv — and the session
 token (``UIDARUBA``) plus cookie are held on the :class:`requests.Session`.
@@ -120,6 +127,11 @@ class ArubaConductorClient:
     def switches(self) -> list[dict[str, Any]]:
         """Rows from ``show switches`` (the controllers the Conductor manages)."""
         return _rows(self.showcommand("show switches"))
+
+    def ap_lldp_neighbors(self) -> list[dict[str, Any]]:
+        """Rows from ``show ap lldp neighbors`` (confirmed against real AOS 8
+        hardware 2026-09-22) — each AP's wired LLDP neighbor, if any."""
+        return _rows(self.showcommand("show ap lldp neighbors"))
 
     def showcommand(self, command: str) -> dict[str, Any]:
         """Run one ``show`` command and return the parsed JSON object."""
