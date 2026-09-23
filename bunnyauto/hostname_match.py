@@ -43,3 +43,33 @@ def match_hostname_candidates(candidates: list[str], devices: list[Any]) -> Any 
         if match is not None:
             return match
     return None
+
+
+def with_stack_suffix(candidates: list[str], member: str | None) -> list[str]:
+    """Expand each candidate with a ``<candidate>-<member>`` form tried first.
+
+    A virtually-stacked switch's chassis reports one shared LLDP identity for
+    the whole stack (its base hostname, no per-member suffix) — but each
+    stack member is deliberately kept as its own separate NetBox device
+    named ``<hostname>-<member>``, never collapsed to one shared name, since
+    different neighbors can be homed to different physical members of the
+    same stack (confirmed 2026-09-23: renaming NetBox devices to drop the
+    suffix is not the fix). The member-suffixed form is tried *first* when a
+    member hint is available (see
+    :func:`bunnyauto.ifname_match.stack_member_hint`) so a coincidentally
+    bare-named device elsewhere in NetBox never wins over the actual stack
+    member; the raw candidate is kept as a fallback for a switch that isn't
+    stacked at all. A ``None``/falsy ``member`` returns the candidates
+    unchanged.
+    """
+    if not member:
+        return list(candidates)
+    expanded: list[str] = []
+    for candidate in candidates:
+        suffixed = f"{candidate}-{member}"
+        if suffixed not in expanded:
+            expanded.append(suffixed)
+    for candidate in candidates:
+        if candidate not in expanded:
+            expanded.append(candidate)
+    return expanded

@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from bunnyauto.hostname_match import match_hostname, match_hostname_candidates, normalize_hostname
+from bunnyauto.hostname_match import (
+    match_hostname,
+    match_hostname_candidates,
+    normalize_hostname,
+    with_stack_suffix,
+)
 
 
 def test_normalize_hostname_strips_domain_and_casefolds():
@@ -54,3 +59,25 @@ def test_match_hostname_candidates_first_match_wins():
 def test_match_hostname_candidates_none_resolve():
     devices = [SimpleNamespace(name="hq-idf1-sw01")]
     assert match_hostname_candidates(["nope", "still-nope"], devices) is None
+
+
+def test_with_stack_suffix_prepends_suffixed_form():
+    assert with_stack_suffix(["hq-idf1-sw01"], "1") == ["hq-idf1-sw01-1", "hq-idf1-sw01"]
+
+
+def test_with_stack_suffix_no_member_leaves_candidates_unchanged():
+    assert with_stack_suffix(["hq-idf1-sw01"], None) == ["hq-idf1-sw01"]
+    assert with_stack_suffix(["hq-idf1-sw01"], "") == ["hq-idf1-sw01"]
+
+
+def test_with_stack_suffix_end_to_end_resolves_the_correct_member():
+    """The stack's chassis reports one bare name; each member is its own
+    NetBox device — the suffixed form must resolve, and must resolve to the
+    *correct* member, not just any device on the stack."""
+    devices = [
+        SimpleNamespace(name="hq-idf1-sw01-1"),
+        SimpleNamespace(name="hq-idf1-sw01-2"),
+    ]
+    candidates = with_stack_suffix(["hq-idf1-sw01"], "2")
+    match = match_hostname_candidates(candidates, devices)
+    assert match is devices[1]

@@ -39,11 +39,22 @@ For each AP a WLC reports (``show ap database long``):
   port in either ``Port ID`` or ``Port Desc`` — every candidate is tried in
   turn (``bunnyauto/hostname_match.py`` / ``bunnyauto/ifname_match.py``'s
   ``*_candidates`` functions) and the first one that resolves against NetBox
-  wins. If both resolve and neither interface already has a **Cable**, one is
-  created between the AP's first wired interface and the matched switch
-  port. An interface that already has a cable is **never touched** —
-  reported as an informational note, not a failure, since deliberately not
-  touching existing physical wiring beats risking a silent mis-correction.
+  wins. A virtually-stacked switch reports one shared chassis identity for
+  the whole stack (its base hostname, no per-member suffix), but each stack
+  member is kept as its own NetBox device named ``<hostname>-<member>`` —
+  never collapsed to one shared name, since different APs can be homed to
+  different members of the same stack. The member number is derived from the
+  port id's own ``<member>/<module>/<port>`` shape
+  (``bunnyauto/ifname_match.py``'s ``stack_member_hint()``) and tried as a
+  ``<hostname>-<member>`` candidate before the bare hostname
+  (``bunnyauto/hostname_match.py``'s ``with_stack_suffix()``), so a
+  coincidentally bare-named device elsewhere in NetBox never wins over the
+  actual stack member. If both device and port resolve and neither interface
+  already has a **Cable**, one is created between the AP's first wired
+  interface and the matched switch port. An interface that already has a
+  cable is **never touched** — reported as an informational note, not a
+  failure, since deliberately not touching existing physical wiring beats
+  risking a silent mis-correction.
 
 A WLC that returns no AP data at all (no APs, or none with LLDP neighbors) is
 reported as an informational note, not an error — not every WLC in the fleet
@@ -69,8 +80,8 @@ from bunnyauto.aruba.lldp import LldpNeighbor, parse_lldp_neighbors
 from bunnyauto.common import env_flag
 from bunnyauto.devicetype_match import match_device_type
 from bunnyauto.errors import ArubaError, ToolError
-from bunnyauto.hostname_match import match_hostname_candidates
-from bunnyauto.ifname_match import match_interface_candidates
+from bunnyauto.hostname_match import match_hostname_candidates, with_stack_suffix
+from bunnyauto.ifname_match import match_interface_candidates, stack_member_hint
 from bunnyauto.interface_match import pick_wired_interface
 from bunnyauto.tools.base import Status, ToolResult
 
@@ -411,11 +422,18 @@ def _plan_cable(
     if lldp is None:
         return _CablePlan(action="none", note="no LLDP neighbor reported for this AP")
 
-    switch = match_hostname_candidates(lldp.remote_system_candidates, all_devices)
+    member_hint = None
+    for port_candidate in lldp.remote_port_candidates:
+        member_hint = stack_member_hint(port_candidate)
+        if member_hint:
+            break
+    system_candidates = with_stack_suffix(lldp.remote_system_candidates, member_hint)
+
+    switch = match_hostname_candidates(system_candidates, all_devices)
     if switch is None:
         return _CablePlan(
             action="blocked",
-            note=f"LLDP neighbor {lldp.remote_system_candidates!r} matched no NetBox device",
+            note=f"LLDP neighbor {system_candidates!r} matched no NetBox device",
         )
 
     switch_id = int(switch.id)

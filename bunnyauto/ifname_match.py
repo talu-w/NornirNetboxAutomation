@@ -8,6 +8,13 @@ own LLDP configuration, not on anything Aruba controls. An exact
 normalized by expanding known family abbreviations before comparing. No match,
 or more than one NetBox interface normalizing the same way, returns ``None`` —
 same "never guess" rule as the rest of this project's matching helpers.
+
+Also home to :func:`stack_member_hint`, which reads the stack-member number
+back out of a ``<member>/<module>/<port>``-shaped port id (confirmed
+2026-09-23 against real stacked switches) — used by ``wireless-enrich`` /
+:mod:`bunnyauto.hostname_match` to find the correct *member's* NetBox device
+in a virtual stack, since a stack's whole chassis shares one LLDP identity
+but each member is its own NetBox device.
 """
 
 from __future__ import annotations
@@ -15,6 +22,11 @@ from __future__ import annotations
 import re
 
 _LEADING_ALPHA = re.compile(r"^([a-z]+)\s*(.*)$")
+#: <member>/<module>/<port> — exactly three numeric segments, the Cisco/Aruba
+#: stacking convention (e.g. "1/0/24" -> stack member "1"). Deliberately
+#: requires all three segments so a plain <module>/<port> name on a
+#: non-stacked switch (e.g. "0/24") is never mistaken for a member number.
+_STACK_MEMBER_PORT = re.compile(r"^[a-z]*(\d+)/\d+/\d+$")
 
 #: Cisco-style port-family abbreviations, longest/most-specific first so e.g.
 #: "te" is not swallowed by a shorter alias that doesn't apply to it.
@@ -72,6 +84,25 @@ def match_interface(remote_port: str, interface_names: list[str]) -> str | None:
         name for name in interface_names if normalize_port_name(name) == normalized_target
     ]
     return normalized_matches[0] if len(normalized_matches) == 1 else None
+
+
+def stack_member_hint(port_name: str) -> str | None:
+    """The stack-member number embedded in a <member>/<module>/<port> port id.
+
+    A virtually-stacked switch's chassis reports one shared LLDP identity for
+    the whole stack, but the *port* naming convention still encodes which
+    physical member owns that port — e.g. ``"Gi1/0/24"`` /
+    ``"GigabitEthernet1/0/24"`` is stack member ``"1"``, module ``0``, port
+    ``24``. Runs on the family-normalized name so any recognized (or
+    unrecognized-but-still-3-segment) prefix works the same way. Requires the
+    *full* three-segment shape — a two-segment ``<module>/<port>`` name (a
+    non-stacked switch) never yields a hint, since there is no way to tell a
+    bare module number from a stack-member number by shape alone. ``None``
+    means "no hint available", never a wrong guess.
+    """
+    normalized = normalize_port_name(port_name)
+    match = _STACK_MEMBER_PORT.match(normalized)
+    return match.group(1) if match else None
 
 
 def match_interface_candidates(candidates: list[str], interface_names: list[str]) -> str | None:

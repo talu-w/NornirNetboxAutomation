@@ -360,6 +360,70 @@ def test_cable_falls_back_to_chassis_id_when_chassis_name_does_not_match(monkeyp
     assert any("would create cable" in c for c in result.changes)
 
 
+def test_cable_resolves_the_correct_stack_member(monkeypatch):
+    """A virtual stack shares one LLDP chassis identity ('hq-idf1-sw01', no
+    suffix) but each member is its own NetBox device ('hq-idf1-sw01-1',
+    '...-2', ...). The member number embedded in the 3-segment Port ID must
+    pick the *correct* member device, not just any device on the stack, and
+    must never require renaming the NetBox devices to drop their suffix."""
+    row = {
+        "AP": "hq-idf1-ap01",
+        "Chassis Name/ID": "hq-idf1-sw01",  # bare — no per-member suffix
+        "Port ID": "GigabitEthernet2/0/24",  # member 2
+    }
+    _fake_client(monkeypatch, aps=[AP_ROW], lldp=[row])
+    ap_device = _ap()
+    member1 = _switch(name="hq-idf1-sw01-1", id_=201)
+    member2 = _switch(name="hq-idf1-sw01-2", id_=202)
+    ap_iface = _Rec(id=300, device_id=100, name="E0", type="5gbase-t", cable=None)
+    # an interface with the same name exists on BOTH members — the member
+    # picked from the port id must decide which device's interface is used.
+    member1_iface = _Rec(
+        id=401, device_id=201, name="GigabitEthernet2/0/24", type="1000base-t", cable=None
+    )
+    member2_iface = _Rec(
+        id=402, device_id=202, name="GigabitEthernet2/0/24", type="1000base-t", cable=None
+    )
+    nb = _nb(
+        wlcs=[_wlc()],
+        other_devices=[ap_device, member1, member2],
+        interfaces=[ap_iface, member1_iface, member2_iface],
+    )
+    result = TOOL.run(_Ctx(nb, apply=True), _args())
+    assert result.status is Status.CHANGED
+    (body,) = nb.dcim.cables.created
+    assert body["b_terminations"] == [{"object_type": "dcim.interface", "object_id": 402}]
+    assert (
+        result.data["hq-wlc01"]["hq-idf1-ap01"]["cable"] == "hq-idf1-sw01-2:GigabitEthernet2/0/24"
+    )
+
+
+def test_cable_falls_back_to_bare_hostname_when_switch_is_not_stacked(monkeypatch):
+    """A 3-segment port id still yields a member hint even for a switch that
+    turns out not to be stacked in NetBox — the bare-hostname fallback must
+    still resolve it rather than blocking."""
+    row = {
+        "AP": "hq-idf1-ap01",
+        "Chassis Name/ID": "hq-idf1-sw01",
+        "Port ID": "GigabitEthernet1/0/24",
+    }
+    _fake_client(monkeypatch, aps=[AP_ROW], lldp=[row])
+    ap_device = _ap()
+    switch = _switch(name="hq-idf1-sw01")  # no "-1" suffix — not stacked
+    ap_iface = _Rec(id=300, device_id=100, name="E0", type="5gbase-t", cable=None)
+    switch_iface = _Rec(
+        id=400, device_id=200, name="GigabitEthernet1/0/24", type="1000base-t", cable=None
+    )
+    nb = _nb(
+        wlcs=[_wlc()],
+        other_devices=[ap_device, switch],
+        interfaces=[ap_iface, switch_iface],
+    )
+    result = TOOL.run(_Ctx(nb), _args())
+    assert result.status is Status.DRIFT
+    assert any("would create cable" in c for c in result.changes)
+
+
 def test_no_lldp_row_is_informational(monkeypatch):
     _fake_client(monkeypatch, aps=[AP_ROW], lldp=[])
     nb = _nb(wlcs=[_wlc()], other_devices=[_ap()])
