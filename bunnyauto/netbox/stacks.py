@@ -8,7 +8,10 @@ own device. A port belongs to the member whose number it carries
 the member devices for the device a tool connected to, trying in order:
 
 1. **its NetBox Virtual Chassis**: a member's ``vc_position`` is its member
-   number. That is explicit modeling, so it is trusted as-is.
+   number. That is explicit modeling, so it is trusted as-is, scope included:
+   every member of the in-scope switch's chassis is part of that switch, even
+   one without the env tag or a role in the branch (NetBox doesn't copy tags to
+   a member added to a chassis). Those are listed in :attr:`Stack.inherited`.
 2. **the owner's naming convention**, ``<host>-<member>[.<domain>]``
    (``SwitchA-2.example.com`` is member 2 of ``SwitchA``, see
    :func:`bunnyauto.netbox.hostnames.split_stack_suffix`). A name alone doesn't
@@ -22,8 +25,8 @@ the member devices for the device a tool connected to, trying in order:
 Anything else is a standalone switch, or one NetBox device for a whole stack or
 modular chassis, and every port stays on the connected device.
 
-Member devices must be in the run's scope (env tag + role branch), the rule
-every tool follows. A member number with no in-scope device is *unresolved*:
+A member found by name must be in the run's scope (env tag + role branch),
+the rule every tool follows. A member number with no usable device is *unresolved*:
 its ports get no owner, and the reason is kept for the report. They are never
 handed to the connected device instead, which is a different physical switch.
 The one case where the connected device's copy of such a port *is* the port is
@@ -60,12 +63,15 @@ class Stack:
     source: str = ""
     #: The connected device's own member number (``None`` when standalone).
     own_member: int | None = None
-    #: Member number -> that member's in-scope NetBox device.
+    #: Member number -> that member's NetBox device.
     members: dict[int, Any] = field(default_factory=dict)
+    #: Virtual Chassis members outside the run's scope, included because the
+    #: switch they're part of is in it. Tools say so, since it bends the scope rule.
+    inherited: list[Any] = field(default_factory=list)
     #: Member number -> why no in-scope device owns that member's ports.
     unresolved: dict[int, str] = field(default_factory=dict)
     #: The unresolved members whose own NetBox device exists but can't be used
-    #: (outside the scope, or more than one candidate). Their ports live on that
+    #: (found by name but outside the scope, or more than one candidate). Their ports live on that
     #: device, so the connected device never stands in for them.
     claimed: set[int] = field(default_factory=set)
     #: The same for every route into one physical stack, so it's checked once.
@@ -159,7 +165,7 @@ def resolve_stack(
     scoped = {int(d.id): d for d in in_scope}
     chassis_id = related_id(getattr(device, "virtual_chassis", None))
     if chassis_id is not None:
-        return _from_virtual_chassis(nb, device, chassis_id, reported, scoped, scope_label)
+        return _from_virtual_chassis(nb, device, chassis_id, reported, scoped)
 
     parsed = split_stack_suffix(str(device.name))
     if parsed is not None and len(reported) > 1 and parsed[1] in reported and min(reported) > 0:
@@ -186,37 +192,35 @@ def _from_virtual_chassis(
     chassis_id: int,
     reported: set[int],
     scoped: dict[int, Any],
-    scope_label: str,
 ) -> Stack:
     chassis = nb.dcim.virtual_chassis.get(chassis_id)
     label = str(getattr(chassis, "name", "") or chassis_id)
     members: dict[int, Any] = {}
-    unresolved: dict[int, str] = {}
-    claimed: set[int] = set()
+    inherited: list[Any] = []
+    by_id: dict[int, Any] = {int(device.id): device}
     for member in nb.dcim.devices.filter(virtual_chassis_id=chassis_id):
+        member = scoped.get(int(member.id), member)
+        by_id[int(member.id)] = member
         position = _position(member)
         if position is None:
             continue
-        if int(member.id) in scoped:
-            members[position] = scoped[int(member.id)]
-        else:
-            claimed.add(position)
-            unresolved[position] = (
-                f"{member.name} (member {position} of Virtual Chassis {label!r}) "
-                f"is outside this run's scope{_scope_suffix(scope_label)}"
-            )
-    for position in reported - members.keys() - unresolved.keys():
-        unresolved[position] = f"Virtual Chassis {label!r} has no member at position {position}"
+        members[position] = member
+        if int(member.id) not in scoped:
+            inherited.append(member)
+    unresolved = {
+        position: f"Virtual Chassis {label!r} has no member at position {position}"
+        for position in reported - members.keys()
+    }
 
     master_id = related_id(getattr(chassis, "master", None))
     return Stack(
         connected=device,
-        anchor=scoped.get(master_id, device) if master_id is not None else device,
+        anchor=by_id.get(master_id, device) if master_id is not None else device,
         source="virtual-chassis",
         own_member=_position(device),
         members=members,
-        unresolved={m: why for m, why in unresolved.items() if m in reported},
-        claimed=claimed & reported,
+        inherited=inherited,
+        unresolved=unresolved,
         key=("virtual-chassis", chassis_id),
     )
 

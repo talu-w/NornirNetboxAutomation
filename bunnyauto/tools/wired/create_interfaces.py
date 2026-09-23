@@ -9,12 +9,15 @@ Name matching and the NetBox type a new interface gets both come from
 member as its own device (:mod:`bunnyauto.netbox.stacks`). A port is checked
 and created on the member whose number it carries (``Gi2/0/1`` -> ``SwitchA-2``).
 Ports without a member number (Port-Channels, VLANs, mgmt) go to the connected
-device, or a Virtual Chassis's master. A member with no in-scope NetBox device
-gets nothing. Its ports are reported, never parked on another member. A copy
-already on the connected device counts as present only when NetBox has no
-device of that member's own (:meth:`~bunnyauto.netbox.stacks.Stack.stand_in`,
-the rule ``sync-interfaces`` uses too). When the member's device exists but is
-out of scope, the copy is a leftover and the ports are reported.
+device, or a Virtual Chassis's master. Every member of the switch's Virtual
+Chassis counts, even one without the env tag (NetBox doesn't copy tags to a
+chassis member); a member found only by name must be in scope. A member with no
+usable NetBox device gets nothing. Its ports are reported, never parked on
+another member. A copy already on the connected device counts as present only
+when NetBox has no device of that member's own
+(:meth:`~bunnyauto.netbox.stacks.Stack.stand_in`, the rule ``sync-interfaces``
+uses too). When the member's device exists but is out of scope, the copy is a
+leftover and the ports are reported.
 
 **Already in NetBox** means present on the port's own device under the same
 name or spelling (``Gi1/0/1`` is ``GigabitEthernet1/0/1``). On a stack member it
@@ -221,6 +224,11 @@ class CreateInterfaces:
                 continue
 
             stacks_seen[stack.key] = host_name
+            if stack.inherited:
+                ctx.reporter.info(
+                    f"{host_name}: including {_names(stack.inherited)} as part of its "
+                    f"Virtual Chassis, though outside this run's scope ({scope_label})"
+                )
             for device_id in _classify(stack, discovered, index, plans, blocked):
                 checked_via.setdefault(device_id, host_name)
 
@@ -263,6 +271,10 @@ class CreateInterfaces:
             progressed=bool(stacks_seen) and (not ordered or any(not p.error for p in ordered)),
             created_total=created_total,
         )
+
+
+def _names(devices: list[Any]) -> str:
+    return ", ".join(sorted(str(device.name) for device in devices))
 
 
 def _interface_index(nb: Any, devices: list[Any]) -> dict[int, dict[str, str]]:

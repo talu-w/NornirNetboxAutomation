@@ -12,8 +12,9 @@ The NetBox client (``nb``) and the tagged Nornir inventory are supplied by the
 keeps each member as its own device. :func:`build_interface_search_scope`
 resolves the members with :func:`bunnyauto.netbox.stacks.resolve_stack`, the
 resolver ``create-interfaces`` uses (the device's Virtual Chassis, else the
-``<host>-<member>`` names), so both tools agree on where a port lives. Only
-devices in the run's scope are ever members. :func:`match_scoped_interface`
+``<host>-<member>`` names), so both tools agree on where a port lives. A member
+found by name must be in the run's scope; a Virtual Chassis member is part of
+the in-scope switch, so it counts even without the env tag. :func:`match_scoped_interface`
 matches a member's port on that member's device only, never on a same-named
 copy elsewhere in the stack.
 """
@@ -1380,10 +1381,10 @@ def build_interface_search_scope(
     """Resolve the switch's stack members and load each one's own interfaces.
 
     Membership comes from :func:`bunnyauto.netbox.stacks.resolve_stack`: the
-    device's Virtual Chassis, else the ``<host>-<member>`` names. Only
-    ``in_scope`` devices (the run's tag + role branch + region/site) are ever
-    members, so nothing outside the scope is loaded, matched or written.
-    ``scope_label`` names that scope in the reason for a member outside it.
+    device's Virtual Chassis, else the ``<host>-<member>`` names. A member found
+    by name must be ``in_scope`` (the run's tag + role branch + region/site); a
+    Virtual Chassis member of the in-scope switch counts even outside it, and
+    is logged. ``scope_label`` names the scope in those notes and reasons.
     """
 
     device = resolve_device(nb, collected)
@@ -1399,6 +1400,13 @@ def build_interface_search_scope(
             collected.inventory_name,
             "Virtual Chassis" if stack.source == "virtual-chassis" else "<host>-<member> names",
             members,
+        )
+    if stack.inherited:
+        LOGGER.info(
+            "%s: including %s as part of its Virtual Chassis, though outside this run's scope (%s)",
+            collected.inventory_name,
+            ", ".join(sorted(str(member.name) for member in stack.inherited)),
+            scope_label,
         )
     return InterfaceSearchScope(
         stack=stack,

@@ -120,7 +120,8 @@ def test_virtual_chassis_positions_and_master():
     assert stack.unresolved == {3: "Virtual Chassis 'bldg-a' has no member at position 3"}
 
 
-def test_virtual_chassis_member_outside_the_scope_is_unresolved():
+def test_virtual_chassis_member_outside_the_scope_is_part_of_the_switch():
+    # NetBox doesn't copy tags to a chassis member: bottom lacks the env tag.
     top = _device(10, "bldg-a-top", chassis=7, position=1)
     bottom = _device(11, "bldg-a-bottom", chassis=7, position=2)
     chassis = {7: SimpleNamespace(name="bldg-a", master={"id": 11})}
@@ -128,9 +129,18 @@ def test_virtual_chassis_member_outside_the_scope_is_unresolved():
 
     stack = resolve_stack(nb, top, {1, 2}, [top])
 
+    assert stack.owner("Gi2/0/1") is bottom
+    assert stack.inherited == [bottom]
+    assert stack.unresolved == {}
+    assert stack.anchor is bottom  # the chassis master, in scope or not
+
+
+def test_name_based_member_outside_the_scope_is_not_inherited():
+    # Without a Virtual Chassis a name is only inference, so scope still applies.
+    stack = resolve_stack(_NB(everywhere=[A1, A2]), A1, {1, 2}, [A1])
+
     assert stack.owner("Gi2/0/1") is None
-    assert stack.unresolved[2].startswith("bldg-a-bottom (member 2 of Virtual Chassis 'bldg-a')")
-    assert stack.anchor is top  # an out-of-scope master never receives ports
+    assert stack.inherited == []
 
 
 def test_management_ip_reads_every_shape():
@@ -201,7 +211,7 @@ def test_resolved_members_and_standalone_devices_need_no_stand_in():
     assert resolve_stack(_NB(), sw, {1, 2}, [sw]).stand_in("Gi2/0/1") is None
 
 
-def test_virtual_chassis_member_outside_the_scope_is_claimed_a_missing_position_is_not():
+def test_missing_virtual_chassis_position_lets_the_connected_device_stand_in():
     top = _device(10, "bldg-a-top", chassis=7, position=1)
     bottom = _device(11, "bldg-a-bottom", chassis=7, position=2)
     chassis = {7: SimpleNamespace(name="bldg-a", master={"id": 10})}
@@ -209,8 +219,8 @@ def test_virtual_chassis_member_outside_the_scope_is_claimed_a_missing_position_
 
     stack = resolve_stack(nb, top, {1, 2, 3}, [top])
 
-    assert stack.claimed == {2}
-    assert stack.stand_in("Gi2/0/1") is None
+    assert stack.claimed == set()
+    assert stack.stand_in("Gi2/0/1") is None  # member 2 has a device: bottom owns it
     assert stack.stand_in("Gi3/0/1") is top
 
 

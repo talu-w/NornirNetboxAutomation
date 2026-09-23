@@ -579,7 +579,8 @@ def test_virtual_chassis_member_wins_over_a_copy_and_the_master_keeps_stack_wide
     assert result.data["bldg-a-top"]["misplaced"] == {"bldg-a-top/Gi2/0/1": "bldg-a-bottom"}
 
 
-def test_virtual_chassis_member_outside_the_scope_is_never_touched(stack_run):
+def test_virtual_chassis_member_outside_the_scope_is_synced_as_part_of_the_switch(stack_run):
+    # bottom lacks the env tag (NetBox doesn't copy tags to a chassis member).
     top = _Device(10, "bldg-a-top", ip="10.0.0.5/24", chassis=7, position=1)
     bottom = _Device(11, "bldg-a-bottom", chassis=7, position=2)
     chassis = {7: argparse.Namespace(name="bldg-a", master={"id": 10})}
@@ -592,12 +593,9 @@ def test_virtual_chassis_member_outside_the_scope_is_never_touched(stack_run):
         apply=True,
     )
 
-    assert nb.dcim.interfaces.on(11, "Gi2/0/1").updates == []
-    assert nb.dcim.interfaces.on(10, "Gi2/0/1").updates == []
-    (blocked,) = result.data["bldg-a-top"]["blocked"]
-    assert blocked["reason"].startswith(
-        "bldg-a-bottom (member 2 of Virtual Chassis 'bldg-a') is outside this run's scope"
-    )
+    assert nb.dcim.interfaces.on(11, "Gi2/0/1").updates != []
+    assert nb.dcim.interfaces.on(10, "Gi2/0/1").updates == []  # the copy is a leftover
+    assert "blocked" not in result.data["bldg-a-top"]
 
 
 def test_port_channel_kept_on_another_member_is_synced_there(stack_run):

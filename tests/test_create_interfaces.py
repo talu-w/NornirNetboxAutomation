@@ -590,3 +590,32 @@ def test_connected_member_two_does_not_lend_its_template_names_to_member_one(wir
     (blocked,) = result.data[A2]["blocked"]
     assert blocked["member"] == 1
     assert blocked["ports"] == ["GigabitEthernet1/0/1"]
+
+
+def test_untagged_virtual_chassis_members_get_their_own_ports(wired):
+    # Owner-reported: VC 'SwitchA-1' with only its master tagged nornirtest. Members
+    # 2 and 3 were found, then refused as "outside this run's scope".
+    chassis = {7: argparse.Namespace(name="SwitchA-1", master={"id": 1})}
+    a1 = _Device(1, A1, ip="10.0.0.11/24", chassis=7, position=1)
+    a2 = _Device(2, A2, chassis=7, position=2)
+    a3 = _Device(3, A3, chassis=7, position=3)
+    nb = wired(
+        existing={2: ["GigabitEthernet1/0/2"]},  # member 2's template name for its Gi2/0/2
+        discovered={A1: [*STACK_PORTS, "GigabitEthernet2/0/2"]},
+        devices=[a1],
+        everywhere=[a1, a2, a3],
+        chassis=chassis,
+    )
+    notes = io.StringIO()
+
+    result = TOOL.run(_ctx(apply=True, stream=notes, nb=nb), _args())
+
+    assert result.status is Status.CHANGED
+    assert _created(nb) == {
+        (1, "GigabitEthernet1/0/1"),
+        (1, "Port-channel1"),
+        (2, "GigabitEthernet2/0/1"),
+        (3, "GigabitEthernet3/0/1"),
+    }
+    assert result.data[A2]["template_named"] == {"GigabitEthernet2/0/2": "GigabitEthernet1/0/2"}
+    assert f"including {A2}, {A3} as part of its Virtual Chassis" in notes.getvalue()
