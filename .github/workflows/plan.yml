@@ -50,12 +50,20 @@ jobs:
       - name: Plan against test
         id: plan
         run: |
-          python scripts/ci_plan.py --env test | tee plan.md
+          # ci_plan.py exits 0 when every tool ran (drift or not) and 1 when one
+          # could not run. Piping it into `tee` would hide that 1, so keep the
+          # code, publish the plan either way, then exit with it.
+          set -o pipefail
+          code=0
+          python scripts/ci_plan.py --env test | tee plan.md || code=$?
           {
             echo "## Plan (test)"
             cat plan.md
           } >> "$GITHUB_STEP_SUMMARY"
+          exit "$code"
       - name: Comment on the PR
+        # Also runs when the plan step failed, so the PR shows what went wrong.
+        if: ${{ !cancelled() && hashFiles('plan.md') != '' }}
         uses: actions/github-script@v7
         with:
           script: |

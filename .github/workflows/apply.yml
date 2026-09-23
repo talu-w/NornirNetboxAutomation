@@ -31,11 +31,18 @@ jobs:
           python scripts/ci_write_env_file.py
       - name: Plan against prod
         run: |
-          python scripts/ci_plan.py --env prod | tee plan.md
+          # ci_plan.py exits 0 when every tool ran (drift or not) and 1 when one
+          # could not run. Piping it into `tee` would hide that 1, so keep the
+          # code, publish the plan either way, then exit with it: a plan that
+          # could not run fails this job, and apply-prod never asks for approval.
+          set -o pipefail
+          code=0
+          python scripts/ci_plan.py --env prod | tee plan.md || code=$?
           {
             echo "## Plan (prod) — approve the deployment below to apply"
             cat plan.md
           } >> "$GITHUB_STEP_SUMMARY"
+          exit "$code"
       - uses: actions/upload-artifact@v4
         with:
           name: prod-plan
@@ -67,5 +74,29 @@ jobs:
       - name: Apply to prod NetBox
         run: |
           set -o pipefail
-          bunnyauto --env prod wired create-interfaces --apply --yes
-          bunnyauto --env prod wired sync-interfaces --apply --yes
+          # bunnyauto's exit code says how the run went (bunnyauto/result.py):
+          #    0 = OK       nothing needed changing        -> success
+          #   20 = CHANGED  the changes were written       -> success
+          #   10 = DRIFT    changes found but NOT written  -> success, with a warning
+          #                 (not expected with --apply)
+          #    2 = PARTIAL  some devices failed            -> fail
+          #                 (also the code for a mistyped command)
+          #    1 = ERROR    could not run at all           -> fail
+          # A step stops at the first command that exits non-zero, so a bare
+          # `bunnyauto ...` line would fail the job on a successful apply (20)
+          # and skip the line after it. run_bunnyauto maps the success codes to
+          # 0; any other code fails the step and skips the commands below it,
+          # so sync-interfaces only runs once create-interfaces has succeeded.
+          run_bunnyauto() {
+            local code=0
+            bunnyauto "$@" || code=$?
+            case "$code" in
+              0|20) return 0 ;;
+              10) echo "::warning::bunnyauto $* exited 10 (DRIFT): found changes but did not write them"
+                  return 0 ;;
+              *) echo "::error::bunnyauto $* failed with exit code $code"
+                 return "$code" ;;
+            esac
+          }
+          run_bunnyauto --env prod wired create-interfaces --apply --yes
+          run_bunnyauto --env prod wired sync-interfaces --apply --yes
