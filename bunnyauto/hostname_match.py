@@ -46,7 +46,7 @@ def match_hostname_candidates(candidates: list[str], devices: list[Any]) -> Any 
 
 
 def with_stack_suffix(candidates: list[str], member: str | None) -> list[str]:
-    """Expand each candidate with a ``<candidate>-<member>`` form tried first.
+    """Expand each candidate with a ``<host>-<member>[.<domain>]`` form tried first.
 
     A virtually-stacked switch's chassis reports one shared LLDP identity for
     the whole stack (its base hostname, no per-member suffix) — but each
@@ -61,12 +61,23 @@ def with_stack_suffix(candidates: list[str], member: str | None) -> list[str]:
     member; the raw candidate is kept as a fallback for a switch that isn't
     stacked at all. A ``None``/falsy ``member`` returns the candidates
     unchanged.
+
+    The suffix goes **before** the domain, not appended to the end of the
+    whole string: NetBox names a stacked member ``host-1.example.com``, not
+    ``host.example.com-1`` (confirmed 2026-09-23 — the naive
+    ``f"{candidate}-{member}"`` concatenation got this wrong for any
+    candidate that was already a FQDN, which every real LLDP chassis name in
+    this deployment is). Only the first ``.`` matters — everything from
+    there onward is carried through unchanged, same "ignore the domain"
+    convention :func:`normalize_hostname` already uses for comparison.
     """
     if not member:
         return list(candidates)
     expanded: list[str] = []
     for candidate in candidates:
-        suffixed = f"{candidate}-{member}"
+        text = str(candidate)
+        host, dot, domain = text.partition(".")
+        suffixed = f"{host}-{member}{dot}{domain}"
         if suffixed not in expanded:
             expanded.append(suffixed)
     for candidate in candidates:

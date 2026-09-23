@@ -398,6 +398,33 @@ def test_cable_resolves_the_correct_stack_member(monkeypatch):
     )
 
 
+def test_cable_resolves_the_correct_stack_member_with_fqdn_naming(monkeypatch):
+    """Regression: NetBox names a stacked member 'host-1.ect.net', not
+    'host.ect.net-1' — the suffix must land before the domain, not appended
+    to the end of the whole reported (FQDN) chassis name."""
+    row = {
+        "AP": "hq-idf1-ap01",
+        "Chassis Name/ID": "hq-idf1-sw01.ect.net",  # bare stack identity, FQDN
+        "Port ID": "GigabitEthernet2/0/24",  # member 2
+    }
+    _fake_client(monkeypatch, aps=[AP_ROW], lldp=[row])
+    ap_device = _ap()
+    member2 = _switch(name="hq-idf1-sw01-2.ect.net", id_=202)
+    ap_iface = _Rec(id=300, device_id=100, name="E0", type="5gbase-t", cable=None)
+    member2_iface = _Rec(
+        id=402, device_id=202, name="GigabitEthernet2/0/24", type="1000base-t", cable=None
+    )
+    nb = _nb(
+        wlcs=[_wlc()],
+        other_devices=[ap_device, member2],
+        interfaces=[ap_iface, member2_iface],
+    )
+    result = TOOL.run(_Ctx(nb, apply=True), _args())
+    assert result.status is Status.CHANGED
+    (body,) = nb.dcim.cables.created
+    assert body["b_terminations"] == [{"object_type": "dcim.interface", "object_id": 402}]
+
+
 def test_cable_falls_back_to_bare_hostname_when_switch_is_not_stacked(monkeypatch):
     """A 3-segment port id still yields a member hint even for a switch that
     turns out not to be stacked in NetBox — the bare-hostname fallback must

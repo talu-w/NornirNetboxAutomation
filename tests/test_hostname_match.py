@@ -65,6 +65,17 @@ def test_with_stack_suffix_prepends_suffixed_form():
     assert with_stack_suffix(["hq-idf1-sw01"], "1") == ["hq-idf1-sw01-1", "hq-idf1-sw01"]
 
 
+def test_with_stack_suffix_inserts_before_the_domain_not_after_it():
+    """Regression: NetBox names a stacked member 'host-1.example.com', not
+    'host.example.com-1' — a naive f'{candidate}-{member}' concatenation
+    got this wrong for any candidate that was already a FQDN, which every
+    real LLDP chassis name in the owner's deployment is."""
+    assert with_stack_suffix(["hq-idf1-sw01.ect.net"], "1") == [
+        "hq-idf1-sw01-1.ect.net",
+        "hq-idf1-sw01.ect.net",
+    ]
+
+
 def test_with_stack_suffix_no_member_leaves_candidates_unchanged():
     assert with_stack_suffix(["hq-idf1-sw01"], None) == ["hq-idf1-sw01"]
     assert with_stack_suffix(["hq-idf1-sw01"], "") == ["hq-idf1-sw01"]
@@ -79,5 +90,18 @@ def test_with_stack_suffix_end_to_end_resolves_the_correct_member():
         SimpleNamespace(name="hq-idf1-sw01-2"),
     ]
     candidates = with_stack_suffix(["hq-idf1-sw01"], "2")
+    match = match_hostname_candidates(candidates, devices)
+    assert match is devices[1]
+
+
+def test_with_stack_suffix_end_to_end_with_fqdn_naming():
+    """Same as above, but with the owner's real naming shape end to end:
+    LLDP reports the bare stack chassis as an FQDN, NetBox names each
+    member '<host>-<member>.<domain>'."""
+    devices = [
+        SimpleNamespace(name="hq-idf1-sw01-1.ect.net"),
+        SimpleNamespace(name="hq-idf1-sw01-2.ect.net"),
+    ]
+    candidates = with_stack_suffix(["hq-idf1-sw01.ect.net"], "2")
     match = match_hostname_candidates(candidates, devices)
     assert match is devices[1]
