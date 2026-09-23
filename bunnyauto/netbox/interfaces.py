@@ -15,7 +15,8 @@ device's actual NetBox interface names, trying an exact match first, then a
 canonical one, and returning nothing if the match is ambiguous.
 :func:`stack_member` reads the member number out of a
 ``<member>/<module>/<port>`` name. A stack's members share one chassis identity
-but each is its own NetBox device.
+but each is its own NetBox device. :func:`member_local_names` gives the
+member-1 names a device-type template puts on every member device.
 
 **Types.** :func:`interface_type` maps a name to the NetBox interface type a
 newly created interface gets. :func:`is_wired_type` and
@@ -119,6 +120,10 @@ _SIGNATURE = re.compile(r"^(?P<family>[a-z-]+)(?P<rest>.+)$")
 #: member 1). Deliberately requires all three segments, so a non-stacked
 #: switch's plain ``<module>/<port>`` (``"0/24"``) is never read as a member.
 _STACK_MEMBER = re.compile(r"^(?:[a-z][a-z-]*)?(\d+)/\d+/\d+(?:\.\d+)?$")
+#: A stack port split for :func:`member_local_names` (case kept, spaces dropped).
+_MEMBER_LOCAL = re.compile(
+    r"^(?P<prefix>[A-Za-z-]+)(?P<member>\d+)/(?P<remainder>\d+/\d+(?:\.\d+)?)$"
+)
 
 
 def _compact(name: str) -> str:
@@ -196,6 +201,23 @@ def stack_member(name: str) -> int | None:
     """
     match = _STACK_MEMBER.match(_compact(name))
     return int(match.group(1)) if match else None
+
+
+def member_local_names(name: str) -> list[str]:
+    """The names a device-type template gives a stack member's port: ``"Gi2/0/3"`` ->
+    ``["Gi1/0/3", "Gi0/3"]``.
+
+    A device type's interface template is fixed, so every member device NetBox
+    creates from it gets member-1 numbering (``Gi1/0/3``), or no member segment
+    at all (``Gi0/3``), even when IOS calls the port ``Gi2/0/3``. On a
+    stack-member device, those are the same physical port under the template's
+    name. Returns ``[]`` for a name without the ``<member>/<module>/<port>`` shape.
+    """
+    match = _MEMBER_LOCAL.match(str(name).strip().replace(" ", ""))
+    if not match:
+        return []
+    prefix, remainder = match.group("prefix"), match.group("remainder")
+    return [f"{prefix}1/{remainder}", f"{prefix}{remainder}"]
 
 
 # ---------------------------------------------------------------------------

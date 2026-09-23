@@ -8,6 +8,7 @@ from bunnyauto.netbox.hostnames import (
     match_hostname,
     match_hostname_candidates,
     normalize_hostname,
+    split_stack_suffix,
     with_stack_suffix,
 )
 
@@ -105,3 +106,25 @@ def test_with_stack_suffix_end_to_end_with_fqdn_naming():
     candidates = with_stack_suffix(["hq-idf1-sw01.ect.net"], "2")
     match = match_hostname_candidates(candidates, devices)
     assert match is devices[1]
+
+
+def test_split_stack_suffix_keeps_the_domain_after_the_host():
+    assert split_stack_suffix("SwitchA-2.corp.example.com") == ("SwitchA.corp.example.com", 2)
+    assert split_stack_suffix("SwitchA-2") == ("SwitchA", 2)
+
+
+def test_split_stack_suffix_reads_zero_padded_and_multi_dash_names():
+    assert split_stack_suffix("idf-sw-02") == ("idf-sw", 2)
+    assert split_stack_suffix("bldg-1-3.corp") == ("bldg-1.corp", 3)
+
+
+def test_split_stack_suffix_needs_a_numeric_suffix_on_the_host_part():
+    assert split_stack_suffix("core-a") is None
+    assert split_stack_suffix("sw1") is None
+    assert split_stack_suffix("10.1.1.1") is None
+    assert split_stack_suffix("switch.site-2.example.com") is None
+
+
+def test_split_stack_suffix_round_trips_with_with_stack_suffix():
+    base, member = split_stack_suffix("SwitchA-3.corp.example.com")
+    assert with_stack_suffix([base], member)[0] == "SwitchA-3.corp.example.com"

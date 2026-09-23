@@ -11,7 +11,11 @@ same name is ambiguous and returns ``None`` — same "never guess" rule as
 
 from __future__ import annotations
 
+import re
 from typing import Any
+
+#: ``<host>-<member>``: the owner's name for one member of a stack (``SwitchA-2``).
+_STACK_SUFFIX = re.compile(r"^(?P<host>.+)-(?P<member>\d+)$")
 
 
 def normalize_hostname(value: str) -> str:
@@ -84,3 +88,19 @@ def with_stack_suffix(candidates: list[str], member: int | str | None) -> list[s
         if candidate not in expanded:
             expanded.append(candidate)
     return expanded
+
+
+def split_stack_suffix(name: str) -> tuple[str, int] | None:
+    """``"SwitchA-2.example.com"`` -> ``("SwitchA.example.com", 2)``, else ``None``.
+
+    The inverse of :func:`with_stack_suffix`: a stack member's NetBox name split
+    into the stack's own name and the member number. As there, the suffix sits
+    before the domain. A name with no trailing ``-<digits>`` on its host part
+    (``"core-a"``, ``"10.1.1.1"``) returns ``None``. The pattern alone doesn't
+    prove the device is in a stack, so callers must check that separately.
+    """
+    host, dot, domain = str(name).strip().partition(".")
+    match = _STACK_SUFFIX.match(host)
+    if not match:
+        return None
+    return f"{match.group('host')}{dot}{domain}", int(match.group("member"))

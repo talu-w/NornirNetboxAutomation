@@ -23,7 +23,11 @@ from nornir.core.task import Result, Task
 from nornir_netmiko.tasks import netmiko_send_command
 
 from bunnyauto.netbox.devices import inventory_device_id
-from bunnyauto.netbox.interfaces import interface_signature, stack_member
+from bunnyauto.netbox.interfaces import (
+    interface_signature,
+    member_local_names,
+    stack_member,
+)
 from bunnyauto.netbox.records import choice_value, related_id
 
 SHOW_VLAN = "show vlan brief"
@@ -1411,21 +1415,6 @@ def build_interface_search_scope(
     )
 
 
-def local_stack_aliases(interface_name: str) -> list[str]:
-    """Return common member-local forms of a stack interface name."""
-
-    cleaned = interface_name.strip().replace(" ", "")
-    match = re.match(
-        r"^(?P<prefix>[A-Za-z-]+)(?P<member>\d+)/(?P<remainder>\d+/\d+(?:\.\d+)?)$",
-        cleaned,
-    )
-    if not match:
-        return []
-    prefix = match.group("prefix")
-    remainder = match.group("remainder")
-    return [f"{prefix}1/{remainder}", f"{prefix}{remainder}"]
-
-
 def match_scoped_interface(
     discovered_name: str,
     scope: InterfaceSearchScope,
@@ -1524,7 +1513,7 @@ def match_scoped_interface(
     # Device-type templates sometimes store a VC member's ports in a
     # member-local form (Gi1/0/3 or Gi0/3), even when IOS reports Gi2/0/3.
     alias_matches: dict[int, Any] = {}
-    for alias in local_stack_aliases(discovered_name):
+    for alias in member_local_names(discovered_name):
         alias_interface, _ = match_interface(alias, *indexes)
         if alias_interface is not None:
             alias_matches[int(alias_interface.id)] = alias_interface

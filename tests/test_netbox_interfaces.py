@@ -18,6 +18,7 @@ from bunnyauto.netbox.interfaces import (
     is_wired_type,
     match_interface,
     match_interface_candidates,
+    member_local_names,
     pick_wired_interface,
     pick_wired_record,
     stack_member,
@@ -239,3 +240,20 @@ def test_pick_wired_record_reads_nested_choice_types():
 def test_pick_wired_record_none_when_only_radios():
     records = [SimpleNamespace(id=1, name="Bluetooth", type="ieee802.15.1")]
     assert pick_wired_record(records) is None
+
+
+def test_member_local_names_are_the_templates_member_one_forms():
+    assert member_local_names("Gi2/0/3") == ["Gi1/0/3", "Gi0/3"]
+    assert member_local_names("GigabitEthernet 3/1/4") == [
+        "GigabitEthernet1/1/4",
+        "GigabitEthernet1/4",
+    ]
+
+
+def test_member_local_names_keep_a_subinterface():
+    assert member_local_names("Te2/0/1.100") == ["Te1/0/1.100", "Te0/1.100"]
+
+
+def test_member_local_names_need_the_three_segment_stack_shape():
+    assert member_local_names("Gi0/1") == []
+    assert member_local_names("Port-channel1") == []

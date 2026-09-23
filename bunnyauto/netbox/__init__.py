@@ -12,6 +12,8 @@ not copied into both.
 ``interfaces``     interface names (Gi1/0/1 == GigabitEthernet1/0/1), stack
                    members, NetBox interface types, picking a wired port
 ``hostnames``      neighbor hostname -> NetBox device (FQDN/short, stack members)
+``stacks``         which member device owns a stack port (Virtual Chassis or
+                   ``<host>-<member>`` names)
 ``tokens``         terse vendor strings -> device types / platforms
 ``ipam``           containing-prefix lookup, primary-IP assignment
 ``cabling``        LLDP/CDP-style neighbor -> NetBox cable plan + create
