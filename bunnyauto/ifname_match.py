@@ -72,3 +72,18 @@ def match_interface(remote_port: str, interface_names: list[str]) -> str | None:
         name for name in interface_names if normalize_port_name(name) == normalized_target
     ]
     return normalized_matches[0] if len(normalized_matches) == 1 else None
+
+
+def match_interface_candidates(candidates: list[str], interface_names: list[str]) -> str | None:
+    """Try each candidate port name in order; return the first that resolves.
+
+    An LLDP neighbor can report its port under more than one field (e.g. Port
+    ID vs. Port Desc) — try each against the switch's actual interfaces and
+    use whichever one resolves, same reasoning as
+    :func:`bunnyauto.hostname_match.match_hostname_candidates`.
+    """
+    for candidate in candidates:
+        match = match_interface(candidate, interface_names)
+        if match is not None:
+            return match
+    return None

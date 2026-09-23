@@ -26,3 +26,20 @@ def match_hostname(remote_system_name: str, devices: list[Any]) -> Any | None:
         return None
     matches = [d for d in devices if normalize_hostname(getattr(d, "name", "")) == target]
     return matches[0] if len(matches) == 1 else None
+
+
+def match_hostname_candidates(candidates: list[str], devices: list[Any]) -> Any | None:
+    """Try each candidate name in order; return the first that resolves.
+
+    An LLDP neighbor can report its identity under more than one field (e.g.
+    Chassis Name vs. Chassis ID) and which one holds a usable hostname isn't
+    knowable in advance — one may be a MAC address, or use a different naming
+    convention NetBox doesn't match. The first candidate that resolves to
+    exactly one NetBox device wins; an ambiguous or unmatched candidate is
+    skipped in favor of the next one.
+    """
+    for candidate in candidates:
+        match = match_hostname(candidate, devices)
+        if match is not None:
+            return match
+    return None

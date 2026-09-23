@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from bunnyauto.ifname_match import match_interface, normalize_port_name
+from bunnyauto.ifname_match import match_interface, match_interface_candidates, normalize_port_name
 
 
 def test_normalize_expands_known_abbreviations():
@@ -37,3 +37,13 @@ def test_match_interface_no_match_returns_none():
 
 def test_match_interface_empty_returns_none():
     assert match_interface("", ["GigabitEthernet1/0/24"]) is None
+
+
+def test_match_interface_candidates_falls_through_to_the_next_one():
+    names = ["GigabitEthernet1/0/24"]
+    assert match_interface_candidates(["not-a-port", "Gi1/0/24"], names) == names[0]
+
+
+def test_match_interface_candidates_none_resolve():
+    names = ["GigabitEthernet1/0/24"]
+    assert match_interface_candidates(["nope", "still-nope"], names) is None

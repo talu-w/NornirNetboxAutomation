@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from bunnyauto.hostname_match import match_hostname, normalize_hostname
+from bunnyauto.hostname_match import match_hostname, match_hostname_candidates, normalize_hostname
 
 
 def test_normalize_hostname_strips_domain_and_casefolds():
@@ -36,3 +36,21 @@ def test_match_hostname_empty_returns_none():
 def test_match_hostname_ambiguous_returns_none():
     devices = [SimpleNamespace(name="sw01.site-a.example.com"), SimpleNamespace(name="sw01")]
     assert match_hostname("sw01", devices) is None
+
+
+def test_match_hostname_candidates_falls_through_to_the_next_one():
+    """E.g. Chassis Name fails to match (MAC-like), Chassis ID candidate does."""
+    devices = [SimpleNamespace(name="hq-idf1-sw01")]
+    match = match_hostname_candidates(["aa:bb:cc:dd:ee:ff", "hq-idf1-sw01"], devices)
+    assert match is devices[0]
+
+
+def test_match_hostname_candidates_first_match_wins():
+    devices = [SimpleNamespace(name="hq-idf1-sw01"), SimpleNamespace(name="other")]
+    match = match_hostname_candidates(["hq-idf1-sw01", "other"], devices)
+    assert match is devices[0]
+
+
+def test_match_hostname_candidates_none_resolve():
+    devices = [SimpleNamespace(name="hq-idf1-sw01")]
+    assert match_hostname_candidates(["nope", "still-nope"], devices) is None

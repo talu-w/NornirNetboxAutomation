@@ -2,13 +2,23 @@
 
 Pure — no I/O. Command name confirmed against real AOS 8 hardware (all WLC
 models) 2026-09-22 — unlike most Aruba field names in this package, this one
-is not a guess. The *field* names inside each row are still tried across a few
-candidate spellings, same tolerant style as :mod:`bunnyauto.aruba.inventory`,
-since AOS field spellings are known to drift between versions.
+is not a guess. Field names inside each row are likewise now confirmed
+against real output (2026-09-23): the neighbor's identity is under
+``Chassis Name`` *or* ``Chassis ID`` (which one actually holds a usable
+hostname vs. e.g. a MAC depends on how the neighboring switch is configured
+to advertise its chassis ID — not something Aruba controls), and its port
+under ``Port ID`` or ``Port Desc`` (both are the *neighbor's own* port, per
+live testing — not the AP's local port). Every candidate for a field is kept,
+not just the first non-empty one, so the caller can try each against NetBox
+and use whichever one actually resolves — same "try progressively more
+candidates" pattern as :func:`bunnyauto.devicetype_match.match_device_type`'s
+``model_candidates``, since which field holds the useful value isn't
+knowable in advance.
 
-A row missing any of the three fields ``wireless-enrich`` needs (which AP,
-which remote system, which remote port) is skipped rather than guessed —
-same "never substitute a wrong value" rule as the rest of this package.
+A row missing any of the three fields ``wireless-enrich`` needs (which AP, at
+least one remote-system candidate, at least one remote-port candidate) is
+skipped rather than guessed — same "never substitute a wrong value" rule as
+the rest of this package.
 """
 
 from __future__ import annotations
@@ -19,11 +29,17 @@ from typing import Any
 
 @dataclass(frozen=True)
 class LldpNeighbor:
-    """One AP's reported wired LLDP neighbor, as a WLC reports it."""
+    """One AP's reported wired LLDP neighbor, as a WLC reports it.
+
+    ``remote_system_candidates`` / ``remote_port_candidates`` hold every
+    non-empty value found for that field, in the order confirmed against real
+    hardware then older best-guess spellings — try each against NetBox in
+    order and use whichever one resolves.
+    """
 
     ap_name: str
-    remote_system_name: str
-    remote_port: str
+    remote_system_candidates: list[str]
+    remote_port_candidates: list[str]
 
 
 def _get(row: dict[str, Any], *keys: str) -> str:
@@ -34,29 +50,47 @@ def _get(row: dict[str, Any], *keys: str) -> str:
     return ""
 
 
+def _get_all(row: dict[str, Any], *keys: str) -> list[str]:
+    """Every non-empty value among these field-name candidates, in order, de-duplicated."""
+    out: list[str] = []
+    for key in keys:
+        for actual, value in row.items():
+            if actual.strip().casefold() == key.casefold() and value not in (None, ""):
+                text = str(value).strip()
+                if text and text not in out:
+                    out.append(text)
+    return out
+
+
 def parse_lldp_neighbors(payload: dict[str, Any] | list[dict[str, Any]]) -> list[LldpNeighbor]:
     """Records from ``show ap lldp neighbors``."""
     neighbors: list[LldpNeighbor] = []
     for row in _rows(payload):
         ap_name = _get(row, "AP Name", "Name")
-        remote_system_name = _get(
-            row, "Neighbor System Name", "System Name", "Neighbor Name", "Chassis Name"
-        )
-        remote_port = _get(
+        remote_system_candidates = _get_all(
             row,
+            "Chassis Name",
+            "Chassis ID",
+            "Neighbor System Name",
+            "System Name",
+            "Neighbor Name",
+        )
+        remote_port_candidates = _get_all(
+            row,
+            "Port ID",
+            "Port Desc",
+            "Port Description",
             "Neighbor Port",
             "Neighbor Port Description",
-            "Port Description",
-            "Port ID",
             "Remote Port",
         )
-        if not ap_name or not remote_system_name or not remote_port:
+        if not ap_name or not remote_system_candidates or not remote_port_candidates:
             continue
         neighbors.append(
             LldpNeighbor(
                 ap_name=ap_name,
-                remote_system_name=remote_system_name,
-                remote_port=remote_port,
+                remote_system_candidates=remote_system_candidates,
+                remote_port_candidates=remote_port_candidates,
             )
         )
     return neighbors

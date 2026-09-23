@@ -28,16 +28,22 @@ For each AP a WLC reports (``show ap database long``):
   uses for device types (see ``_aos_version_candidates``). No recognized
   version field, or no matching Platform, is reported and left alone — never
   a guess.
-* Its wired LLDP neighbor (``show ap lldp neighbors`` — command name
-  confirmed against real AOS 8 hardware) is matched to an existing NetBox
-  device by hostname, and the reported remote port to that device's actual
-  interface (tolerating vendor abbreviations like ``Gi1/0/24`` for
-  ``GigabitEthernet1/0/24`` — see ``bunnyauto/ifname_match.py``). If both
-  resolve and neither interface already has a **Cable**, one is created
-  between the AP's first wired interface and the matched switch port. An
-  interface that already has a cable is **never touched** — reported as an
-  informational note, not a failure, since deliberately not touching existing
-  physical wiring beats risking a silent mis-correction.
+* Its wired LLDP neighbor (``show ap lldp neighbors`` — command name *and*
+  field names confirmed against real AOS 8 hardware) is matched to an
+  existing NetBox device by hostname, and the reported remote port to that
+  device's actual interface (tolerating vendor abbreviations like
+  ``Gi1/0/24`` for ``GigabitEthernet1/0/24`` — see
+  ``bunnyauto/ifname_match.py``). The neighbor's identity can land in either
+  ``Chassis Name`` or ``Chassis ID`` depending on how *that* switch is
+  configured to advertise itself (one may be a MAC, not a hostname) and its
+  port in either ``Port ID`` or ``Port Desc`` — every candidate is tried in
+  turn (``bunnyauto/hostname_match.py`` / ``bunnyauto/ifname_match.py``'s
+  ``*_candidates`` functions) and the first one that resolves against NetBox
+  wins. If both resolve and neither interface already has a **Cable**, one is
+  created between the AP's first wired interface and the matched switch
+  port. An interface that already has a cable is **never touched** —
+  reported as an informational note, not a failure, since deliberately not
+  touching existing physical wiring beats risking a silent mis-correction.
 
 A WLC that returns no AP data at all (no APs, or none with LLDP neighbors) is
 reported as an informational note, not an error — not every WLC in the fleet
@@ -63,8 +69,8 @@ from bunnyauto.aruba.lldp import LldpNeighbor, parse_lldp_neighbors
 from bunnyauto.common import env_flag
 from bunnyauto.devicetype_match import match_device_type
 from bunnyauto.errors import ArubaError, ToolError
-from bunnyauto.hostname_match import match_hostname
-from bunnyauto.ifname_match import match_interface
+from bunnyauto.hostname_match import match_hostname_candidates
+from bunnyauto.ifname_match import match_interface_candidates
 from bunnyauto.interface_match import pick_wired_interface
 from bunnyauto.tools.base import Status, ToolResult
 
@@ -405,11 +411,11 @@ def _plan_cable(
     if lldp is None:
         return _CablePlan(action="none", note="no LLDP neighbor reported for this AP")
 
-    switch = match_hostname(lldp.remote_system_name, all_devices)
+    switch = match_hostname_candidates(lldp.remote_system_candidates, all_devices)
     if switch is None:
         return _CablePlan(
             action="blocked",
-            note=f"LLDP neighbor {lldp.remote_system_name!r} matched no NetBox device",
+            note=f"LLDP neighbor {lldp.remote_system_candidates!r} matched no NetBox device",
         )
 
     switch_id = int(switch.id)
@@ -417,12 +423,14 @@ def _plan_cable(
         switch_interfaces_cache[switch_id] = list(nb.dcim.interfaces.filter(device_id=switch_id))
     switch_interfaces = switch_interfaces_cache[switch_id]
 
-    switch_iface_name = match_interface(lldp.remote_port, [str(i.name) for i in switch_interfaces])
+    switch_iface_name = match_interface_candidates(
+        lldp.remote_port_candidates, [str(i.name) for i in switch_interfaces]
+    )
     if switch_iface_name is None:
         return _CablePlan(
             action="blocked",
             b_device_name=str(switch.name),
-            note=f"switch port {lldp.remote_port!r} matched no interface on "
+            note=f"switch port {lldp.remote_port_candidates!r} matched no interface on "
             f"NetBox device {switch.name!r}",
         )
     switch_iface = next(i for i in switch_interfaces if str(i.name) == switch_iface_name)

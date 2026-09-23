@@ -161,8 +161,8 @@ AP_ROW = {"Name": "hq-idf1-ap01", "AP Type": "515"}
 AP_ROW_WITH_VERSION = {**AP_ROW, "Software Version": "8.10.0.5"}
 LLDP_ROW = {
     "AP Name": "hq-idf1-ap01",
-    "Neighbor System Name": "hq-idf1-sw01",
-    "Neighbor Port": "Gi1/0/24",
+    "Chassis Name": "hq-idf1-sw01",
+    "Port ID": "Gi1/0/24",
 }
 
 
@@ -332,6 +332,32 @@ def test_cable_plan_then_apply(monkeypatch):
     assert body["b_terminations"] == [{"object_type": "dcim.interface", "object_id": 400}]
     assert body["status"] == "connected"
     assert result.data["hq-wlc01"]["hq-idf1-ap01"]["cable"] == "hq-idf1-sw01:GigabitEthernet1/0/24"
+
+
+def test_cable_falls_back_to_chassis_id_when_chassis_name_does_not_match(monkeypatch):
+    """Real-hardware finding: which LLDP field holds a usable hostname (vs. a
+    MAC) depends on the neighboring switch's own config — try both."""
+    row = {
+        "AP Name": "hq-idf1-ap01",
+        "Chassis Name": "aa:bb:cc:dd:ee:ff",  # doesn't match any NetBox device
+        "Chassis ID": "hq-idf1-sw01",  # this one does
+        "Port ID": "Gi1/0/24",
+    }
+    _fake_client(monkeypatch, aps=[AP_ROW], lldp=[row])
+    ap_device = _ap()
+    switch = _switch()
+    ap_iface = _Rec(id=300, device_id=100, name="E0", type="5gbase-t", cable=None)
+    switch_iface = _Rec(
+        id=400, device_id=200, name="GigabitEthernet1/0/24", type="1000base-t", cable=None
+    )
+    nb = _nb(
+        wlcs=[_wlc()],
+        other_devices=[ap_device, switch],
+        interfaces=[ap_iface, switch_iface],
+    )
+    result = TOOL.run(_Ctx(nb), _args())
+    assert result.status is Status.DRIFT
+    assert any("would create cable" in c for c in result.changes)
 
 
 def test_no_lldp_row_is_informational(monkeypatch):
