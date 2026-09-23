@@ -3,18 +3,19 @@
 Pure — no I/O. Command name confirmed against real AOS 8 hardware (all WLC
 models) 2026-09-22 — unlike most Aruba field names in this package, this one
 is not a guess. Field names inside each row are likewise now confirmed
-against real output: the row identifies the local AP under the column
-``AP`` (not ``"AP Name"`` — confirmed 2026-09-23; the row also carries an
-``Interface`` column for the AP's *own* local port and a ``Neighbor`` column
-of unconfirmed meaning, neither of which this parser currently uses). The
-neighbor's identity is under ``Chassis Name`` *or* ``Chassis ID`` (which one
-actually holds a usable hostname vs. e.g. a MAC depends on how the
-neighboring switch is configured to advertise its chassis ID — not something
-Aruba controls), and its port under ``Port ID`` or ``Port Desc`` (both are
-the *neighbor's own* port, per live testing — not the AP's local port).
-Every candidate for a field is kept, not just the first non-empty one, so the
-caller can try each against NetBox and use whichever one actually resolves —
-same "try progressively more candidates" pattern as
+against a real payload the owner supplied directly (2026-09-23): the row
+identifies the local AP under the column ``AP`` (not ``"AP Name"``), and the
+neighbor's identity under the single combined column ``Chassis Name/ID``
+(*not* two separate ``"Chassis Name"``/``"Chassis ID"`` columns — an earlier,
+wrong guess). The row also carries ``Capabilities``, ``Interface`` (the AP's
+own local port), ``Mgmt. Address`` (the neighboring switch's management IP —
+a possible future fallback match if hostname matching ever proves
+unreliable, not wired in yet) and ``Neighbor`` (meaning unconfirmed), none of
+which this parser currently uses. The neighbor's port is under ``Port ID`` or
+``Port Desc`` (both are the *neighbor's own* port, per live testing — not the
+AP's local port). Every candidate for a field is kept, not just the first
+non-empty one, so the caller can try each against NetBox and use whichever
+one actually resolves — same "try progressively more candidates" pattern as
 :func:`bunnyauto.devicetype_match.match_device_type`'s ``model_candidates``,
 since which field holds the useful value isn't knowable in advance.
 
@@ -72,6 +73,7 @@ def parse_lldp_neighbors(payload: dict[str, Any] | list[dict[str, Any]]) -> list
         ap_name = _get(row, "AP", "AP Name", "Name")
         remote_system_candidates = _get_all(
             row,
+            "Chassis Name/ID",
             "Chassis Name",
             "Chassis ID",
             "Neighbor System Name",

@@ -5,23 +5,36 @@ from __future__ import annotations
 from bunnyauto.aruba.lldp import parse_lldp_neighbors
 
 PAYLOAD = {
-    "_meta": ["AP", "Interface", "Neighbor", "Chassis Name", "Port ID", "Port Desc"],
+    "_meta": [
+        "AP",
+        "Capabilities",
+        "Chassis Name/ID",
+        "Interface",
+        "Mgmt. Address",
+        "Neighbor",
+        "Port Desc",
+        "Port ID",
+    ],
     "AP LLDP Neighbors": [
         {
             "AP": "hq-idf1-ap01",
+            "Capabilities": "B",
+            "Chassis Name/ID": "hq-idf1-sw01",
             "Interface": "eth0",
+            "Mgmt. Address": "10.1.0.10",
             "Neighbor": "1",
-            "Chassis Name": "hq-idf1-sw01",
-            "Port ID": "GigabitEthernet1/0/24",
             "Port Desc": "GigabitEthernet1/0/24",
+            "Port ID": "GigabitEthernet1/0/24",
         },
         {
             "AP": "hq-idf1-ap02",
+            "Capabilities": "",
+            "Chassis Name/ID": "",  # no neighbor reported
             "Interface": "eth0",
+            "Mgmt. Address": "",
             "Neighbor": "",
-            "Chassis Name": "",  # no neighbor reported
-            "Port ID": "",
             "Port Desc": "",
+            "Port ID": "",
         },
     ],
 }
@@ -37,16 +50,26 @@ def test_parse_lldp_neighbors():
 
 def test_row_missing_any_required_field_is_skipped():
     assert parse_lldp_neighbors([{"AP": "ap1"}]) == []
-    assert parse_lldp_neighbors([{"AP": "ap1", "Chassis Name": "sw1"}]) == []
+    assert parse_lldp_neighbors([{"AP": "ap1", "Chassis Name/ID": "sw1"}]) == []
 
 
 def test_ap_column_is_recognized():
     """Regression: real hardware's AP-identity column is literally 'AP', not
     'AP Name' — every row was being skipped entirely before this was added,
     since ap_name is required before anything else is even attempted."""
-    row = {"AP": "hq-idf1-ap01", "Chassis Name": "sw1", "Port ID": "Gi1/0/24"}
+    row = {"AP": "hq-idf1-ap01", "Chassis Name/ID": "sw1", "Port ID": "Gi1/0/24"}
     (neighbor,) = parse_lldp_neighbors([row])
     assert neighbor.ap_name == "hq-idf1-ap01"
+
+
+def test_combined_chassis_name_id_column_is_recognized():
+    """Regression: real hardware combines this into one 'Chassis Name/ID'
+    column, not the separate 'Chassis Name' / 'Chassis ID' columns first
+    guessed — every row was still being skipped even after the 'AP' fix,
+    since remote_system_candidates came back empty."""
+    row = {"AP": "ap1", "Chassis Name/ID": "hq-idf1-sw01", "Port ID": "Gi1/0/24"}
+    (neighbor,) = parse_lldp_neighbors([row])
+    assert neighbor.remote_system_candidates == ["hq-idf1-sw01"]
 
 
 def test_both_chassis_name_and_chassis_id_are_kept_as_candidates():
