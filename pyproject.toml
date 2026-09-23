@@ -30,7 +30,12 @@ bunnyauto = "bunnyauto.cli:main"
 [tool.setuptools]
 packages = [
     "bunnyauto",
+    "bunnyauto.netbox",
     "bunnyauto.tools",
+    "bunnyauto.tools.wired",
+    "bunnyauto.tools.wireless",
+    "bunnyauto.tools.security",
+    "bunnyauto.tools.netbox",
     "bunnyauto.aruba",
     "bunnyauto.backup",
     "bunnyauto.firewall",

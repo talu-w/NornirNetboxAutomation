@@ -11,8 +11,8 @@ from bunnyauto.context import Settings
 from bunnyauto.errors import ToolError
 from bunnyauto.reporting import Reporter
 from bunnyauto.result import Status
-from bunnyauto.tools import send_command
-from bunnyauto.tools.send_command import TOOL
+from bunnyauto.scope import Scope
+from bunnyauto.tools.wired.send_command import TOOL
 
 # --- fakes -----------------------------------------------------------------
 
@@ -49,10 +49,12 @@ class _Targets:
 class _Ctx:
     settings: Settings
     reporter: Reporter
-    _nr: object = None
 
-    def nornir(self):
-        return self._nr
+    def target_hosts(self):  # stubbed per test with monkeypatch
+        raise AssertionError("target_hosts was not stubbed for this test")
+
+    def scope(self):
+        return Scope(tag=self.settings.target_tag, role="wired-network", branch="wired-network")
 
 
 def _ctx(**settings_over) -> _Ctx:
@@ -73,7 +75,7 @@ def _args(command: str, *, config_mode: bool = False) -> argparse.Namespace:
 
 def _patch_targets(monkeypatch, hosts, run_result):
     targets = _Targets(hosts, run_result)
-    monkeypatch.setattr(send_command, "filter_by_tag", lambda nr, tag: targets)
+    monkeypatch.setattr(_Ctx, "target_hosts", lambda self: targets)
     return targets
 
 

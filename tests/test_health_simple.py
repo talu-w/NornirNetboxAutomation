@@ -24,8 +24,8 @@ from bunnyauto.health.collect import (
 from bunnyauto.health.simple_workbook import build_collection_notes, create_health_workbook
 from bunnyauto.reporting import Reporter
 from bunnyauto.result import Status
-from bunnyauto.tools import health
-from bunnyauto.tools.health import TOOL
+from bunnyauto.scope import Scope
+from bunnyauto.tools.wired.health import TOOL
 
 # ---------------------------------------------------------------------------
 # parsers
@@ -214,10 +214,12 @@ class _Targets:
 class _Ctx:
     settings: Settings
     reporter: Reporter
-    _nr: object = None
 
-    def nornir(self):
-        return self._nr
+    def target_hosts(self):  # stubbed per test with monkeypatch
+        raise AssertionError("target_hosts was not stubbed for this test")
+
+    def scope(self):
+        return Scope(tag=self.settings.target_tag, role="wired-network", branch="wired-network")
 
 
 def _ctx() -> _Ctx:
@@ -257,7 +259,7 @@ def test_tool_writes_workbook(monkeypatch, tmp_path):
         pass
 
     run_result = _Results()
-    monkeypatch.setattr(health, "filter_by_tag", lambda nr, tag: _Targets(hosts, run_result))
+    monkeypatch.setattr(_Ctx, "target_hosts", lambda self: _Targets(hosts, run_result))
     monkeypatch.setattr(
         collect,
         "extract_records",
@@ -278,7 +280,7 @@ def test_tool_writes_workbook(monkeypatch, tmp_path):
 
 
 def _run_for_output(monkeypatch, **args) -> Path:
-    monkeypatch.setattr(health, "filter_by_tag", lambda nr, tag: _Targets({"sw1": _Host({})}, {}))
+    monkeypatch.setattr(_Ctx, "target_hosts", lambda self: _Targets({"sw1": _Host({})}, {}))
     monkeypatch.setattr(
         collect, "extract_records", lambda results, hosts_: [{"hostname": "sw1", "reachable": True}]
     )
@@ -305,7 +307,7 @@ def test_output_dir_precedence(monkeypatch, tmp_path):
 
 
 def test_tool_no_devices(monkeypatch):
-    monkeypatch.setattr(health, "filter_by_tag", lambda nr, tag: _Targets({}, {}))
+    monkeypatch.setattr(_Ctx, "target_hosts", lambda self: _Targets({}, {}))
     result = TOOL.run(_ctx(), _args())
     assert result.status is Status.OK
     assert "nornirtest" in result.summary

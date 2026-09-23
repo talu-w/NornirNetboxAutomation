@@ -16,10 +16,10 @@ which this parser currently uses. The neighbor's port is under ``Port ID`` or
 AP's local port). Every candidate for a field is kept, not just the first
 non-empty one, so the caller can try each against NetBox and use whichever
 one actually resolves — same "try progressively more candidates" pattern as
-:func:`bunnyauto.devicetype_match.match_device_type`'s ``model_candidates``,
+:func:`bunnyauto.netbox.tokens.match_record`'s ``model_candidates``,
 since which field holds the useful value isn't knowable in advance.
 
-A row missing any of the three fields ``wireless-enrich`` needs (which AP, at
+A row missing any of the three fields ``wireless enrich`` needs (which AP, at
 least one remote-system candidate, at least one remote-port candidate) is
 skipped rather than guessed — same "never substitute a wrong value" rule as
 the rest of this package.

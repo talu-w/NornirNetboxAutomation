@@ -2,9 +2,10 @@
 
 ``bunnyauto`` with no arguments and ``python -m bunnyauto.hub`` both land here.
 The hub does exactly what
-:mod:`bunnyauto.cli` does — pick an environment, gather a tool's arguments,
-build one Context, run the tool, render the result — except it asks instead of
-reading ``argv``.
+:mod:`bunnyauto.cli` does — pick an environment, pick a category and a tool,
+gather the tool's arguments, build one Context, run the tool, render the result
+— except it asks instead of reading ``argv``. Menus go network -> category ->
+tool, mirroring ``bunnyauto --env <env> <category> <tool>``.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import argparse
 import os
 from collections.abc import Callable, Mapping
 
+from bunnyauto.categories import CATEGORIES
 from bunnyauto.context import build_context
 from bunnyauto.environments import Environment, load_environments
 from bunnyauto.errors import BunnyautoError, ToolError
@@ -63,7 +65,7 @@ def main(argv: list[str] | None = None, *, input_fn: InputFn = input) -> int:
         if environment is None:
             reporter.say("bye.")
             return 0
-        if _tool_loop(environment, args.env_file, reporter, input_fn) == "quit":
+        if _category_loop(environment, args.env_file, reporter, input_fn) == "quit":
             reporter.say("bye.")
             return 0
 
@@ -95,19 +97,55 @@ def _choose_environment(
         reporter.say("  (enter a number from the list, or 'q')")
 
 
-def _tool_loop(
+def _category_loop(
     environment: Environment,
     env_file: str | None,
     reporter: Reporter,
     input_fn: InputFn,
 ) -> str:
-    """Run tools for one environment. Returns ``"quit"`` or ``"back"``."""
-    tools = list(REGISTRY.values())
+    """Pick a category for one environment. Returns ``"quit"`` or ``"back"``."""
+    keys = list(REGISTRY)
     while True:
-        reporter.say(f"\n[{environment.name}] what would you like to do?")
+        reporter.say(f"\n[{environment.name}] which area?")
+        for index, key in enumerate(keys, start=1):
+            category = CATEGORIES[key]
+            branch = (
+                f"  (role branch: {environment.roles[category.branch]})"
+                if category.branch is not None
+                else ""
+            )
+            reporter.say(f"  {index}. {key} — {category.summary}{branch}")
+        reporter.say("  b. back to network choice    q. quit")
+
+        try:
+            choice = input_fn("Choose an area: ").strip().casefold()
+        except EOFError:
+            return "quit"
+        if choice in _QUIT:
+            return "quit"
+        if choice in _BACK:
+            return "back"
+        if not (choice.isdigit() and 1 <= int(choice) <= len(keys)):
+            reporter.say("  (enter a number from the list, 'b', or 'q')")
+            continue
+        if _tool_loop(environment, keys[int(choice) - 1], env_file, reporter, input_fn) == "quit":
+            return "quit"
+
+
+def _tool_loop(
+    environment: Environment,
+    category: str,
+    env_file: str | None,
+    reporter: Reporter,
+    input_fn: InputFn,
+) -> str:
+    """Run tools from one category. Returns ``"quit"`` or ``"back"``."""
+    tools = list(REGISTRY[category].values())
+    while True:
+        reporter.say(f"\n[{environment.name} / {category}] what would you like to do?")
         for index, tool in enumerate(tools, start=1):
             reporter.say(f"  {index}. {tool.name} — {tool.summary}")
-        reporter.say("  b. back to network choice    q. quit")
+        reporter.say("  b. back to areas    q. quit")
 
         try:
             choice = input_fn("Choose a tool: ").strip().casefold()
@@ -204,14 +242,11 @@ def _run_tool(
         timeouts=timeouts_from_args(args),
         need_devices=getattr(tool, "needs_devices", True),
         need_netbox=getattr(tool, "needs_netbox", True),
+        category=CATEGORIES[tool.category],
+        role=getattr(args, "role", None),
     )
     try:
-        reporter.banner(
-            ctx.environment,
-            ctx.settings.target_tag,
-            region=ctx.settings.region,
-            site=ctx.settings.site,
-        )
+        ctx.banner()
         if ctx.settings.apply and not _confirm_apply(ctx.environment, reporter, input_fn):
             reporter.say("not applying — nothing was changed")
             return

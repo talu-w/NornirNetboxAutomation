@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import ipaddress
 
-from bunnyauto.ipam_match import Prefix, find_prefix
+from bunnyauto.netbox.ipam import Prefix, find_prefix
 
 
 def _prefix(id_, cidr, vrf_id=None):

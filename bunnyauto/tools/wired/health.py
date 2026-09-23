@@ -1,4 +1,4 @@
-"""``health`` — the network-health report, in one of two depths.
+"""``wired health`` — the network-health report, in one of two depths.
 
 Merges the old ``health-simple`` and ``health-elaborate`` tools (they were
 near-identical shells over the same collect/record/status machinery). The first
@@ -26,7 +26,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from bunnyauto.common import filter_by_tag
 from bunnyauto.errors import ToolError
 from bunnyauto.health import collect as _simple_collect
 from bunnyauto.health import elaborate_collect as _elaborate_collect
@@ -94,6 +93,7 @@ class Health:
     name: str = "health"
     summary: str = "Create Network Health Reports - Reports are written in Excel format"
     writes: bool = False
+    category: str = "wired"
 
     def add_arguments(self, parser: argparse.ArgumentParser) -> None:
         add_common_arguments(parser)
@@ -130,12 +130,12 @@ class Health:
             ) from None
 
         output_path = _resolve_output(args, report)
-        targets = filter_by_tag(ctx.nornir(), ctx.settings.target_tag)
+        targets = ctx.target_hosts()
         hosts = targets.inventory.hosts
         if not hosts:
             return ToolResult(
                 status=Status.OK,
-                summary=f"no devices carry tag {ctx.settings.target_tag!r}",
+                summary=f"no devices in scope ({ctx.scope().describe()})",
                 data={"report": args.report, "tag": ctx.settings.target_tag, "devices": 0},
             )
 

@@ -17,18 +17,24 @@ The file is deliberately small and hand-editable::
         default_tag: networking-active
         token_env: BUNNYAUTO_PROD_NB_TOKEN
         protected: true
+
+An optional ``roles:`` mapping (top-level, and/or inside one environment to
+override it there) points bunnyauto at your NetBox device-role slugs when they
+differ from :data:`bunnyauto.categories.DEFAULT_ROLES`; see
+:mod:`bunnyauto.categories` for what each key means.
 """
 
 from __future__ import annotations
 
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import yaml
 
+from bunnyauto.categories import DEFAULT_ROLES
 from bunnyauto.errors import ConfigError, UnknownEnvironmentError
 
 DEFAULT_ENV_FILE = "bunnyauto.yaml"
@@ -44,6 +50,7 @@ _ALLOWED_KEYS = {
     "aruba_url",
     "device_username_env",
     "device_password_env",
+    "roles",
 }
 
 
@@ -70,6 +77,10 @@ class Environment:
     #: "use the shared vars" — the common case for test/prod, one AAA realm.
     device_username_env: str | None = None
     device_password_env: str | None = None
+    #: NetBox device-role slugs by :data:`~bunnyauto.categories.DEFAULT_ROLES`
+    #: key — the defaults, overlaid with the file's ``roles:`` (top-level, then
+    #: this environment's own).
+    roles: Mapping[str, str] = field(default_factory=lambda: dict(DEFAULT_ROLES), hash=False)
 
     @property
     def token(self) -> str | None:
@@ -120,9 +131,11 @@ def load_environments(
     if not isinstance(section, Mapping) or not section:
         raise ConfigError(f"{file_path}: 'environments:' must define at least one entry")
 
+    shared_roles = _parse_roles(raw.get("roles"), file_path, where="top-level")
+
     environments: dict[str, Environment] = {}
     for name, body in section.items():
-        environments[str(name)] = _build_environment(str(name), body, file_path)
+        environments[str(name)] = _build_environment(str(name), body, file_path, shared_roles)
     return environments
 
 
@@ -138,7 +151,33 @@ def resolve_environment(
         raise UnknownEnvironmentError(name, environments) from None
 
 
-def _build_environment(name: str, body: Any, file_path: Path) -> Environment:
+def _parse_roles(value: Any, file_path: Path, *, where: str) -> dict[str, str]:
+    """Validate a ``roles:`` mapping: known keys only, each a non-empty slug."""
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise ConfigError(f"{file_path}: {where} 'roles:' must be a mapping of key: slug")
+    unknown = sorted(str(key) for key in value if str(key) not in DEFAULT_ROLES)
+    if unknown:
+        raise ConfigError(
+            f"{file_path}: {where} 'roles:' has unknown key(s): {', '.join(unknown)}",
+            fix=f"use only: {', '.join(DEFAULT_ROLES)}",
+        )
+    roles: dict[str, str] = {}
+    for key, slug in value.items():
+        text = str(slug or "").strip()
+        if not text:
+            raise ConfigError(f"{file_path}: {where} 'roles:' {key!r} needs a role slug")
+        roles[str(key)] = text
+    return roles
+
+
+def _build_environment(
+    name: str,
+    body: Any,
+    file_path: Path,
+    shared_roles: Mapping[str, str] | None = None,
+) -> Environment:
     if not isinstance(body, Mapping):
         raise ConfigError(f"{file_path}: environment {name!r} must be a mapping")
 
@@ -192,6 +231,12 @@ def _build_environment(name: str, body: Any, file_path: Path) -> Environment:
             f"the shared NORNIR_USERNAME/NORNIR_PASSWORD"
         )
 
+    roles = {
+        **DEFAULT_ROLES,
+        **(shared_roles or {}),
+        **_parse_roles(body.get("roles"), file_path, where=f"environment {name!r}"),
+    }
+
     return Environment(
         name=name,
         nb_url=nb_url,
@@ -203,4 +248,5 @@ def _build_environment(name: str, body: Any, file_path: Path) -> Environment:
         aruba_url=aruba_url,
         device_username_env=device_username_env,
         device_password_env=device_password_env,
+        roles=roles,
     )

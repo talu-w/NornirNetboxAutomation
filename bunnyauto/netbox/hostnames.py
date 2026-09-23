@@ -1,6 +1,6 @@
-"""Match an LLDP neighbor's reported system name to an existing NetBox device.
+"""Match a neighbor's reported system name (LLDP/CDP) to an existing NetBox device.
 
-Pure — no I/O. The only signal is the name string an LLDP neighbor reports,
+Pure — no I/O. The only signal is the name string a neighbor reports,
 which may be a bare hostname or a fully-qualified one depending on the
 switch's own configuration; NetBox device names in this project are short
 hostnames. Both sides are normalized to their short form (casefold, domain
@@ -45,7 +45,7 @@ def match_hostname_candidates(candidates: list[str], devices: list[Any]) -> Any 
     return None
 
 
-def with_stack_suffix(candidates: list[str], member: str | None) -> list[str]:
+def with_stack_suffix(candidates: list[str], member: int | str | None) -> list[str]:
     """Expand each candidate with a ``<host>-<member>[.<domain>]`` form tried first.
 
     A virtually-stacked switch's chassis reports one shared LLDP identity for
@@ -56,10 +56,10 @@ def with_stack_suffix(candidates: list[str], member: str | None) -> list[str]:
     same stack (confirmed 2026-09-23: renaming NetBox devices to drop the
     suffix is not the fix). The member-suffixed form is tried *first* when a
     member hint is available (see
-    :func:`bunnyauto.ifname_match.stack_member_hint`) so a coincidentally
+    :func:`bunnyauto.netbox.interfaces.stack_member`) so a coincidentally
     bare-named device elsewhere in NetBox never wins over the actual stack
     member; the raw candidate is kept as a fallback for a switch that isn't
-    stacked at all. A ``None``/falsy ``member`` returns the candidates
+    stacked at all. A ``None`` / empty ``member`` returns the candidates
     unchanged.
 
     The suffix goes **before** the domain, not appended to the end of the
@@ -71,7 +71,7 @@ def with_stack_suffix(candidates: list[str], member: str | None) -> list[str]:
     there onward is carried through unchanged, same "ignore the domain"
     convention :func:`normalize_hostname` already uses for comparison.
     """
-    if not member:
+    if member is None or member == "":
         return list(candidates)
     expanded: list[str] = []
     for candidate in candidates:

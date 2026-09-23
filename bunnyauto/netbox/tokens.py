@@ -1,4 +1,10 @@
-"""Match a short vendor model string to a NetBox device type by model/slug.
+"""Match a terse vendor string to a NetBox record by token containment.
+
+Used for device types (``wireless sync``: Aruba's ``"655"`` -> the NetBox
+device type ``"Aruba AP-655"``) and for platforms (``wireless enrich``: a
+reported ``"8.10.0.5"`` becomes the candidate ``"AOS 8"`` -> the NetBox
+platform ``"AOS 8"``). Any NetBox record with name-like fields works the same
+way; pass the fields to compare as ``key_fields``.
 
 Pure — no I/O. A device reports a terse model string (Aruba: ``"655"``,
 ``"AP-655"``); a real NetBox device type's ``model``/``slug`` is usually longer
@@ -36,31 +42,31 @@ def _contains_contiguous(haystack: list[str], needle: list[str]) -> bool:
     return any(haystack[i : i + span] == needle for i in range(len(haystack) - span + 1))
 
 
-def match_device_type(
-    model_candidates: list[str],
-    device_types: list[Any],
+def match_record(
+    candidates: list[str],
+    records: list[Any],
     *,
     key_fields: tuple[str, ...] = ("model", "slug"),
 ) -> Any | None:
-    """Return the one device type matching a model candidate, or ``None``.
+    """Return the one record matching a candidate string, or ``None``.
 
-    Tries each of ``model_candidates`` in order (best guess first — typically
-    the bare model number, then a more specific ``"AP-<model>"`` form). A
-    candidate is accepted the moment it identifies exactly one device type
-    (checking ``key_fields`` on each); a candidate matching zero or more than
-    one device type is skipped in favor of the next, more specific candidate.
-    ``None`` if no candidate ever resolves to exactly one.
+    Tries each of ``candidates`` in order (best guess first — for a device
+    type, typically the bare model number, then a more specific
+    ``"AP-<model>"`` form). A candidate is accepted the moment it identifies
+    exactly one record (checking ``key_fields`` on each); a candidate matching
+    zero or more than one record is skipped in favor of the next, more
+    specific candidate. ``None`` if no candidate ever resolves to exactly one.
     """
-    for candidate in model_candidates:
+    for candidate in candidates:
         needle = tokens(candidate)
         if not needle:
             continue
         matched: dict[int, Any] = {}
-        for device_type in device_types:
+        for record in records:
             for field in key_fields:
-                raw = getattr(device_type, field, "")
+                raw = getattr(record, field, "")
                 if raw and _contains_contiguous(tokens(raw), needle):
-                    matched[id(device_type)] = device_type
+                    matched[id(record)] = record
                     break
         if len(matched) == 1:
             return next(iter(matched.values()))

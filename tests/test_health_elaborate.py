@@ -29,8 +29,8 @@ from bunnyauto.health.elaborate_workbook import (
 )
 from bunnyauto.reporting import Reporter
 from bunnyauto.result import Status
-from bunnyauto.tools import health
-from bunnyauto.tools.health import TOOL
+from bunnyauto.scope import Scope
+from bunnyauto.tools.wired.health import TOOL
 
 # ---------------------------------------------------------------------------
 # small helpers
@@ -230,10 +230,12 @@ class _Targets:
 class _Ctx:
     settings: Settings
     reporter: Reporter
-    _nr: object = None
 
-    def nornir(self):
-        return self._nr
+    def target_hosts(self):  # stubbed per test with monkeypatch
+        raise AssertionError("target_hosts was not stubbed for this test")
+
+    def scope(self):
+        return Scope(tag=self.settings.target_tag, role="wired-network", branch="wired-network")
 
 
 def _ctx() -> _Ctx:
@@ -263,7 +265,7 @@ def test_output_must_be_xlsx():
 
 def test_tool_writes_workbook(monkeypatch, tmp_path):
     hosts = {"sw1": object(), "sw2": object()}
-    monkeypatch.setattr(health, "filter_by_tag", lambda nr, tag: _Targets(hosts, {}))
+    monkeypatch.setattr(_Ctx, "target_hosts", lambda self: _Targets(hosts, {}))
     monkeypatch.setattr(
         elaborate_collect,
         "extract_records",
@@ -281,7 +283,7 @@ def test_tool_writes_workbook(monkeypatch, tmp_path):
 
 
 def test_elaborate_dir_env_wins_over_shared(monkeypatch, tmp_path):
-    monkeypatch.setattr(health, "filter_by_tag", lambda nr, tag: _Targets({"sw1": object()}, {}))
+    monkeypatch.setattr(_Ctx, "target_hosts", lambda self: _Targets({"sw1": object()}, {}))
     monkeypatch.setattr(
         elaborate_collect,
         "extract_records",
@@ -297,6 +299,6 @@ def test_elaborate_dir_env_wins_over_shared(monkeypatch, tmp_path):
 
 
 def test_tool_no_devices(monkeypatch):
-    monkeypatch.setattr(health, "filter_by_tag", lambda nr, tag: _Targets({}, {}))
+    monkeypatch.setattr(_Ctx, "target_hosts", lambda self: _Targets({}, {}))
     result = TOOL.run(_ctx(), _args())
     assert result.status is Status.OK

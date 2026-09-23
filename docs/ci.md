@@ -4,11 +4,15 @@ Three GitHub Actions workflows drive the network as code:
 
 | Workflow | Trigger | What it does | Writes? |
 |---|---|---|---|
-| [`plan.yml`](../.github/workflows/plan.yml) | every PR | ruff + pytest, then **plan** `create-interfaces` + `sync-interfaces` against **test** and post the diff as a PR comment | no |
+| [`plan.yml`](../.github/workflows/plan.yml) | every PR | ruff + pytest, then **plan** `wired create-interfaces` + `wired sync-interfaces` against **test** and post the diff as a PR comment | no |
 | [`apply.yml`](../.github/workflows/apply.yml) | push to `main` | plan against **prod**, then **apply** after a required reviewer approves the `production` environment | yes (prod NetBox) |
-| [`nightly.yml`](../.github/workflows/nightly.yml) | 07:00 UTC daily | `backup` (redacted) + both health reports for **test** and **prod**, committed to the backups repo | no (backups repo only) |
+| [`nightly.yml`](../.github/workflows/nightly.yml) | 07:00 UTC daily | `wired backup` (redacted) + both `wired health` reports for **test** and **prod**, committed to the backups repo | no (backups repo only) |
 
 The `bunnyauto` CLI is the same one you run locally — CI just passes `--env` and `--apply --yes` explicitly instead of prompting.
+Commands are `bunnyauto --env <env> <category> <tool>`: every tool lives in a category
+(`wired`, `wireless`, `security`, `netbox`) and only touches devices whose NetBox role
+is in that category's branch **and** that carry the environment's tag. Run
+`bunnyauto --env <env> netbox scope` to see exactly what each category reaches.
 
 ## One-time setup
 
@@ -75,7 +79,7 @@ Config `diff`s over time in that repo are the running record of the network.
 ## Day-to-day flow
 
 1. Change something in NetBox (or in a device the pipeline reconciles from).
-2. Open a PR. `plan.yml` comments what `sync-interfaces` / `create-interfaces`
+2. Open a PR. `plan.yml` comments what `wired sync-interfaces` / `wired create-interfaces`
    would change against **test**.
 3. Merge. `apply.yml` plans against **prod** and waits.
 4. A reviewer reads the prod plan and approves the `production` deployment.

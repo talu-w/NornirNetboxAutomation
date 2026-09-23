@@ -11,15 +11,40 @@
 #   protected     optional; true means an --apply needs a typed confirmation
 #   fw_url        optional; base URL of that network's FortiGate REST API
 #   fw_token_env  optional; env var holding that firewall's API token
-#                 (required if fw_url is set — used by the fw-subnet-check tool)
+#                 (required if fw_url is set — used by `security subnet-check`)
 #   aruba_url     optional; base URL of that network's Aruba Mobility Conductor
-#                 REST API (include :4343 if that is the API port). Used by the
-#                 wireless-sync tool. Auth is the shared device login
+#                 REST API (include :4343 if that is the API port). Used by
+#                 `wireless sync`. Auth is the shared device login
 #                 (NORNIR_USERNAME / NORNIR_PASSWORD) — no separate token — and
 #                 the Conductor's TLS certificate is always verified.
+#   roles         optional; per-environment override of the top-level roles:
+#                 block below, for a NetBox whose role slugs differ.
 #
 # Device credentials (NORNIR_USERNAME / NORNIR_PASSWORD) and firewall tokens are
 # never written here — only the *names* of the variables that hold them.
+
+# Tool categories and NetBox device roles (NetBox 4.3+ nested roles).
+#
+# Every tool belongs to a category — `bunnyauto --env <env> <category> <tool>` —
+# and a wired / wireless / security tool only ever touches devices that carry the
+# environment's default_tag AND whose NetBox role sits in that category's branch
+# of the role tree (the branch root or any role beneath it):
+#
+#   Networking
+#   ├── Wired Network      -> wired      Routing, Switching > Core > Distribution > Access
+#   ├── Wireless Network   -> wireless   Wireless Controller > Wireless Access Point
+#   └── Network Security   -> security   Firewalls
+#
+# The defaults below are NetBox's auto-generated slugs for those names — only
+# add this block (or just the keys that differ) if yours are different.
+# `bunnyauto --env <env> netbox scope` shows what each category reaches.
+#
+# roles:
+#   wired: wired-network                          # wired branch root
+#   wireless: wireless-network                    # wireless branch root
+#   security: network-security                    # security branch root
+#   wireless-controller: wireless-controller      # WLCs: `wireless enrich` logs into these
+#   wireless-access-point: wireless-access-point  # APs: `wireless sync` creates these
 
 environments:
 

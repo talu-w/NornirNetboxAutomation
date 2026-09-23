@@ -1,4 +1,4 @@
-"""``fw-subnet-check`` — is a subnet already on the firewall, and in which policies?
+"""``security subnet-check`` — is a subnet already on the firewall, and in which policies?
 
 Read-only. Connects to one FortiGate's REST API, pulls its address objects,
 address groups and firewall policies — both policy CMDB endpoints, since a
@@ -67,9 +67,10 @@ if TYPE_CHECKING:
 
 @dataclass(slots=True)
 class FwSubnetCheck:
-    name: str = "fw-subnet-check"
+    name: str = "subnet-check"
     summary: str = "Check whether a subnet is already on the firewall and in which policies"
     writes: bool = False
+    category: str = "security"
     needs_devices: bool = False
     needs_netbox: bool = False
 

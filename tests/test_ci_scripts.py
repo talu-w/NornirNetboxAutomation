@@ -59,8 +59,8 @@ def fake_tool(monkeypatch):
     calls: list[str] = []
 
     def _install(results: dict[str, dict]):
-        def _run(env, tool):
-            calls.append(tool)
+        def _run(env, category, tool):
+            calls.append(f"{category} {tool}")
             payload = results[tool]
             return payload.get("exit_code", 0), payload
 
@@ -80,6 +80,7 @@ def test_ci_plan_in_sync(fake_tool, capsys):
     assert ci_plan.main(["--env", "test"]) == 0
     out = capsys.readouterr().out
     assert "NetBox is in sync" in out
+    assert "`wired sync-interfaces`" in out
 
 
 def test_ci_plan_drift(fake_tool, capsys):
@@ -121,9 +122,33 @@ def test_ci_plan_parses_bad_json(monkeypatch):
         return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="bunnyauto: NetBox down\n")
 
     monkeypatch.setattr(ci_plan.subprocess, "run", _fake_run)
-    code, payload = ci_plan._run_tool("test", "sync-interfaces")
+    code, payload = ci_plan._run_tool("test", "wired", "sync-interfaces")
     assert payload["status"] == "error"
     assert "NetBox down" in payload["summary"]
+
+
+def test_ci_plan_runs_the_categorized_commands(monkeypatch):
+    import subprocess
+
+    seen: list[list[str]] = []
+
+    def _fake_run(cmd, **kwargs):
+        seen.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout='{"status": "ok", "summary": "x"}')
+
+    monkeypatch.setattr(ci_plan.subprocess, "run", _fake_run)
+    assert ci_plan.main(["--env", "test"]) == 0
+    assert [cmd[-2:] for cmd in seen] == [
+        ["wired", "create-interfaces"],
+        ["wired", "sync-interfaces"],
+    ]
+
+
+def test_ci_plan_tools_exist_in_the_registry():
+    from bunnyauto.tools import REGISTRY
+
+    for category, tool in ci_plan.PLAN_TOOLS:
+        assert REGISTRY[category][tool].writes is True
 
 
 def test_json_error_shape_is_documented():

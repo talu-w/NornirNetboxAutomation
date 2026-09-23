@@ -18,49 +18,109 @@ from bunnyauto.result import Status, ToolResult
 def test_parser_requires_env():
     parser = cli.build_parser()
     with pytest.raises(SystemExit):
-        parser.parse_args(["send-command", "show version"])
+        parser.parse_args(["wired", "send-command", "show version"])
 
 
-def test_parser_requires_a_tool():
+def test_parser_requires_a_category():
     parser = cli.build_parser()
     with pytest.raises(SystemExit):
         parser.parse_args(["--env", "test"])
 
 
+def test_parser_requires_a_tool_within_the_category():
+    parser = cli.build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--env", "test", "wired"])
+
+
 def test_parser_happy_path():
     parser = cli.build_parser()
     args = parser.parse_args(
-        ["--env", "test", "--json", "send-command", "show version", "--tag", "core"]
+        ["--env", "test", "--json", "wired", "send-command", "show version", "--tag", "core"]
     )
     assert args.env == "test"
     assert args.json is True
+    assert args.category == "wired"
     assert args.tool == "send-command"
     assert args.command == "show version"
     assert args.tag == "core"
 
 
-def test_parser_accepts_region_and_site():
+def test_parser_accepts_role_region_and_site():
     parser = cli.build_parser()
     args = parser.parse_args(
         [
             "--env",
             "test",
+            "wired",
             "send-command",
             "show version",
+            "--role",
+            "access-switch",
             "--region",
             "south",
             "--site",
             "dallas-metro-it-services",
         ]
     )
+    assert args.role == "access-switch"
     assert args.region == "south"
     assert args.site == "dallas-metro-it-services"
+
+
+def test_every_category_has_its_tools():
+    parser = cli.build_parser()
+    for argv in (
+        ["wired", "backup"],
+        ["wired", "sync-interfaces"],
+        ["wireless", "sync"],
+        ["wireless", "enrich"],
+        ["security", "subnet-check", "10.0.0.0/24"],
+        ["netbox", "import-device-type", "x.yaml"],
+        ["netbox", "scope"],
+    ):
+        args = parser.parse_args(["--env", "test", *argv])
+        assert (args.category, args.tool) == (argv[0], argv[1])
+
+
+def test_a_tool_is_not_reachable_from_another_category():
+    parser = cli.build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--env", "test", "wireless", "backup"])
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (
+            ["--env", "test", "backup", "--raw"],
+            "run: bunnyauto --env test wired backup --raw",
+        ),
+        (
+            ["--env", "prod", "wireless-sync", "--apply"],
+            "run: bunnyauto --env prod wireless sync --apply",
+        ),
+        (
+            ["--env", "test", "fw-subnet-check", "10.1.0.0/24"],
+            "run: bunnyauto --env test security subnet-check 10.1.0.0/24",
+        ),
+    ],
+)
+def test_a_tool_typed_without_its_category_gets_the_corrected_command(argv, expected, capsys):
+    assert cli.main(argv) == 2
+    assert expected in capsys.readouterr().err
+
+
+def test_unknown_word_is_left_to_argparse():
+    assert cli._category_hint(["--env", "test", "nonsense"]) is None
+    assert cli._category_hint(["--env", "wired", "wired", "backup"]) is None
 
 
 class _FakeTool:
     name = "send-command"
     summary = "fake"
     writes = False
+    category = "wired"
 
     def __init__(self, result=None, exc=None):
         self._result = result
@@ -83,6 +143,9 @@ class _FakeCtx:
         self.settings = argparse.Namespace(target_tag="nornirtest", region=None, site=None)
         self.closed = False
 
+    def banner(self):
+        pass
+
     def close(self):
         self.closed = True
 
@@ -90,7 +153,7 @@ class _FakeCtx:
 @pytest.fixture
 def fake_registry(monkeypatch):
     def _install(tool):
-        monkeypatch.setitem(cli.REGISTRY, "send-command", tool)
+        monkeypatch.setitem(cli.REGISTRY["wired"], "send-command", tool)
         return tool
 
     return _install
@@ -101,7 +164,7 @@ def test_main_returns_tool_exit_code(monkeypatch, fake_registry):
     tool = fake_registry(_FakeTool(result=ToolResult(status=Status.DRIFT, summary="2 changes")))
     monkeypatch.setattr(cli, "build_context", lambda **kw: ctx)
 
-    code = cli.main(["--env", "test", "send-command", "show version"])
+    code = cli.main(["--env", "test", "wired", "send-command", "show version"])
 
     assert code == 10  # DRIFT
     assert ctx.closed is True
@@ -116,7 +179,7 @@ def test_main_friendly_error(monkeypatch, fake_registry, capsys):
 
     monkeypatch.setattr(cli, "build_context", _boom)
 
-    code = cli.main(["--env", "test", "send-command", "show version"])
+    code = cli.main(["--env", "test", "wired", "send-command", "show version"])
 
     assert code == 1
     err = capsys.readouterr().err
@@ -133,7 +196,7 @@ def test_main_debug_reraises(monkeypatch, fake_registry):
     monkeypatch.setattr(cli, "build_context", _boom)
 
     with pytest.raises(InventoryError):
-        cli.main(["--env", "test", "--debug", "send-command", "show version"])
+        cli.main(["--env", "test", "--debug", "wired", "send-command", "show version"])
 
 
 def test_json_output_is_always_valid_json_even_on_error(tmp_path):
@@ -162,6 +225,7 @@ def test_json_output_is_always_valid_json_even_on_error(tmp_path):
             "--env-file",
             str(env_file),
             "--json",
+            "wired",
             "sync-interfaces",
         ],
         capture_output=True,

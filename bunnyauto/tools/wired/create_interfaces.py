@@ -1,58 +1,28 @@
-"""``create-interfaces`` — discover device interfaces and create the missing ones in NetBox.
+"""``wired create-interfaces`` — discover device interfaces and create the missing ones in NetBox.
 
 Ported from ``create_interfaces_netbox.py``. Plans by default; ``--apply`` writes.
 It never updates or deletes an interface — only creates ones NetBox is missing.
+Name matching and the NetBox type a new interface gets both come from
+:mod:`bunnyauto.netbox.interfaces`, shared with every other tool.
 """
 
 from __future__ import annotations
 
 import argparse
-import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from nornir.core.task import Result, Task
 from nornir_netmiko.tasks import netmiko_send_command
 
+from bunnyauto.common import first_error
 from bunnyauto.errors import ToolError
-from bunnyauto.netbox_match import get_netbox_device, select_tagged_inventory
+from bunnyauto.netbox.devices import get_netbox_device, select_tagged_inventory
+from bunnyauto.netbox.interfaces import canonical_name, interface_type
 from bunnyauto.tools.base import Status, ToolResult, add_common_arguments
 
 if TYPE_CHECKING:
     from bunnyauto.context import Context
-
-# Interface-name prefix -> NetBox interface type. The Port-Channel ("lag") rule
-# must precede the generic virtual rules so aggregates are always created.
-TYPE_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
-    (re.compile(r"^(?:port-?channel|po)(?=\d|[./:]|$)", re.I), "lag"),
-    (re.compile(r"^(?:lo|loopback)", re.I), "virtual"),
-    (re.compile(r"^(?:vlan|bdi|irb|tunnel|tun)", re.I), "virtual"),
-    (re.compile(r"^(?:fa|fastethernet)", re.I), "100base-tx"),
-    (re.compile(r"^(?:fi|fivegigabitethernet)", re.I), "5gbase-t"),
-    (re.compile(r"^(?:gi|gigabitethernet)", re.I), "1000base-t"),
-    (re.compile(r"^(?:te|tengigabitethernet)", re.I), "10gbase-x-sfpp"),
-    (re.compile(r"^(?:tw|twe|twentyfivegige|twentyfivegigabitethernet)", re.I), "25gbase-x-sfp28"),
-    (re.compile(r"^(?:fo|fortygige|fortygigabitethernet)", re.I), "40gbase-x-qsfpp"),
-    (re.compile(r"^(?:hu|hundredgige|hundredgigabitethernet)", re.I), "100gbase-x-qsfp28"),
-)
-
-_NAME_PREFIXES = {
-    "hundredgigabitethernet": "hu",
-    "hundredgige": "hu",
-    "fortygigabitethernet": "fo",
-    "fortygige": "fo",
-    "twentyfivegigabitethernet": "twe",
-    "twentyfivegige": "twe",
-    "tengigabitethernet": "te",
-    "tengige": "te",
-    "gigabitethernet": "gi",
-    "fastethernet": "fa",
-    "fivegigabitethernet": "fi",
-    "port-channel": "po",
-    "portchannel": "po",
-    "loopback": "lo",
-    "ethernet": "eth",
-}
 
 _DISABLED_STATES = {"administratively down", "admin down", "disabled"}
 
@@ -62,21 +32,6 @@ class DiscoveredInterface:
     name: str
     description: str = ""
     enabled: bool = True
-
-
-def normalize_name(name: str) -> str:
-    compact = re.sub(r"\s+", "", name).casefold()
-    for long_name, short_name in _NAME_PREFIXES.items():
-        if compact.startswith(long_name):
-            return short_name + compact[len(long_name) :]
-    return compact
-
-
-def interface_type(name: str) -> str:
-    for pattern, netbox_type in TYPE_RULES:
-        if pattern.search(name):
-            return netbox_type
-    return "other"
 
 
 def parse_interfaces(rows: Any, include_virtual: bool) -> list[DiscoveredInterface]:
@@ -97,14 +52,14 @@ def parse_interfaces(rows: Any, include_virtual: bool) -> list[DiscoveredInterfa
             continue
         status = str(row.get("link_status") or row.get("status") or "").casefold()
         discovered.setdefault(
-            normalize_name(name),
+            canonical_name(name),
             DiscoveredInterface(
                 name=name,
                 description=str(row.get("description") or "").strip(),
                 enabled=status not in _DISABLED_STATES,
             ),
         )
-    return sorted(discovered.values(), key=lambda item: normalize_name(item.name))
+    return sorted(discovered.values(), key=lambda item: canonical_name(item.name))
 
 
 def _collect(task: Task, include_virtual: bool) -> Result:
@@ -127,13 +82,14 @@ class CreateInterfaces:
     name: str = "create-interfaces"
     summary: str = "Create NetBox interfaces that a device has but NetBox is missing"
     writes: bool = True
+    category: str = "wired"
 
     def add_arguments(self, parser: argparse.ArgumentParser) -> None:
         add_common_arguments(parser)
         parser.add_argument(
             "--device",
             default=None,
-            help="limit to one device by name (must still carry the tag)",
+            help="limit to one device by name (must still be in scope)",
         )
         parser.add_argument(
             "--include-virtual",
@@ -144,15 +100,19 @@ class CreateInterfaces:
 
     def run(self, ctx: Context, args: argparse.Namespace) -> ToolResult:
         nb = ctx.netbox()
-        tag = ctx.settings.target_tag
-        tagged = list(nb.dcim.devices.filter(tag=tag))
+        tagged = ctx.target_devices()
         if args.device:
             wanted = args.device.casefold()
             tagged = [d for d in tagged if str(d.name).casefold() == wanted]
             if not tagged:
-                raise ToolError(f"device {args.device!r} was not found with tag {tag!r}")
+                raise ToolError(
+                    f"device {args.device!r} was not found in scope ({ctx.scope().describe()})"
+                )
         if not tagged:
-            return ToolResult(status=Status.OK, summary=f"no NetBox devices carry tag {tag!r}")
+            return ToolResult(
+                status=Status.OK,
+                summary=f"no NetBox devices in scope ({ctx.scope().describe()})",
+            )
 
         selected = select_tagged_inventory(ctx.nornir(), tagged)
         if not selected.inventory.hosts:
@@ -175,7 +135,7 @@ class CreateInterfaces:
         for host_name, multi in run_result.items():
             discovered = _discovered(multi)
             if multi.failed or discovered is None:
-                message = _first_error(multi)
+                message = first_error(multi, "interface discovery failed")
                 failures.append(host_name)
                 data[host_name] = {"ok": False, "error": message}
                 ctx.reporter.error(f"{host_name}: {message}")
@@ -185,10 +145,10 @@ class CreateInterfaces:
                 host = selected.inventory.hosts[host_name]
                 device = get_netbox_device(nb, host)
                 existing = {
-                    normalize_name(i.name)
+                    canonical_name(i.name)
                     for i in nb.dcim.interfaces.filter(device_id=int(device.id))
                 }
-                missing = [i for i in discovered if normalize_name(i.name) not in existing]
+                missing = [i for i in discovered if canonical_name(i.name) not in existing]
             except Exception as exc:  # pynetbox RequestError etc.
                 failures.append(host_name)
                 data[host_name] = {"ok": False, "error": str(exc)}
@@ -269,14 +229,6 @@ def _discovered(multi) -> list[DiscoveredInterface] | None:
         ):
             return item.result
     return None
-
-
-def _first_error(multi) -> str:
-    for item in reversed(list(multi)):
-        exc = getattr(item, "exception", None)
-        if exc is not None:
-            return f"{type(exc).__name__}: {exc}"
-    return "interface discovery failed"
 
 
 TOOL = CreateInterfaces()

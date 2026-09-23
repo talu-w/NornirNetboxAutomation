@@ -96,6 +96,7 @@ class Reporter:
         environment: Environment,
         tag: str,
         *,
+        role: str | None = None,
         region: str | None = None,
         site: str | None = None,
     ) -> None:
@@ -104,6 +105,8 @@ class Reporter:
             return
         marker = "PRODUCTION" if environment.protected else environment.name.upper()
         scope = f"  tag={tag}"
+        if role:
+            scope += f"  role={role}"
         if region:
             scope += f"  region={region}"
         if site:

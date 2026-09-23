@@ -71,6 +71,14 @@ class TagMismatchError(BunnyautoError):
         )
 
 
+class RoleScopeError(BunnyautoError):
+    """A category's branch role, or ``--role``, doesn't exist or is outside the branch.
+
+    The role-side twin of :class:`TagMismatchError`: the tag keeps a run on one
+    network, the role branch keeps a category's tools on their own devices.
+    """
+
+
 class InventoryError(BunnyautoError):
     """Nornir could not be initialized, or the tag matched no devices."""
 

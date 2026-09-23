@@ -1,4 +1,4 @@
-"""``import-device-type`` — create a NetBox device type from a Device Type Library YAML file.
+"""``netbox import-device-type`` — create a NetBox device type from a Device Type Library YAML file.
 
 Reads one YAML file in the NetBox Device Type Library format — the format used
 by both the community `devicetype-library
@@ -118,6 +118,7 @@ class ImportDeviceType:
         "Create a NetBox device type (and its templates) from a Device Type Library YAML file"
     )
     writes: bool = True
+    category: str = "netbox"
     needs_devices: bool = False
 
     def add_arguments(self, parser: argparse.ArgumentParser) -> None:

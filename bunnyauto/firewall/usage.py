@@ -3,7 +3,7 @@
 Pure functions over the raw dicts a :class:`FortiGateClient` returns — no I/O,
 so this is the part with the heavy test coverage.
 
-The question the ``fw-subnet-check`` tool answers has three outcomes:
+The question the ``security subnet-check`` tool answers has three outcomes:
 
 * **not present** — no address object overlaps the queried subnet. Free to use.
 * **present, unreferenced** — an object exists (exact, or a wider/narrower block

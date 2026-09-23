@@ -11,7 +11,7 @@ import pytest
 from bunnyauto.errors import ToolError
 from bunnyauto.reporting import Reporter
 from bunnyauto.result import Status
-from bunnyauto.tools.device_type_import import TOOL, load_device_type_yaml, slugify
+from bunnyauto.tools.netbox.import_device_type import TOOL, load_device_type_yaml, slugify
 
 # --- fake pynetbox ---------------------------------------------------
 
@@ -365,6 +365,6 @@ def test_image_fields_produce_a_note_not_a_change(tmp_path):
 def test_tool_is_registered():
     from bunnyauto.tools import REGISTRY
 
-    assert REGISTRY["import-device-type"] is TOOL
+    assert REGISTRY["netbox"]["import-device-type"] is TOOL
     assert TOOL.writes is True
     assert TOOL.needs_devices is False

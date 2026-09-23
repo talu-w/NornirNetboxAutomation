@@ -16,8 +16,8 @@ from bunnyauto.backup.workbook import create_interface_workbook
 from bunnyauto.context import Settings
 from bunnyauto.reporting import Reporter
 from bunnyauto.result import Status
-from bunnyauto.tools import backup
-from bunnyauto.tools.backup import TOOL
+from bunnyauto.scope import Scope
+from bunnyauto.tools.wired.backup import TOOL
 
 # ---------------------------------------------------------------------------
 # sanitize
@@ -188,10 +188,12 @@ class _Targets:
 class _Ctx:
     settings: Settings
     reporter: Reporter
-    _nr: object = None
 
-    def nornir(self):
-        return self._nr
+    def target_hosts(self):  # stubbed per test with monkeypatch
+        raise AssertionError("target_hosts was not stubbed for this test")
+
+    def scope(self):
+        return Scope(tag=self.settings.target_tag, role="wired-network", branch="wired-network")
 
 
 def _ctx() -> _Ctx:
@@ -213,7 +215,7 @@ def _args(*, raw: bool = False, output_dir: str = "./bk") -> argparse.Namespace:
 
 def _patch(monkeypatch, hosts, run_result):
     targets = _Targets(hosts, run_result)
-    monkeypatch.setattr(backup, "filter_by_tag", lambda nr, tag: targets)
+    monkeypatch.setattr(_Ctx, "target_hosts", lambda self: targets)
     return targets
 
 

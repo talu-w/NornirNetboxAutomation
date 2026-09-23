@@ -67,5 +67,5 @@ jobs:
       - name: Apply to prod NetBox
         run: |
           set -o pipefail
-          bunnyauto --env prod create-interfaces --apply --yes
-          bunnyauto --env prod sync-interfaces --apply --yes
+          bunnyauto --env prod wired create-interfaces --apply --yes
+          bunnyauto --env prod wired sync-interfaces --apply --yes

@@ -1,4 +1,4 @@
-"""Tests for the wireless-enrich tool (fake WLC client + fake pynetbox, no HTTP)."""
+"""Tests for `wireless enrich` (fake WLC client + fake pynetbox, no HTTP)."""
 
 from __future__ import annotations
 
@@ -7,11 +7,14 @@ from types import SimpleNamespace
 
 import pytest
 
+from bunnyauto.categories import DEFAULT_ROLES
 from bunnyauto.errors import ArubaError, ToolError
+from bunnyauto.netbox.roles import RoleTree
 from bunnyauto.reporting import Reporter
 from bunnyauto.result import Status
-from bunnyauto.tools import wireless_enrich
-from bunnyauto.tools.wireless_enrich import TOOL
+from bunnyauto.scope import resolve_scope
+from bunnyauto.tools.wireless import enrich as wireless_enrich
+from bunnyauto.tools.wireless.enrich import TOOL
 
 # --- fake pynetbox ---------------------------------------------------
 
@@ -51,10 +54,31 @@ class _Endpoint:
 
 
 class _DevicesEndpoint(_Endpoint):
-    def filter(self, *, role=None, tag=None):
+    """Emulates NetBox >= 4.3: ``role=`` matches that role *and every role beneath it*."""
+
+    def __init__(self, items, roles):
+        super().__init__(items)
+        self._roles = roles
+
+    def _branch(self, root):
+        slugs = {root}
+        grew = True
+        while grew:
+            grew = False
+            for role in self._roles:
+                parent = getattr(role, "parent", None)
+                if parent is not None and parent.slug in slugs and role.slug not in slugs:
+                    slugs.add(role.slug)
+                    grew = True
+        return slugs
+
+    def filter(self, *, role=None, tag=None, region=None, site=None):
         result = list(self._items)
         if role is not None:
-            result = [d for d in result if getattr(getattr(d, "role", None), "slug", None) == role]
+            branch = self._branch(role)
+            result = [
+                d for d in result if getattr(getattr(d, "role", None), "slug", None) in branch
+            ]
         if tag is not None:
             result = [d for d in result if tag in [t.slug for t in getattr(d, "tags", [])]]
         return result
@@ -65,14 +89,17 @@ class _NB:
         self.version = "4.1"
         self.dcim = SimpleNamespace(
             device_roles=_Endpoint(roles),
-            devices=_DevicesEndpoint(devices),
+            devices=_DevicesEndpoint(devices, roles),
             platforms=_Endpoint(platforms),
             interfaces=_Endpoint(interfaces),
             cables=_Endpoint(cables),
         )
 
 
-_WLC_ROLE = _Rec(id=8, slug="wireless-controller", name="Wireless Controller")
+# The owner's wireless role branch: Wireless Network > Wireless Controller > Wireless Access Point.
+_BRANCH_ROLE = _Rec(id=9, slug="wireless-network", name="Wireless Network", parent=None)
+_WLC_ROLE = _Rec(id=8, slug="wireless-controller", name="Wireless Controller", parent=_BRANCH_ROLE)
+_AP_ROLE = _Rec(id=7, slug="wireless-access-point", name="Wireless Access Point", parent=_WLC_ROLE)
 _WIRELESS_TAG = _Rec(slug="nornirtest")
 
 
@@ -95,7 +122,7 @@ def _switch(name="hq-idf1-sw01", id_=200):
 
 
 def _nb(*, wlcs=(), other_devices=(), platforms=(), interfaces=(), with_role=True):
-    roles = [_WLC_ROLE] if with_role else []
+    roles = [_BRANCH_ROLE, _WLC_ROLE, _AP_ROLE] if with_role else [_BRANCH_ROLE]
     return _NB(
         roles=roles,
         devices=[*wlcs, *other_devices],
@@ -106,14 +133,31 @@ def _nb(*, wlcs=(), other_devices=(), platforms=(), interfaces=(), with_role=Tru
 
 class _Ctx:
     def __init__(self, nb, *, apply=False, tag="nornirtest"):
-        self.settings = SimpleNamespace(apply=apply, target_tag=tag)
+        self.settings = SimpleNamespace(
+            apply=apply,
+            target_tag=tag,
+            category="wireless",
+            branch_role=DEFAULT_ROLES["wireless"],
+            role=None,
+            region=None,
+            site=None,
+        )
         self.creds = SimpleNamespace(username="u", password="p")
-        self.environment = SimpleNamespace(name="test")
+        self.environment = SimpleNamespace(name="test", roles=dict(DEFAULT_ROLES))
         self.reporter = Reporter(json_mode=True)
         self._nb = nb
 
     def netbox(self):
         return self._nb
+
+    def role_tree(self):
+        return RoleTree.load(self._nb)
+
+    def scope(self):
+        return resolve_scope(self.settings, self.role_tree)
+
+    def target_devices(self):
+        return list(self._nb.dcim.devices.filter(**self.scope().device_filters()))
 
 
 # --- fake WLC client ---------------------------------------------------
@@ -194,6 +238,22 @@ def test_wlc_not_tagged_is_excluded(monkeypatch):
     _fake_client(monkeypatch)
     result = TOOL.run(_Ctx(_nb(wlcs=[_wlc(tagged=False)])), _args())
     assert result.status is Status.OK
+
+
+def test_aps_nested_under_the_wlc_role_are_never_logged_into(monkeypatch):
+    """Regression: NetBox's role filter is hierarchical and Wireless Access
+    Point sits *under* Wireless Controller, so role=wireless-controller also
+    returns APs. Only devices whose role is exactly the WLC role are WLCs."""
+    captured = _fake_client(monkeypatch)
+    tagged_ap = _Rec(
+        id=300,
+        name="hq-idf1-ap09",
+        role=_AP_ROLE,
+        tags=[_WIRELESS_TAG],
+        primary_ip4=_Rec(address="10.9.9.9/24"),
+    )
+    TOOL.run(_Ctx(_nb(wlcs=[_wlc()], other_devices=[tagged_ap])), _args())
+    assert captured["urls"] == ["https://10.1.0.5:4343"]
 
 
 def test_device_filter(monkeypatch):
@@ -514,5 +574,5 @@ def test_existing_cable_on_either_end_is_left_alone(monkeypatch):
 def test_tool_is_registered():
     from bunnyauto.tools import REGISTRY
 
-    assert REGISTRY["wireless-enrich"] is TOOL
+    assert REGISTRY["wireless"]["enrich"] is TOOL
     assert TOOL.writes is True

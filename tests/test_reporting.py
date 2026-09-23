@@ -2,7 +2,7 @@
 
 Rich's ``Console.print`` treats ``[...]`` as markup by default and silently drops
 anything that isn't a recognised style name — so a policy field annotation like
-``[dstaddr]`` (fw-subnet-check) or a menu label like ``[test]`` (the hub) used to
+``[dstaddr]`` (security subnet-check) or a menu label like ``[test]`` (the hub) used to
 vanish outright instead of printing. Every Reporter method that hands dynamic
 content to the console must escape it first.
 """

@@ -46,15 +46,15 @@ jobs:
           path: backups-repo
 
       - name: Back up configs
-        run: bunnyauto --env ${{ matrix.env }} backup --output-dir "backups-repo/${{ matrix.env }}"
+        run: bunnyauto --env ${{ matrix.env }} wired backup --output-dir "backups-repo/${{ matrix.env }}"
 
       - name: Generate health reports
         run: |
           day="$(date -u +%Y-%m-%d)"
           dir="backups-repo/${{ matrix.env }}/reports/$day"
           mkdir -p "$dir"
-          bunnyauto --env ${{ matrix.env }} health simple     --output "$dir/health-simple.xlsx"
-          bunnyauto --env ${{ matrix.env }} health elaborate  --output "$dir/health-elaborate.xlsx"
+          bunnyauto --env ${{ matrix.env }} wired health simple     --output "$dir/health-simple.xlsx"
+          bunnyauto --env ${{ matrix.env }} wired health elaborate  --output "$dir/health-elaborate.xlsx"
 
       - name: Commit and push
         working-directory: backups-repo

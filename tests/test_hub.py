@@ -11,8 +11,8 @@ from bunnyauto import hub
 from bunnyauto.environments import Environment
 from bunnyauto.errors import ToolError
 from bunnyauto.result import Status, ToolResult
-from bunnyauto.tools.device_type_import import TOOL as IMPORT_DEVICE_TYPE
-from bunnyauto.tools.send_command import TOOL as SEND_COMMAND
+from bunnyauto.tools.netbox.import_device_type import TOOL as IMPORT_DEVICE_TYPE
+from bunnyauto.tools.wired.send_command import TOOL as SEND_COMMAND
 
 
 class _Script:
@@ -33,6 +33,7 @@ class _FakeTool:
     name = "demo"
     summary = "a fake tool"
     writes = False
+    category = "wired"
 
     def __init__(self, result: ToolResult):
         self._result = result
@@ -62,6 +63,9 @@ class _FakeCtx:
             protected=environment.protected,
         )
         self.closed = False
+
+    def banner(self) -> None:
+        pass
 
     def close(self) -> None:
         self.closed = True
@@ -188,7 +192,7 @@ def test_main_shows_missing_credentials_but_still_opens_the_menu(env_file, capsy
 
 def test_main_runs_a_tool_then_quits(env_file, creds, monkeypatch):
     fake = _FakeTool(ToolResult(status=Status.OK, summary="done"))
-    monkeypatch.setattr(hub, "REGISTRY", {"demo": fake})
+    monkeypatch.setattr(hub, "REGISTRY", {"wired": {"demo": fake}})
 
     captured = {}
 
@@ -201,17 +205,20 @@ def test_main_runs_a_tool_then_quits(env_file, creds, monkeypatch):
 
     monkeypatch.setattr(hub, "build_context", _fake_build_context)
 
-    script = _Script("1", "1", "show version", "q")
+    # network 1 (test), area 1 (wired), tool 1, its positional, quit
+    script = _Script("1", "1", "1", "show version", "q")
     code = hub.main(["--env-file", str(env_file)], input_fn=script)
 
     assert code == 0
     assert fake.ran is True
     assert captured["env"] == "test"
+    assert captured["category"].key == "wired"  # the run is confined to the wired branch
+    assert captured["role"] is None
 
 
 def test_main_protected_apply_requires_typed_name(env_file, creds, monkeypatch):
     fake = _WriteTool(ToolResult(status=Status.CHANGED, summary="applied"))
-    monkeypatch.setattr(hub, "REGISTRY", {"writer": fake})
+    monkeypatch.setattr(hub, "REGISTRY", {"wired": {"writer": fake}})
 
     def _fake_build_context(**kwargs):
         from bunnyauto.environments import resolve_environment
@@ -221,8 +228,8 @@ def test_main_protected_apply_requires_typed_name(env_file, creds, monkeypatch):
 
     monkeypatch.setattr(hub, "build_context", _fake_build_context)
 
-    # env 2 (prod, protected), tool 1, command, apply=yes, wrong confirmation, quit
-    script = _Script("2", "1", "wr mem", "y", "nope", "q")
+    # env 2 (prod, protected), area 1, tool 1, command, apply=yes, wrong confirmation, quit
+    script = _Script("2", "1", "1", "wr mem", "y", "nope", "q")
     code = hub.main(["--env-file", str(env_file)], input_fn=script)
 
     assert code == 0
@@ -231,6 +238,37 @@ def test_main_protected_apply_requires_typed_name(env_file, creds, monkeypatch):
 
 def test_main_back_then_quit(env_file, creds, monkeypatch):
     fake = _FakeTool(ToolResult(status=Status.OK, summary="x"))
-    monkeypatch.setattr(hub, "REGISTRY", {"demo": fake})
+    monkeypatch.setattr(hub, "REGISTRY", {"wired": {"demo": fake}})
     script = _Script("1", "b", "q")
     assert hub.main(["--env-file", str(env_file)], input_fn=script) == 0
+
+
+def test_area_menu_lists_categories_with_their_role_branch(env_file, creds, capsys):
+    hub.main(["--env-file", str(env_file)], input_fn=_Script("1", "q"))
+    out = capsys.readouterr().out
+    assert "which area?" in out
+    assert "wired" in out and "(role branch: wired-network)" in out
+    assert "wireless" in out and "(role branch: wireless-network)" in out
+    assert "security" in out and "(role branch: network-security)" in out
+
+
+def test_back_from_tools_returns_to_the_area_menu(env_file, creds, monkeypatch):
+    wired = _FakeTool(ToolResult(status=Status.OK, summary="w"))
+    wireless = _FakeTool(ToolResult(status=Status.OK, summary="wl"))
+    wireless.category = "wireless"
+    monkeypatch.setattr(hub, "REGISTRY", {"wired": {"demo": wired}, "wireless": {"demo": wireless}})
+    ran = []
+
+    def _fake_build_context(**kwargs):
+        from bunnyauto.environments import resolve_environment
+
+        ran.append(kwargs["category"].key)
+        return _FakeCtx(resolve_environment(kwargs["env"], kwargs.get("env_file")))
+
+    monkeypatch.setattr(hub, "build_context", _fake_build_context)
+
+    # network 1, area 1 (wired), back, area 2 (wireless), tool 1, positional, quit
+    script = _Script("1", "1", "b", "2", "1", "show version", "q")
+    assert hub.main(["--env-file", str(env_file)], input_fn=script) == 0
+    assert ran == ["wireless"]
+    assert wireless.ran is True and wired.ran is False

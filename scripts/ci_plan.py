@@ -2,8 +2,8 @@
 """Run bunnyauto's mutating tools in plan mode and format a Markdown report.
 
 Used by the CI workflows to show what *would* change before anything is applied.
-Runs each tool via ``bunnyauto --env <env> <tool> --json``, parses the structured
-result, and prints one Markdown block to stdout.
+Runs each tool via ``bunnyauto --env <env> --json <category> <tool>``, parses the
+structured result, and prints one Markdown block to stdout.
 
 Exit code:
   0  every tool ran (whether or not it found drift)
@@ -18,8 +18,8 @@ import re
 import subprocess
 import sys
 
-# Mutating tools, in the order the pipeline applies them.
-PLAN_TOOLS = ("create-interfaces", "sync-interfaces")
+# Mutating tools as (category, tool), in the order the pipeline applies them.
+PLAN_TOOLS = (("wired", "create-interfaces"), ("wired", "sync-interfaces"))
 
 _STATUS_EMOJI = {
     "ok": "✅",
@@ -30,9 +30,9 @@ _STATUS_EMOJI = {
 }
 
 
-def _run_tool(env: str, tool: str) -> tuple[int, dict]:
+def _run_tool(env: str, category: str, tool: str) -> tuple[int, dict]:
     proc = subprocess.run(
-        [sys.executable, "-m", "bunnyauto", "--env", env, "--json", tool],
+        [sys.executable, "-m", "bunnyauto", "--env", env, "--json", category, tool],
         capture_output=True,
         text=True,
         check=False,
@@ -65,14 +65,14 @@ def main(argv: list[str] | None = None) -> int:
     hard_error = False
     any_drift = False
 
-    for tool in PLAN_TOOLS:
-        code, payload = _run_tool(args.env, tool)
+    for category, tool in PLAN_TOOLS:
+        code, payload = _run_tool(args.env, category, tool)
         status = str(payload.get("status", "error"))
         emoji = _STATUS_EMOJI.get(status, "❔")
         summary = payload.get("summary", "(no summary)")
         changes = payload.get("changes", []) or []
 
-        lines.append(f"### {emoji} `{tool}` — {summary}")
+        lines.append(f"### {emoji} `{category} {tool}` — {summary}")
         if status == "error":
             hard_error = True
         if status in {"drift", "partial"}:

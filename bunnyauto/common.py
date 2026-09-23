@@ -165,25 +165,29 @@ def ssl_verify_setting(value: Any) -> bool | str:
     return value  # treat anything else as a CA bundle path
 
 
-def build_nornir(settings: Settings, creds: Credentials) -> Nornir:
+def build_nornir(
+    settings: Settings,
+    creds: Credentials,
+    *,
+    filters: Mapping[str, str] | None = None,
+) -> Nornir:
     """Initialize the NetBox inventory for ``settings.environment`` and prime hosts.
 
     The environment's ``nb_url`` and token override whatever the Nornir config
     carries, so one ``config.yaml`` serves both test and prod.
+
+    ``filters`` (normally :meth:`bunnyauto.scope.Scope.location_filters`: the
+    run's role branch, region and site) narrow the inventory pull itself via
+    NetBox's own devices API filters, layered on top of whatever ``config.yaml``
+    already sets. NetBox's ``role`` and ``region`` filters are both hierarchical
+    (a parent matches its descendants too), so this needs no tree-walking.
     """
     options = load_raw_inventory_options(settings.config_file)
     options["nb_url"] = settings.nb_url
     options["nb_token"] = creds.nb_token
 
-    # --region / --site narrow the inventory pull itself via NetBox's own
-    # devices API filters, layered on top of whatever config.yaml already sets.
-    # NetBox's region filter is hierarchical (a parent region matches its
-    # descendants too), so this needs no tree-walking on our side.
     filter_parameters = dict(options.get("filter_parameters") or {})
-    if settings.region:
-        filter_parameters["region"] = settings.region
-    if settings.site:
-        filter_parameters["site"] = settings.site
+    filter_parameters.update(filters or {})
     if filter_parameters:
         options["filter_parameters"] = filter_parameters
 
@@ -211,16 +215,17 @@ def build_nornir(settings: Settings, creds: Credentials) -> Nornir:
         _apply_netmiko_extras(host, legacy_extras if is_legacy else default_extras)
 
     if not nr.inventory.hosts:
-        scope = ", ".join(
-            f"{key}={value!r}"
-            for key, value in (("region", settings.region), ("site", settings.site))
-            if value
-        )
+        active = {key: value for key, value in (filters or {}).items() if value}
+        scope = ", ".join(f"{key}={value!r}" for key, value in active.items())
+        fix = "confirm devices exist in that NetBox and the API token can read them"
+        if active:
+            fix += f" for that {'/'.join(active)}"
+        if "role" in active:
+            fix += " — the role filter includes child roles, so check the devices' roles sit in it"
         raise InventoryError(
             f"the {settings.environment!r} NetBox returned no devices"
             + (f" matching {scope}" if scope else ""),
-            fix="confirm devices exist in that NetBox and the API token can read them"
-            + (" for that region/site" if scope else ""),
+            fix=fix,
         )
     return nr
 
@@ -229,6 +234,15 @@ def filter_by_tag(nr: Nornir, tag: str) -> Nornir:
     """Return the sub-inventory whose hosts carry ``tag`` (case-insensitive)."""
     slug = tag.strip().casefold()
     return nr.filter(F(tag_slugs__contains=slug))
+
+
+def first_error(multi_result: Any, fallback: str) -> str:
+    """The last exception in a Nornir ``MultiResult`` as ``"Type: message"``, else ``fallback``."""
+    for item in reversed(list(multi_result)):
+        exc = getattr(item, "exception", None)
+        if exc is not None:
+            return f"{type(exc).__name__}: {exc}"
+    return fallback
 
 
 def build_netbox(settings: Settings, token: str) -> Any:

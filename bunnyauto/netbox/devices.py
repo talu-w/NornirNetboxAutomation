@@ -1,8 +1,10 @@
-"""Match Nornir inventory hosts to their authoritative NetBox device objects.
+"""NetBox device records: match them to Nornir hosts, and tag them.
 
-Shared by the tools that write to NetBox (``create-interfaces``,
-``sync-interfaces``). Ported from the matching helpers that were duplicated in
-``create_interfaces_netbox.py`` and ``netbox_interfaces_update.py``.
+The host-matching helpers were first shared by ``create-interfaces`` and
+``sync-interfaces`` (ported from the copies duplicated in
+``create_interfaces_netbox.py`` and ``netbox_interfaces_update.py``).
+:func:`add_tag` came out of ``wireless sync``, and is the one way any tool adds
+a tag to an existing device.
 """
 
 from __future__ import annotations
@@ -10,6 +12,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
+from bunnyauto.common import normalize_tags
 from bunnyauto.errors import NetBoxError
 
 if TYPE_CHECKING:
@@ -60,3 +63,17 @@ def get_netbox_device(nb: Any, host: Any) -> Any:
     if device is None:
         raise NetBoxError(f"no NetBox device matched Nornir host {host.name!r}")
     return device
+
+
+def add_tag(device: Any, slug: str) -> bool | str:
+    """Add tag ``slug`` to an existing device, keeping its other tags.
+
+    ``True`` on success, otherwise the error text (the caller reports it and
+    carries on with the rest of the run).
+    """
+    try:
+        slugs = sorted(set(normalize_tags(getattr(device, "tags", [])) + [slug.casefold()]))
+        device.update({"tags": [{"slug": s} for s in slugs]})
+    except Exception as exc:  # pynetbox RequestError etc.
+        return str(exc)
+    return True

@@ -11,49 +11,15 @@ from bunnyauto.context import Settings
 from bunnyauto.errors import ToolError
 from bunnyauto.reporting import Reporter
 from bunnyauto.result import Status
-from bunnyauto.tools import create_interfaces as ci
-from bunnyauto.tools.create_interfaces import (
+from bunnyauto.scope import Scope
+from bunnyauto.tools.wired import create_interfaces as ci
+from bunnyauto.tools.wired.create_interfaces import (
     TOOL,
     DiscoveredInterface,
-    interface_type,
-    normalize_name,
     parse_interfaces,
 )
 
-# ---------------------------------------------------------------------------
-# naming / typing
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    ("name", "expected"),
-    [
-        ("GigabitEthernet1/0/1", "gi1/0/1"),
-        ("Gi1/0/1", "gi1/0/1"),
-        ("Port-Channel10", "po10"),
-        ("Loopback0", "lo0"),
-    ],
-)
-def test_normalize_name(name, expected):
-    assert normalize_name(name) == expected
-
-
-@pytest.mark.parametrize(
-    ("name", "expected"),
-    [
-        ("Port-channel1", "lag"),
-        ("Po1", "lag"),
-        ("Loopback0", "virtual"),
-        ("Vlan10", "virtual"),
-        ("Tunnel0", "virtual"),
-        ("GigabitEthernet1/0/1", "1000base-t"),
-        ("TenGigE1/1/1", "10gbase-x-sfpp"),
-        ("Weird0", "other"),
-    ],
-)
-def test_interface_type(name, expected):
-    assert interface_type(name) == expected
-
+# Interface naming and typing are shared now — see tests/test_netbox_interfaces.py.
 
 # ---------------------------------------------------------------------------
 # parse_interfaces
@@ -119,7 +85,8 @@ class _Devices:
     def __init__(self, devices):
         self._devices = devices
 
-    def filter(self, tag=None):
+    def filter(self, **filters):
+        self.last_filters = filters
         return list(self._devices)
 
 
@@ -160,6 +127,12 @@ class _Ctx:
 
     def nornir(self):
         return object()
+
+    def scope(self):
+        return Scope(tag=self.settings.target_tag, role="wired-network", branch="wired-network")
+
+    def target_devices(self):
+        return list(self._nb.dcim.devices.filter(**self.scope().device_filters()))
 
 
 def _ctx(*, apply: bool = False) -> _Ctx:

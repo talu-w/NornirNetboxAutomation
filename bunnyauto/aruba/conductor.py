@@ -8,7 +8,7 @@ a traceback.
 Despite the name, this class talks to any AOS 8 box running this API — the
 Conductor itself, or one of its managed WLCs directly (each runs the identical
 ``/v1/api/login`` -> ``UIDARUBA`` -> ``/v1/configuration/showcommand`` service).
-``wireless-enrich`` points one at a WLC's own NetBox-recorded IP to reach
+``wireless enrich`` points one at a WLC's own NetBox-recorded IP to reach
 per-AP data (LLDP neighbors, software version) that the Conductor's own
 aggregated view doesn't carry.
 

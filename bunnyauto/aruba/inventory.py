@@ -34,7 +34,7 @@ class WirelessDevice:
     status: str
     #: Raw software/image version string as the Conductor reports it (e.g. an
     #: AOS 8 build string) — matched against existing NetBox Platforms by
-    #: wireless-enrich, never used to create one. Empty if no recognized
+    #: wireless enrich, never used to create one. Empty if no recognized
     #: version field was present on this row.
     os_version: str = ""
 

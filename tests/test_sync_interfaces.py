@@ -11,9 +11,10 @@ from bunnyauto.context import Settings
 from bunnyauto.errors import ToolError
 from bunnyauto.reporting import Reporter
 from bunnyauto.result import Status
+from bunnyauto.scope import Scope
 from bunnyauto.sync import engine
-from bunnyauto.tools import sync_interfaces
-from bunnyauto.tools.sync_interfaces import TOOL
+from bunnyauto.tools.wired import sync_interfaces
+from bunnyauto.tools.wired.sync_interfaces import TOOL
 
 # ---------------------------------------------------------------------------
 # engine parsers
@@ -115,7 +116,8 @@ class _Devices:
     def __init__(self, devices):
         self._devices = devices
 
-    def filter(self, tag=None):
+    def filter(self, **filters):
+        self.last_filters = filters
         return list(self._devices)
 
 
@@ -135,6 +137,12 @@ class _Ctx:
 
     def nornir(self):
         return object()
+
+    def scope(self):
+        return Scope(tag=self.settings.target_tag, role="wired-network", branch="wired-network")
+
+    def target_devices(self):
+        return list(self._nb.dcim.devices.filter(**self.scope().device_filters()))
 
 
 def _ctx(*, apply: bool = False) -> _Ctx:

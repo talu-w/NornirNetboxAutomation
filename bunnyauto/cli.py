@@ -2,23 +2,38 @@
 
 Assembles the argument parser from the tool registry, builds one ``Context``,
 runs the chosen tool, and returns its exit code. The interactive hub
-(:mod:`bunnyauto.hub`, migration step 3) does the same work with prompts instead
-of ``argv``.
+(:mod:`bunnyauto.hub`) does the same work with prompts instead of ``argv``.
+
+Commands are ``bunnyauto --env <env> <category> <tool> [options]``, e.g.
+``bunnyauto --env prod wired backup`` or ``bunnyauto --env test wireless enrich``;
+see :mod:`bunnyauto.categories`.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import shlex
 import sys
 
 from bunnyauto import __version__
+from bunnyauto.categories import CATEGORIES, DEFAULT_ROLES
 from bunnyauto.common import env_flag
 from bunnyauto.context import build_context
 from bunnyauto.errors import BunnyautoError
 from bunnyauto.reporting import make_reporter
 from bunnyauto.tools import REGISTRY
 from bunnyauto.tools.base import timeouts_from_args
+
+#: Pre-category (flat) names that also changed their own name, mapped to where
+#: they live now. Everything else keeps its name inside its category.
+_RENAMED: dict[str, tuple[str, str]] = {
+    "wireless-sync": ("wireless", "sync"),
+    "wireless-enrich": ("wireless", "enrich"),
+    "fw-subnet-check": ("security", "subnet-check"),
+}
+#: Global options that take a value, so the value isn't mistaken for a category.
+_VALUE_OPTIONS = frozenset({"--env", "--env-file"})
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -50,22 +65,84 @@ def build_parser() -> argparse.ArgumentParser:
         help="show full tracebacks instead of one-line errors",
     )
 
-    subparsers = parser.add_subparsers(dest="tool", required=True, metavar="<tool>")
-    for tool in REGISTRY.values():
-        tool_parser = subparsers.add_parser(tool.name, help=tool.summary, description=tool.summary)
-        if tool.writes:
-            tool_parser.add_argument(
-                "--apply",
-                action="store_true",
-                help="apply the change (default: plan only, nothing written)",
+    categories = parser.add_subparsers(dest="category", required=True, metavar="<category>")
+    for key, tools in REGISTRY.items():
+        category = CATEGORIES[key]
+        category_parser = categories.add_parser(
+            key,
+            help=category.summary,
+            description=_category_description(key),
+        )
+        subparsers = category_parser.add_subparsers(dest="tool", required=True, metavar="<tool>")
+        for tool in tools.values():
+            tool_parser = subparsers.add_parser(
+                tool.name, help=tool.summary, description=tool.summary
             )
-            tool_parser.add_argument(
-                "--yes",
-                action="store_true",
-                help="skip confirmation prompts — for non-interactive/CI use",
-            )
-        tool.add_arguments(tool_parser)
+            if tool.writes:
+                tool_parser.add_argument(
+                    "--apply",
+                    action="store_true",
+                    help="apply the change (default: plan only, nothing written)",
+                )
+                tool_parser.add_argument(
+                    "--yes",
+                    action="store_true",
+                    help="skip confirmation prompts — for non-interactive/CI use",
+                )
+            tool.add_arguments(tool_parser)
     return parser
+
+
+def _category_description(key: str) -> str:
+    category = CATEGORIES[key]
+    text = f"{category.title}: {category.summary}."
+    if category.branch is not None:
+        text += (
+            " Its tools only touch devices that carry the environment's tag and whose "
+            f"NetBox role is {DEFAULT_ROLES[category.branch]!r} or any role beneath it "
+            f"(set roles.{category.branch} in bunnyauto.yaml if your slug differs; "
+            "'netbox scope' shows what that reaches)."
+        )
+    return text
+
+
+def _category_hint(argv: list[str]) -> str | None:
+    """The corrected command when a tool name is typed where a category belongs.
+
+    ``bunnyauto --env test backup --raw`` -> ``bunnyauto --env test wired backup --raw``;
+    a renamed tool (``wireless-sync``) is pointed at its new name too.
+    """
+    index = _first_positional(argv)
+    if index is None or argv[index] in REGISTRY:
+        return None
+    word = argv[index]
+    if word in _RENAMED:
+        category, tool = _RENAMED[word]
+        lead = f"{word!r} is now '{category} {tool}'"
+    else:
+        homes = [category for category, tools in REGISTRY.items() if word in tools]
+        if len(homes) != 1:
+            return None
+        category, tool = homes[0], word
+        lead = f"{word!r} is a {category} tool"
+    fixed = [*argv[:index], category, tool, *argv[index + 1 :]]
+    return f"{lead} — run: {shlex.join(['bunnyauto', *fixed])}"
+
+
+def _first_positional(argv: list[str]) -> int | None:
+    """Index of the first token that isn't a global option or an option's value."""
+    skip_next = False
+    for index, token in enumerate(argv):
+        if skip_next:
+            skip_next = False
+            continue
+        if token in _VALUE_OPTIONS:
+            skip_next = True
+            continue
+        if token.startswith("-"):
+            continue
+        return index
+    return None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -76,10 +153,23 @@ def main(argv: list[str] | None = None) -> int:
 
         return hub_main([])
 
+    hint = _category_hint(raw)
+    if hint is not None:
+        message = f"bunnyauto: {hint}"
+        if "--json" in raw:
+            json.dump(
+                {"status": "error", "summary": message, "exit_code": 2, "changes": []},
+                sys.stdout,
+            )
+            sys.stdout.write("\n")
+        else:
+            sys.stderr.write(f"{message}\n")
+        return 2
+
     parser = build_parser()
     args = parser.parse_args(raw)
     reporter = make_reporter(json_mode=args.json)
-    tool = REGISTRY[args.tool]
+    tool = REGISTRY[args.category][args.tool]
 
     def _fail(message: str, code: int = 1) -> int:
         if args.json:
@@ -109,13 +199,10 @@ def main(argv: list[str] | None = None) -> int:
             timeouts=timeouts_from_args(args),
             need_devices=getattr(tool, "needs_devices", True),
             need_netbox=getattr(tool, "needs_netbox", True),
+            category=CATEGORIES[args.category],
+            role=getattr(args, "role", None),
         )
-        reporter.banner(
-            ctx.environment,
-            ctx.settings.target_tag,
-            region=ctx.settings.region,
-            site=ctx.settings.site,
-        )
+        ctx.banner()
         result = tool.run(ctx, args)
     except BunnyautoError as exc:
         if args.debug:

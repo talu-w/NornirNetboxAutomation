@@ -490,7 +490,7 @@ def test_build_context_applies_region_and_site(env_file, nornir_config, _creds_e
 
 
 # ---------------------------------------------------------------------------
-# build_nornir — region/site -> filter_parameters
+# build_nornir — scope filters (role/region/site) -> filter_parameters
 # ---------------------------------------------------------------------------
 
 
@@ -506,7 +506,7 @@ def _fake_init_nornir_factory(hosts: dict):
     return fake_init_nornir, captured
 
 
-def test_build_nornir_merges_region_and_site_into_filter_parameters(nornir_config, monkeypatch):
+def test_build_nornir_merges_scope_filters_into_filter_parameters(nornir_config, monkeypatch):
     fake_init_nornir, captured = _fake_init_nornir_factory(
         {"h1": SimpleNamespace(data={"tags": []}, connection_options={})}
     )
@@ -517,12 +517,18 @@ def test_build_nornir_merges_region_and_site_into_filter_parameters(nornir_confi
         nb_url="https://nb.example.com",
         config_file=nornir_config,
         target_tag="nornirtest",
-        region="south",
-        site="dallas",
     )
-    build_nornir(settings, Credentials(username="u", password="p", nb_token="t"))
+    build_nornir(
+        settings,
+        Credentials(username="u", password="p", nb_token="t"),
+        filters={"role": "wired-network", "region": "south", "site": "dallas"},
+    )
 
-    assert captured["options"]["filter_parameters"] == {"region": "south", "site": "dallas"}
+    assert captured["options"]["filter_parameters"] == {
+        "role": "wired-network",
+        "region": "south",
+        "site": "dallas",
+    }
 
 
 def test_build_nornir_omits_filter_parameters_when_region_and_site_unset(
@@ -544,7 +550,7 @@ def test_build_nornir_omits_filter_parameters_when_region_and_site_unset(
     assert "filter_parameters" not in captured["options"]
 
 
-def test_build_nornir_empty_inventory_error_names_the_region_and_site(nornir_config, monkeypatch):
+def test_build_nornir_empty_inventory_error_names_the_filters(nornir_config, monkeypatch):
     fake_init_nornir, _captured = _fake_init_nornir_factory({})
     monkeypatch.setattr("bunnyauto.common.InitNornir", fake_init_nornir)
 
@@ -553,11 +559,13 @@ def test_build_nornir_empty_inventory_error_names_the_region_and_site(nornir_con
         nb_url="https://nb.example.com",
         config_file=nornir_config,
         target_tag="nornirtest",
-        region="south",
-        site="dallas",
     )
-    with pytest.raises(InventoryError, match="region='south', site='dallas'"):
-        build_nornir(settings, Credentials(username="u", password="p", nb_token="t"))
+    with pytest.raises(InventoryError, match="role='wired-network', region='south', site='dallas'"):
+        build_nornir(
+            settings,
+            Credentials(username="u", password="p", nb_token="t"),
+            filters={"role": "wired-network", "region": "south", "site": "dallas"},
+        )
 
 
 def test_reporter_json_render(capsys):

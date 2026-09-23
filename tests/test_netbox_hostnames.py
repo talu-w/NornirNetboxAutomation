@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from bunnyauto.hostname_match import (
+from bunnyauto.netbox.hostnames import (
     match_hostname,
     match_hostname_candidates,
     normalize_hostname,

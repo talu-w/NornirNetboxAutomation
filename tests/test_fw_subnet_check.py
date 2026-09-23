@@ -1,4 +1,4 @@
-"""Tests for the fw-subnet-check tool (fake FortiGate client, no HTTP)."""
+"""Tests for `security subnet-check` (fake FortiGate client, no HTTP)."""
 
 from __future__ import annotations
 
@@ -10,8 +10,8 @@ from bunnyauto.environments import Environment
 from bunnyauto.errors import FirewallError
 from bunnyauto.reporting import Reporter
 from bunnyauto.result import Status
-from bunnyauto.tools import fw_subnet_check
-from bunnyauto.tools.fw_subnet_check import TOOL
+from bunnyauto.tools.security import subnet_check as fw_subnet_check
+from bunnyauto.tools.security.subnet_check import TOOL
 
 NET_HQ = {"name": "net_hq", "type": "ipmask", "subnet": "10.1.0.0 255.255.0.0"}
 VLAN2 = {"name": "vlan2", "type": "ipmask", "subnet": "10.1.2.0 255.255.255.0"}
@@ -260,7 +260,7 @@ def test_notes_block_is_none_when_nothing_to_show(monkeypatch):
     monkeypatch.setenv("FW_TOKEN", "t")
     _fake_client(monkeypatch, addresses=[VLAN2])
     from bunnyauto.firewall.usage import analyze, parse_query
-    from bunnyauto.tools.fw_subnet_check import _build_notes_block, _notes_aside
+    from bunnyauto.tools.security.subnet_check import _build_notes_block, _notes_aside
 
     report = analyze(parse_query("10.1.2.0/24"), [VLAN2], [], [])
     assert _build_notes_block(report) is None
@@ -269,7 +269,7 @@ def test_notes_block_is_none_when_nothing_to_show(monkeypatch):
 
 def test_notes_block_groups_and_indents_each_category():
     from bunnyauto.firewall.usage import analyze, parse_query
-    from bunnyauto.tools.fw_subnet_check import _build_notes_block, _notes_aside
+    from bunnyauto.tools.security.subnet_check import _build_notes_block, _notes_aside
 
     addresses = [
         {"name": "rfc1918_all", "type": "ipmask", "subnet": "10.0.0.0 255.0.0.0"},
@@ -302,7 +302,7 @@ def test_notes_block_groups_and_indents_each_category():
 
 def test_notes_block_unreferenced_object_says_so_without_a_policy_list():
     from bunnyauto.firewall.usage import analyze, parse_query
-    from bunnyauto.tools.fw_subnet_check import _build_notes_block
+    from bunnyauto.tools.security.subnet_check import _build_notes_block
 
     rfc1918 = {"name": "rfc1918_all", "type": "ipmask", "subnet": "10.0.0.0 255.0.0.0"}
     report = analyze(parse_query("10.20.30.0/24"), [rfc1918], [], [])
@@ -322,4 +322,4 @@ def test_tool_declares_no_device_or_netbox_need():
 def test_tool_is_registered():
     from bunnyauto.tools import REGISTRY
 
-    assert REGISTRY["fw-subnet-check"] is TOOL
+    assert REGISTRY["security"]["subnet-check"] is TOOL

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from bunnyauto.devicetype_match import match_device_type, tokens
+from bunnyauto.netbox.tokens import match_record, tokens
 
 
 def _dt(model="", slug=""):
@@ -27,15 +27,15 @@ def test_tokens():
 
 def test_bare_model_number_matches_ndx_style_slug():
     """Aruba reports '655'; NetBox has model 'Aruba AP-655' / slug 'hpe-aruba-ap-655'."""
-    assert match_device_type(["655"], [AP_655, AP_635, A7210]) is AP_655
+    assert match_record(["655"], [AP_655, AP_635, A7210]) is AP_655
 
 
 def test_ap_prefixed_candidate_matches_too():
-    assert match_device_type(["AP-655"], [AP_655, AP_635, A7210]) is AP_655
+    assert match_record(["AP-655"], [AP_655, AP_635, A7210]) is AP_655
 
 
 def test_exact_model_string_still_matches():
-    assert match_device_type(["A7210"], [AP_655, AP_635, A7210]) is A7210
+    assert match_record(["A7210"], [AP_655, AP_635, A7210]) is A7210
 
 
 # --- token boundaries prevent false positives ---------------------------
@@ -43,11 +43,11 @@ def test_exact_model_string_still_matches():
 
 def test_does_not_spuriously_match_substring_inside_a_longer_token():
     weird = _dt(model="8655X", slug="vendor-8655x")
-    assert match_device_type(["655"], [weird]) is None
+    assert match_record(["655"], [weird]) is None
 
 
 def test_no_match_returns_none():
-    assert match_device_type(["999"], [AP_655, AP_635]) is None
+    assert match_record(["999"], [AP_655, AP_635]) is None
 
 
 # --- disambiguation across candidates ------------------------------------
@@ -56,16 +56,16 @@ def test_no_match_returns_none():
 def test_true_ambiguity_returns_none_even_with_a_more_specific_candidate():
     """Two device types that both contain 'AP-655' as a token run: unresolvable."""
     clash = _dt(model="Other AP-655-EU", slug="other-ap-655-eu")
-    assert match_device_type(["655", "AP-655"], [AP_655, clash]) is None
+    assert match_record(["655", "AP-655"], [AP_655, clash]) is None
 
 
 def test_bare_number_alone_unambiguous_despite_a_similar_looking_model():
     """A coincidental '1655' model doesn't clash with '655' — different token."""
     coincidence = _dt(model="Widget-1655", slug="widget-1655")
-    assert match_device_type(["655"], [AP_655, coincidence]) is AP_655
+    assert match_record(["655"], [AP_655, coincidence]) is AP_655
 
 
 def test_empty_candidates_and_types_are_handled():
-    assert match_device_type([], [AP_655]) is None
-    assert match_device_type(["655"], []) is None
-    assert match_device_type([""], [AP_655]) is None
+    assert match_record([], [AP_655]) is None
+    assert match_record(["655"], []) is None
+    assert match_record([""], [AP_655]) is None

@@ -10,8 +10,13 @@ interactive hub and the CI command line) build on:
 * :mod:`bunnyauto.reporting`    — a single output sink (TTY, CI, or JSON).
 * :mod:`bunnyauto.result`       — the structured result every tool returns.
 * :mod:`bunnyauto.context`      — the per-invocation Context object.
+* :mod:`bunnyauto.categories`   — tool categories and the NetBox role branch each owns.
+* :mod:`bunnyauto.scope`        — tag + role branch + region/site: which devices a run touches.
+* :mod:`bunnyauto.netbox`       — shared NetBox building blocks every category reuses.
 
-Nothing here connects to a device or to NetBox on import.
+Tools live in :mod:`bunnyauto.tools`, one package per category (``wired``,
+``wireless``, ``security``, ``netbox``). Nothing here connects to a device or
+to NetBox on import.
 """
 
 from __future__ import annotations

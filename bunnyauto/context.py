@@ -1,9 +1,15 @@
 """The per-invocation ``Context`` and the ``build_context`` that assembles it.
 
 Both entry points do the same thing: resolve the environment, run preflight,
-fold in any overrides, and hand every tool one ``Context``. Nornir and the
-direct NetBox client are built lazily and cached, so the hub can render menus
-without an inventory pull until a tool actually runs.
+fold in any overrides, and hand every tool one ``Context``. Nornir, the direct
+NetBox client, the role tree and the resolved :class:`~bunnyauto.scope.Scope`
+are all built lazily and cached, so the hub can render menus without touching
+NetBox until a tool actually runs.
+
+Tools get their devices from here, never by building their own queries:
+:meth:`Context.target_hosts` (the Nornir inventory, for SSH tools) and
+:meth:`Context.target_devices` (NetBox records, for NetBox-first tools) both
+apply the same tag + role branch + region/site scope.
 """
 
 from __future__ import annotations
@@ -17,16 +23,20 @@ from typing import TYPE_CHECKING, Any
 from bunnyauto.common import (
     build_netbox,
     build_nornir,
+    filter_by_tag,
     load_raw_inventory_options,
     ssl_verify_setting,
 )
 from bunnyauto.environments import Environment, resolve_environment
-from bunnyauto.errors import NetBoxError, TagMismatchError
+from bunnyauto.errors import NetBoxError, RoleScopeError, TagMismatchError
+from bunnyauto.netbox.roles import RoleTree
 from bunnyauto.preflight import preflight
+from bunnyauto.scope import Scope, resolve_scope
 
 if TYPE_CHECKING:
     from nornir.core import Nornir
 
+    from bunnyauto.categories import Category
     from bunnyauto.reporting import Reporter
 
 DEFAULT_CONFIG_FILE = "config.yaml"
@@ -50,6 +60,13 @@ class Settings:
     target_tag: str
     region: str | None = None
     site: str | None = None
+    #: The running tool's category key (``"wired"``, ...), if it has one.
+    category: str | None = None
+    #: That category's role-branch root slug, from the environment's ``roles``;
+    #: ``None`` when the tool isn't confined to a role branch.
+    branch_role: str | None = None
+    #: ``--role``: a narrower role inside the branch (validated by ``Context.scope``).
+    role: str | None = None
     protected: bool = False
     ssl_verify: bool | str = True
     legacy_ssh: bool = False
@@ -81,16 +98,53 @@ class Context:
     environment: Environment
     _nr: Nornir | None = None
     _nb: Any = None
+    _roles: RoleTree | None = None
+    _scope: Scope | None = None
 
     def nornir(self) -> Nornir:
-        """The NetBox-backed inventory for this environment. Built once, reused."""
+        """The NetBox-backed inventory for this run's role branch + region/site.
+
+        Built once, reused. Not yet filtered by tag — see :meth:`target_hosts`.
+        """
         if self._nr is None:
+            filters = self.scope().location_filters()
             with self.reporter.spinner("querying NetBox inventory..."):
-                self._nr = build_nornir(self.settings, self.creds)
+                self._nr = build_nornir(self.settings, self.creds, filters=filters)
         return self._nr
 
+    def target_hosts(self) -> Nornir:
+        """The Nornir hosts this run may touch: :meth:`nornir` narrowed to the tag."""
+        return filter_by_tag(self.nornir(), self.settings.target_tag)
+
+    def target_devices(self) -> list[Any]:
+        """The NetBox devices this run may touch: tag + role branch + region/site."""
+        return list(self.netbox().dcim.devices.filter(**self.scope().device_filters()))
+
+    def role_tree(self) -> RoleTree:
+        """NetBox's device-role hierarchy. Fetched once, reused."""
+        if self._roles is None:
+            self._roles = RoleTree.load(self.netbox())
+        return self._roles
+
+    def scope(self) -> Scope:
+        """This run's validated tag + role + region/site narrowing (see :mod:`bunnyauto.scope`)."""
+        if self._scope is None:
+            self._scope = resolve_scope(self.settings, self.role_tree)
+        return self._scope
+
+    def banner(self) -> None:
+        """The environment header both entry points show before a tool runs."""
+        settings = self.settings
+        self.reporter.banner(
+            self.environment,
+            settings.target_tag,
+            role=settings.role or settings.branch_role,
+            region=settings.region,
+            site=settings.site,
+        )
+
     def netbox(self) -> Any:
-        """Direct NetBox API client for tools that write objects (not inventory)."""
+        """Direct NetBox API client (object reads/writes, role tree, scope checks)."""
         if self._nb is None:
             if not self.creds.nb_token:  # pragma: no cover - preflight already guards
                 raise NetBoxError(
@@ -133,12 +187,19 @@ def build_context(
     timeouts: Mapping[str, float] | None = None,
     need_devices: bool = True,
     need_netbox: bool = True,
+    category: Category | None = None,
+    role: str | None = None,
 ) -> Context:
     """Resolve the environment, run preflight, and return a ready ``Context``.
 
     ``creds`` may be passed in when the caller (the hub) already ran preflight;
     otherwise it is run here. ``need_devices`` / ``need_netbox`` let a tool that
     uses neither (a firewall-only query) run without those variables set.
+
+    ``category`` confines the run to that category's NetBox role branch (unless
+    the tool doesn't use NetBox at all); ``role`` is ``--role``, a narrower role
+    inside it. Neither touches NetBox here — :meth:`Context.scope` validates them
+    against the role tree the first time a tool asks for devices.
     """
     environment = resolve_environment(env, env_file)
 
@@ -165,6 +226,17 @@ def build_context(
     extra_timeouts = {
         key: float(value) for key, value in (timeouts or {}).items() if key in _TIMEOUT_FIELDS
     }
+    branch_role = None
+    if category is not None and category.branch is not None and need_netbox:
+        branch_role = environment.roles.get(category.branch)
+    role_value = (role or "").strip() or None
+    if role_value and branch_role is None:
+        raise RoleScopeError(
+            f"--role {role_value!r} doesn't apply here: this tool isn't confined to a "
+            "NetBox role branch",
+            fix="drop --role",
+        )
+
     settings = Settings(
         environment=environment.name,
         nb_url=environment.nb_url,
@@ -172,6 +244,9 @@ def build_context(
         target_tag=tag_value,
         region=(region or "").strip() or None,
         site=(site or "").strip() or None,
+        category=category.key if category is not None else None,
+        branch_role=branch_role,
+        role=role_value,
         protected=environment.protected,
         ssl_verify=ssl_verify,
         legacy_ssh=legacy_ssh,

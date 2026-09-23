@@ -1,4 +1,4 @@
-"""``sync-interfaces`` — reconcile Cisco interface VLAN state into NetBox.
+"""``wired sync-interfaces`` — reconcile Cisco interface VLAN state into NetBox.
 
 Ported from ``netbox_interfaces_update.py``. Collects access/voice/trunk/
 link-state/description data, resolves ambiguous voice VLANs via SVI addresses,
@@ -13,8 +13,9 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from bunnyauto.common import first_error
 from bunnyauto.errors import ToolError
-from bunnyauto.netbox_match import select_tagged_inventory
+from bunnyauto.netbox.devices import select_tagged_inventory
 from bunnyauto.sync import engine
 from bunnyauto.tools.base import Status, ToolResult, add_common_arguments
 
@@ -44,6 +45,7 @@ class SyncInterfaces:
     name: str = "sync-interfaces"
     summary: str = "Reconcile Cisco interface VLAN assignments into NetBox"
     writes: bool = True
+    category: str = "wired"
 
     def add_arguments(self, parser: argparse.ArgumentParser) -> None:
         add_common_arguments(parser)
@@ -83,7 +85,6 @@ class SyncInterfaces:
 
     def _run(self, ctx: Context, args: argparse.Namespace, *, dry_run: bool) -> ToolResult:
         nb = ctx.netbox()
-        tag = ctx.settings.target_tag
 
         ctx.reporter.info(
             f"voice-vlan model={args.voice_vlan_model}, "
@@ -91,9 +92,12 @@ class SyncInterfaces:
             f"{'PLAN (no writes)' if dry_run else 'APPLY'}"
         )
 
-        tagged_devices = list(nb.dcim.devices.filter(tag=tag))
+        tagged_devices = ctx.target_devices()
         if not tagged_devices:
-            return ToolResult(status=Status.OK, summary=f"no NetBox devices carry tag {tag!r}")
+            return ToolResult(
+                status=Status.OK,
+                summary=f"no NetBox devices in scope ({ctx.scope().describe()})",
+            )
 
         selected = select_tagged_inventory(ctx.nornir(), tagged_devices)
         if not selected.inventory.hosts:
@@ -121,7 +125,8 @@ class SyncInterfaces:
         for host_name, multi_result in results.items():
             if multi_result.failed:
                 failed_hosts.append(host_name)
-                ctx.reporter.error(f"{host_name}: collection failed — {_first_error(multi_result)}")
+                message = first_error(multi_result, "collection failed (no exception detail)")
+                ctx.reporter.error(f"{host_name}: collection failed — {message}")
                 continue
             collected = engine.find_collected_result(multi_result)
             if collected is None:
@@ -227,14 +232,6 @@ def _result(
         summary += f" ({failures} device(s) failed)"
 
     return ToolResult(status=status, summary=summary, changes=changes, data=data)
-
-
-def _first_error(multi_result: Any) -> str:
-    for item in reversed(list(multi_result)):
-        exc = getattr(item, "exception", None)
-        if exc is not None:
-            return f"{type(exc).__name__}: {exc}"
-    return "collection failed (no exception detail)"
 
 
 TOOL = SyncInterfaces()

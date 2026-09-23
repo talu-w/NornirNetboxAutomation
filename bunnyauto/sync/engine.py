@@ -22,7 +22,9 @@ from typing import Any
 from nornir.core.task import Result, Task
 from nornir_netmiko.tasks import netmiko_send_command
 
-from bunnyauto.netbox_match import inventory_device_id
+from bunnyauto.netbox.devices import inventory_device_id
+from bunnyauto.netbox.interfaces import interface_signature, stack_member
+from bunnyauto.netbox.records import choice_value, related_id
 
 SHOW_VLAN = "show vlan brief"
 SHOW_TRUNKS = "show interfaces trunk"
@@ -996,55 +998,6 @@ def collect_device_state(
     return Result(host=task.host, result=collected, changed=False)
 
 
-INTERFACE_PREFIXES = {
-    "fa": "fa",
-    "fastethernet": "fa",
-    "gi": "gi",
-    "gig": "gi",
-    "gigabitethernet": "gi",
-    "te": "te",
-    "ten": "te",
-    "tengige": "te",
-    "tengigabitethernet": "te",
-    "tw": "tw",
-    "two": "tw",
-    "twogige": "tw",
-    "twogigabitethernet": "tw",
-    "twe": "twe",
-    "twentyfivegige": "twe",
-    "twentyfivegigabitethernet": "twe",
-    "fo": "fo",
-    "fortygige": "fo",
-    "fortygigabitethernet": "fo",
-    "hu": "hu",
-    "hundredgige": "hu",
-    "hundredgigabitethernet": "hu",
-    "fou": "fou",
-    "fourhundredgige": "fou",
-    "fourhundredgigabitethernet": "fou",
-    "eth": "eth",
-    "ethernet": "eth",
-    "po": "po",
-    "port-channel": "po",
-    "portchannel": "po",
-    "fi": "fi",
-    "fivegigabitethernet": "fi",
-    "ap": "ap",
-    "appgigabitethernet": "ap",
-}
-
-
-def interface_signature(name: str) -> tuple[str, str]:
-    """Normalize short and long Cisco interface names for safe matching."""
-
-    cleaned = name.strip().replace(" ", "")
-    match = re.match(r"^(?P<prefix>[A-Za-z-]+)(?P<number>.+)$", cleaned)
-    if not match:
-        return "", cleaned.casefold()
-    prefix = match.group("prefix").casefold()
-    return INTERFACE_PREFIXES.get(prefix, prefix), match.group("number").casefold()
-
-
 def interface_sort_key(name: str) -> tuple[str, tuple[int, ...], str]:
     prefix, number = interface_signature(name)
     numeric_parts = tuple(int(part) for part in re.findall(r"\d+", number))
@@ -1083,32 +1036,12 @@ def match_interface(
     return None, f"interface {name!r} does not exist on this NetBox device"
 
 
-def related_id(value: Any) -> int | None:
-    if value is None:
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, dict):
-        value = value.get("id")
-    else:
-        value = getattr(value, "id", None)
-    return int(value) if value is not None else None
-
-
 def related_ids(values: Any) -> list[int]:
     return sorted(
         object_id
         for object_id in (related_id(value) for value in (values or []))
         if object_id is not None
     )
-
-
-def choice_value(value: Any) -> str | None:
-    if value is None or isinstance(value, str):
-        return value
-    if isinstance(value, dict):
-        return value.get("value")
-    return getattr(value, "value", str(value))
 
 
 def object_type_value(value: Any) -> str | None:
@@ -1391,17 +1324,6 @@ def integer_value(value: Any) -> int | None:
         return None
 
 
-def stack_member_number(interface_name: str) -> int | None:
-    """Return 2 for names such as Gi2/0/3; two-part names are standalone."""
-
-    cleaned = interface_name.strip().replace(" ", "")
-    match = re.match(
-        r"^(?:[A-Za-z-]+)?(?P<member>\d+)/\d+/\d+(?:\.\d+)?$",
-        cleaned,
-    )
-    return int(match.group("member")) if match else None
-
-
 def resolve_virtual_chassis(
     nb: Any,
     device: Any,
@@ -1517,7 +1439,7 @@ def match_scoped_interface(
     that direct match does not exist.
     """
 
-    position = stack_member_number(discovered_name)
+    position = stack_member(discovered_name)
     connected_indexes = scope.indexes_by_device_id.get(int(scope.connected_device.id))
     if connected_indexes is not None:
         interface, _ = match_interface(discovered_name, *connected_indexes)

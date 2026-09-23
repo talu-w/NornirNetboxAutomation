@@ -1,4 +1,4 @@
-"""Tests for the wireless-sync tool (fake Conductor client + fake pynetbox, no HTTP)."""
+"""Tests for `wireless sync` (fake Conductor client + fake pynetbox, no HTTP)."""
 
 from __future__ import annotations
 
@@ -7,11 +7,14 @@ from types import SimpleNamespace
 
 import pytest
 
-from bunnyauto.errors import ArubaError, ToolError
+from bunnyauto.categories import DEFAULT_ROLES
+from bunnyauto.errors import ArubaError, RoleScopeError, ToolError
+from bunnyauto.netbox.roles import RoleTree
 from bunnyauto.reporting import Reporter
 from bunnyauto.result import Status
-from bunnyauto.tools import wireless_sync
-from bunnyauto.tools.wireless_sync import TOOL
+from bunnyauto.scope import resolve_scope
+from bunnyauto.tools.wireless import sync as wireless_sync
+from bunnyauto.tools.wireless.sync import TOOL
 
 # --- fake pynetbox ---------------------------------------------------
 
@@ -86,22 +89,41 @@ class _NB:
         )
 
 
+# The owner's wireless role branch (NetBox >= 4.3 nested roles):
+# Wireless Network > Wireless Controller > Wireless Access Point.
+_BRANCH_ROLE = _Rec(id=9, slug="wireless-network", name="Wireless Network", parent=None)
+
+
 def _nb(
     *,
     devices=(),
-    tags=("wireless",),
-    with_role=True,
+    tags=("nornirtest",),
+    with_ap_role=True,
     with_wlc_role=True,
+    with_branch=True,
     prefixes=(),
     ip_addresses=(),
     interfaces=(),
     interface_templates=(),
 ):
-    roles = []
-    if with_role:
-        roles.append(_Rec(id=7, slug="wireless", name="Wireless"))
+    roles = [_BRANCH_ROLE] if with_branch else []
+    wlc_role = _Rec(
+        id=8,
+        slug="wireless-controller",
+        name="Wireless Controller",
+        parent=_BRANCH_ROLE if with_branch else None,
+    )
     if with_wlc_role:
-        roles.append(_Rec(id=8, slug="wireless-controller", name="Wireless Controller"))
+        roles.append(wlc_role)
+    if with_ap_role:
+        roles.append(
+            _Rec(
+                id=7,
+                slug="wireless-access-point",
+                name="Wireless Access Point",
+                parent=wlc_role if with_wlc_role else _BRANCH_ROLE,
+            )
+        )
     return _NB(
         roles=roles,
         sites=[
@@ -123,14 +145,30 @@ def _nb(
 
 class _Ctx:
     def __init__(self, nb, *, apply=False, aruba_url="https://cond.example.com:4343"):
-        self.settings = SimpleNamespace(apply=apply)
+        self.settings = SimpleNamespace(
+            apply=apply,
+            target_tag="nornirtest",
+            category="wireless",
+            branch_role=DEFAULT_ROLES["wireless"],
+            role=None,
+            region=None,
+            site=None,
+        )
         self.creds = SimpleNamespace(username="u", password="p")
-        self.environment = SimpleNamespace(name="test", aruba_url=aruba_url)
+        self.environment = SimpleNamespace(
+            name="test", aruba_url=aruba_url, roles=dict(DEFAULT_ROLES)
+        )
         self.reporter = Reporter(json_mode=True)
         self._nb = nb
 
     def netbox(self):
         return self._nb
+
+    def role_tree(self):
+        return RoleTree.load(self._nb)
+
+    def scope(self):
+        return resolve_scope(self.settings, self.role_tree)
 
 
 # --- fake Conductor client -----------------------------------------
@@ -190,8 +228,27 @@ def test_missing_aruba_url(monkeypatch):
 
 def test_missing_role(monkeypatch):
     _fake_client(monkeypatch, aps=[AP])
-    with pytest.raises(ToolError, match="device role with slug 'wireless'"):
-        TOOL.run(_Ctx(_nb(with_role=False)), _args())
+    with pytest.raises(ToolError, match="device role with slug 'wireless-access-point'"):
+        TOOL.run(_Ctx(_nb(with_ap_role=False)), _args())
+
+
+def test_missing_wireless_branch_root_raises(monkeypatch):
+    _fake_client(monkeypatch, aps=[AP])
+    with pytest.raises(RoleScopeError, match="'wireless-network'"):
+        TOOL.run(_Ctx(_nb(with_branch=False)), _args())
+
+
+def test_role_outside_the_wireless_branch_refuses_creation(monkeypatch):
+    """A device created with a role outside the branch would be invisible to
+    every wireless tool — refuse rather than create it there."""
+    _fake_client(monkeypatch, aps=[AP])
+    nb = _nb()
+    stray = _Rec(id=40, slug="elsewhere", name="Elsewhere", parent=None)
+    ap_role = nb.dcim.device_roles.get(slug="wireless-access-point")
+    ap_role.parent = stray
+    nb.dcim.device_roles._items.append(stray)
+    with pytest.raises(ToolError, match="not inside the wireless branch"):
+        TOOL.run(_Ctx(nb, apply=True), _args())
 
 
 def test_missing_wlc_role_blocks_wlc_creation(monkeypatch):
@@ -259,7 +316,7 @@ def test_apply_creates_device(monkeypatch):
     assert body["device_type"] == 50
     assert body["serial"] == "CN0001"
     assert body["status"] == "active"
-    assert body["tags"] == [{"slug": "wireless"}]
+    assert body["tags"] == [{"slug": "nornirtest"}]  # the environment's tag, not 'wireless'
 
 
 def test_older_netbox_uses_device_role(monkeypatch):
@@ -282,21 +339,49 @@ def test_existing_device_missing_tag_is_tagged(monkeypatch):
 
     applied = TOOL.run(_Ctx(nb, apply=True), _args())
     assert applied.status is Status.CHANGED
-    assert existing.updated == {"tags": [{"slug": "wireless"}]}
+    assert existing.updated == {"tags": [{"slug": "nornirtest"}]}
+
+
+def test_device_with_only_the_old_wireless_tag_gets_the_environment_tag(monkeypatch):
+    """Devices adopted before 2026-09-23 carry the old 'wireless' tag. They
+    now need the environment's tag to be in scope; the old tag is kept."""
+    _fake_client(monkeypatch, switches=[WLC])
+    existing = _Device(id=1, name="hq-wlc01", serial="CX0009", tags=[_Rec(slug="wireless")])
+    nb = _nb(devices=[existing])
+    result = TOOL.run(_Ctx(nb, apply=True), _args())
+    assert result.status is Status.CHANGED
+    assert existing.updated == {"tags": [{"slug": "nornirtest"}, {"slug": "wireless"}]}
 
 
 def test_existing_tagged_device_is_in_sync(monkeypatch):
     _fake_client(monkeypatch, switches=[WLC])
-    existing = _Device(id=1, name="hq-wlc01", serial="CX0009", tags=[_Rec(slug="wireless")])
+    existing = _Device(id=1, name="hq-wlc01", serial="CX0009", tags=[_Rec(slug="nornirtest")])
     nb = _nb(devices=[existing])
     result = TOOL.run(_Ctx(nb), _args())
     assert result.status is Status.OK
     assert result.changes == []
 
 
+def test_existing_device_outside_the_branch_gets_a_role_note(monkeypatch):
+    """Its role is never changed — but it's out of every wireless tool's reach, so say so."""
+    _fake_client(monkeypatch, switches=[WLC])
+    existing = _Device(
+        id=1,
+        name="hq-wlc01",
+        serial="CX0009",
+        tags=[_Rec(slug="nornirtest")],
+        role=_Rec(slug="access-switch"),
+    )
+    nb = _nb(devices=[existing])
+    nb.dcim.device_roles._items.append(_Rec(id=30, slug="access-switch", parent=None))
+    result = TOOL.run(_Ctx(nb), _args())
+    assert result.status is Status.OK  # informational only
+    assert "outside the wireless branch" in result.data["hq-wlc01"]["role_note"]
+
+
 def test_match_by_name_when_serial_differs(monkeypatch):
     _fake_client(monkeypatch, aps=[AP])
-    existing = _Device(id=1, name="hq-idf1-ap01", serial="", tags=[_Rec(slug="wireless")])
+    existing = _Device(id=1, name="hq-idf1-ap01", serial="", tags=[_Rec(slug="nornirtest")])
     nb = _nb(devices=[existing])
     result = TOOL.run(_Ctx(nb), _args())
     assert result.status is Status.OK
@@ -381,7 +466,7 @@ def test_missing_tag_is_created_on_apply(monkeypatch):
 
     nb = _nb(tags=())
     TOOL.run(_Ctx(nb, apply=True), _args())
-    assert nb.extras.tags.created == [{"name": "wireless", "slug": "wireless"}]
+    assert nb.extras.tags.created == [{"name": "nornirtest", "slug": "nornirtest"}]
 
 
 # --- IP address creation --------------------------------------------
@@ -592,5 +677,5 @@ def test_existing_device_ip_is_never_touched(monkeypatch):
 def test_tool_is_registered():
     from bunnyauto.tools import REGISTRY
 
-    assert REGISTRY["wireless-sync"] is TOOL
+    assert REGISTRY["wireless"]["sync"] is TOOL
     assert TOOL.writes is True

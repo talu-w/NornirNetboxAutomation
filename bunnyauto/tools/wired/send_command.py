@@ -1,4 +1,4 @@
-"""``send-command`` — run one show command on every tagged device.
+"""``wired send-command`` — run one show command on every wired device in scope.
 
 This is the reference tool: the smallest thing that exercises the whole
 contract (declare args, take a Context, return a ToolResult) without any
@@ -14,13 +14,11 @@ from typing import TYPE_CHECKING
 from nornir.core.task import Task
 from nornir_netmiko.tasks import netmiko_send_command
 
-from bunnyauto.common import filter_by_tag
+from bunnyauto.common import first_error
 from bunnyauto.errors import ToolError
 from bunnyauto.tools.base import Status, ToolResult, add_common_arguments
 
 if TYPE_CHECKING:
-    from nornir.core.task import MultiResult
-
     from bunnyauto.context import Context
 
 # Leading tokens that mean the command changes device state or configuration.
@@ -49,8 +47,9 @@ _STATE_CHANGING = (
 @dataclass(slots=True)
 class SendCommand:
     name: str = "send-command"
-    summary: str = "Run one show command on every device carrying the tag"
+    summary: str = "Run one show command on every device in scope"
     writes: bool = False
+    category: str = "wired"
 
     def add_arguments(self, parser: argparse.ArgumentParser) -> None:
         add_common_arguments(parser)
@@ -72,12 +71,12 @@ class SendCommand:
                 fix="re-run with --config-mode if you are sure",
             )
 
-        targets = filter_by_tag(ctx.nornir(), ctx.settings.target_tag)
+        targets = ctx.target_hosts()
         host_count = len(targets.inventory.hosts)
         if host_count == 0:
             return ToolResult(
                 status=Status.OK,
-                summary=f"no devices carry tag {ctx.settings.target_tag!r}",
+                summary=f"no devices in scope ({ctx.scope().describe()})",
                 data={"tag": ctx.settings.target_tag, "command": command, "devices": {}},
             )
 
@@ -94,7 +93,7 @@ class SendCommand:
         failures: list[str] = []
         for host, multi in run_result.items():
             if multi.failed:
-                message = _first_error(multi)
+                message = first_error(multi, "command failed")
                 devices[host] = {"failed": True, "output": message}
                 failures.append(host)
                 ctx.reporter.error(f"{host}: {message}")
@@ -133,14 +132,6 @@ def _send(task: Task, command: str, read_timeout: float) -> None:
 def _is_state_changing(command: str) -> bool:
     head = command.strip().casefold()
     return any(head == token.strip() or head.startswith(token) for token in _STATE_CHANGING)
-
-
-def _first_error(multi: MultiResult) -> str:
-    for item in reversed(list(multi)):
-        exc = getattr(item, "exception", None)
-        if exc is not None:
-            return f"{type(exc).__name__}: {exc}"
-    return "command failed"
 
 
 TOOL = SendCommand()

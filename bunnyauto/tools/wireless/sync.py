@@ -1,45 +1,51 @@
-"""``wireless-sync`` — create NetBox WLCs/APs from an Aruba Conductor, tag them ``wireless``.
+"""``wireless sync`` — create NetBox WLCs/APs from an Aruba Conductor, tagged for this network.
 
 Reads the Conductor's device inventory over its read-only REST API
 (``show switches`` + ``show ap database long``), compares it to NetBox by serial
 then name, and:
 
-* creates every WLC/AP NetBox is missing — a WLC gets the ``wireless-controller``
-  role, an AP gets the ``wireless`` role (split 2026-09-22 so a tool like
-  ``wireless-enrich`` can select just the controllers; only whichever role a
-  run actually needs to create is required to pre-exist — a run that only
-  tags already-existing devices needs neither). Device type matched
-  from the Aruba model string (e.g. Aruba's bare ``"655"`` against a device
-  type with model ``"Aruba AP-655"`` / slug ``"hpe-aruba-ap-655"`` — a
-  token-boundary *contains*, not an exact match; see
-  ``bunnyauto/devicetype_match.py``), site derived from the hostname prefix —
-  each stamped with the ``wireless`` tag;
-* adds the ``wireless`` tag to Conductor devices that already exist in NetBox but
-  are not yet tagged;
+* creates every WLC/AP NetBox is missing. A WLC gets the ``wireless-controller``
+  role and an AP the ``wireless-access-point`` role (slugs from the
+  environment's ``roles:``, see :mod:`bunnyauto.categories`). Only whichever
+  role a run actually needs to create is required to exist, and it must sit
+  inside the wireless branch (``wireless-network``), because a device created
+  outside it would be invisible to every wireless tool. The device type is
+  matched from the Aruba model string (e.g. Aruba's bare ``"655"`` against a
+  device type with model ``"Aruba AP-655"`` / slug ``"hpe-aruba-ap-655"``) by
+  token-boundary *containment*, not an exact match (see
+  :mod:`bunnyauto.netbox.tokens`). The site is derived from the hostname prefix.
+  Each device is stamped with the **environment's tag** (``nornirtest`` /
+  ``networking-active``, the tag every other tool targets), so a new WLC is
+  immediately visible to ``wireless enrich``. The role now says "wireless",
+  so the old separate ``wireless`` tag is no longer applied (2026-09-23);
+* adds the environment's tag to Conductor devices that already exist in NetBox
+  but don't carry it yet. An existing device's role is never changed; if it
+  sits outside the wireless branch, that's reported as a note, since no
+  wireless tool will see it until its role is fixed;
 * for each **newly created** device that reported an IP, creates that IP in
   NetBox IPAM (``address/mask``, the mask taken from the most specific NetBox
   Prefix containing it) — provided such a Prefix exists — attaches it to a
-  wired interface and sets it as the device's primary IPv4. If no Prefix
-  contains the IP, the device is still created; only the IP is skipped, with a
-  note. Existing (already-matched) devices never have their IP touched.
+  wired interface and sets it as the device's primary IPv4
+  (:func:`bunnyauto.netbox.ipam.assign_primary_ip`). If no Prefix contains the
+  IP, the device is still created; only the IP is skipped, with a note.
+  Existing (already-matched) devices never have their IP touched.
 
 The interface an IP is attached to is never a guessed literal name: a real
 NetBox device type (e.g. one imported from NetBox Data Exchange) carries an
 interface template with wired ports (``E0``, ``E1``, ...) alongside any Wi-Fi/
 Bluetooth/Zigbee radios (``6GHz WiFi``, ``Bluetooth``, ...), and NetBox
-auto-creates those interfaces along with the device. This tool reads that
-device's *actual* interfaces and picks the first wired one, alphabetically by
-name (see ``bunnyauto/interface_match.py``) — radio and virtual/lag/bridge
-interfaces are never candidates, so an IP never lands on a radio. Pass
-``--ip-interface`` to force a specific interface by name instead (created if
-the device doesn't have it); a device type with no interface template at all
-(no wired candidates found) falls back to creating one named ``Ethernet0``.
+auto-creates those interfaces along with the device. The device's *actual*
+interfaces are read and the first wired one, alphabetically by name, is used
+(:func:`bunnyauto.netbox.interfaces.pick_wired_record`) — radio and
+virtual/lag/bridge interfaces are never candidates. ``--ip-interface`` forces a
+specific interface by name instead (created if the device doesn't have it); a
+device type with no interface template at all falls back to creating one named
+``Ethernet0``.
 
-It never updates or deletes an existing device, and never creates a device
-type or a site (interfaces are the one exception, and only as a last resort —
-see above). It never creates a NetBox Prefix/IP Range. A device whose model
-has no matching NetBox device type, or whose hostname maps to no site (and no
-``--default-site`` was given), is reported and skipped.
+It never updates or deletes an existing device (beyond adding the tag), and
+never creates a device type, a site, a role, a Prefix or an IP Range. A device
+whose model has no matching NetBox device type, or whose hostname maps to no
+site (and no ``--default-site`` was given), is reported and skipped.
 
 **Known limitation**: which physical port actually carries the AP's IP is not
 queried live from the Conductor — the pick is the device type's first wired
@@ -61,28 +67,32 @@ from bunnyauto.aruba.conductor import ArubaConductorClient
 from bunnyauto.aruba.inventory import WirelessDevice, parse_ap_database, parse_switches
 from bunnyauto.aruba.sitematch import Site, match_site
 from bunnyauto.common import env_flag, normalize_tags
-from bunnyauto.devicetype_match import match_device_type
 from bunnyauto.errors import ArubaError, ToolError
-from bunnyauto.interface_match import pick_wired_interface
-from bunnyauto.ipam_match import Prefix, find_prefix
+from bunnyauto.netbox.devices import add_tag
+from bunnyauto.netbox.interfaces import pick_wired_record
+from bunnyauto.netbox.ipam import (
+    FALLBACK_INTERFACE_NAME,
+    Prefix,
+    assign_primary_ip,
+    find_prefix,
+    load_prefixes,
+)
+from bunnyauto.netbox.roles import RoleTree, device_role_slug, require_role, role_field
+from bunnyauto.netbox.tokens import match_record
 from bunnyauto.tools.base import Status, ToolResult
 
 if TYPE_CHECKING:
     from bunnyauto.context import Context
 
-_TAG_SLUG = "wireless"
-_AP_ROLE_SLUG = "wireless"
-_WLC_ROLE_SLUG = "wireless-controller"
-_ROLE_SLUG_BY_KIND = {"ap": _AP_ROLE_SLUG, "wlc": _WLC_ROLE_SLUG}
-#: Used only when a device has no wired interface at all — no template, and no
-#: --ip-interface override. Should be rare once device types carry real templates.
-_FALLBACK_INTERFACE_NAME = "Ethernet0"
+#: Which ``roles:`` key names the role each kind of device is created with.
+_ROLE_KEY_BY_KIND = {"ap": "wireless-access-point", "wlc": "wireless-controller"}
 
 
 @dataclass(slots=True)
 class _Outcome:
     device: WirelessDevice
     action: str  # "in-sync" | "tag" | "create" | "blocked"
+    existing: Any = None  # the matched NetBox device, for "in-sync" / "tag"
     site: str = ""
     device_type: str = ""  # display string, e.g. "Aruba AP-655"
     device_type_id: int = 0
@@ -95,9 +105,10 @@ class _Outcome:
 
 @dataclass(slots=True)
 class WirelessSync:
-    name: str = "wireless-sync"
-    summary: str = "Create NetBox WLCs/APs from an Aruba Conductor and tag them 'wireless'"
+    name: str = "sync"
+    summary: str = "Create NetBox WLCs/APs from an Aruba Conductor, tagged for this network"
     writes: bool = True
+    category: str = "wireless"
 
     def add_arguments(self, parser: argparse.ArgumentParser) -> None:
         parser.add_argument(
@@ -159,6 +170,9 @@ class WirelessSync:
 
         nb = ctx.netbox()
         apply = ctx.settings.apply
+        tag_slug = ctx.settings.target_tag
+        branch = ctx.scope().branch  # validates the wireless branch root exists
+        tree = ctx.role_tree()
 
         sites = [
             Site(slug=str(s.slug), id=int(s.id), name=str(s.name)) for s in nb.dcim.sites.all()
@@ -206,10 +220,9 @@ class WirelessSync:
         )
 
         need_ip_work = any(d.ip for d in wireless)
-        prefixes = _load_prefixes(nb) if need_ip_work else []
+        prefixes = load_prefixes(nb) if need_ip_work else []
         templates_by_type = _load_interface_templates(nb) if need_ip_work else {}
 
-        role_key = _role_key(nb)
         outcomes = [
             self._classify(
                 d,
@@ -221,6 +234,7 @@ class WirelessSync:
                 prefixes,
                 templates_by_type,
                 args.ip_interface,
+                tag_slug,
             )
             for d in wireless
         ]
@@ -232,18 +246,20 @@ class WirelessSync:
         role_by_kind: dict[str, Any] = {}
         for kind in ("ap", "wlc"):
             if any(o.action == "create" and o.device.kind == kind for o in outcomes):
-                role_by_kind[kind] = _require_role(nb, _ROLE_SLUG_BY_KIND[kind])
+                slug = ctx.environment.roles[_ROLE_KEY_BY_KIND[kind]]
+                role_by_kind[kind] = _require_role_in_branch(nb, tree, slug, branch)
+        role_key = role_field(nb)
 
         # -- ensure the tag exists --------------------------------------
         changes: list[str] = []
-        tag = nb.extras.tags.get(slug=_TAG_SLUG)
+        tag = nb.extras.tags.get(slug=tag_slug)
         need_tag_create = tag is None and any(o.action in ("create", "tag") for o in outcomes)
         if need_tag_create:
             if apply:
-                tag = nb.extras.tags.create({"name": _TAG_SLUG, "slug": _TAG_SLUG})
-                ctx.reporter.success(f"created NetBox tag {_TAG_SLUG!r}")
+                tag = nb.extras.tags.create({"name": tag_slug, "slug": tag_slug})
+                ctx.reporter.success(f"created NetBox tag {tag_slug!r}")
             else:
-                changes.append(f"would create NetBox tag {_TAG_SLUG!r}")
+                changes.append(f"would create NetBox tag {tag_slug!r}")
 
         # -- act on each device ---------------------------------------
         data: dict[str, Any] = {}
@@ -265,19 +281,25 @@ class WirelessSync:
                 "ip_cidr": out.ip_cidr,
                 "ip_note": out.ip_note,
             }
+            if out.existing is not None:
+                role_note = _role_note(out.existing, tree, branch)
+                if role_note:
+                    data[d.name]["role_note"] = role_note
+                    ctx.reporter.warn(f"{d.name}: {role_note}")
+
             if out.action == "in-sync":
-                ctx.reporter.info(f"{d.name}: already in NetBox and tagged {_TAG_SLUG!r}")
+                ctx.reporter.info(f"{d.name}: already in NetBox and tagged {tag_slug!r}")
             elif out.action == "blocked":
                 blocked.append(d.name)
                 ctx.reporter.warn(f"{d.name}: skipped — {out.reason}")
             elif out.action == "tag":
                 verb = "add tag" if apply else "would add tag"
-                changes.append(f"{d.name}: {verb} {_TAG_SLUG!r}")
+                changes.append(f"{d.name}: {verb} {tag_slug!r}")
                 if apply:
-                    ok = _add_tag(by_serial.get(d.serial.casefold()) or by_name[d.name.casefold()])
+                    ok = add_tag(out.existing, tag_slug)
                     if ok is True:
                         tagged += 1
-                        ctx.reporter.success(f"{d.name}: tagged {_TAG_SLUG!r}")
+                        ctx.reporter.success(f"{d.name}: tagged {tag_slug!r}")
                     else:
                         failures.append(d.name)
                         data[d.name]["error"] = ok
@@ -288,7 +310,7 @@ class WirelessSync:
                 verb = "create" if apply else "would create"
                 changes.append(
                     f"{d.name}: {verb} {d.kind.upper()} in site {out.site!r} "
-                    f"(type {out.device_type!r}) tagged {_TAG_SLUG!r}"
+                    f"(type {out.device_type!r}) tagged {tag_slug!r}"
                 )
                 if out.ip_cidr:
                     changes.append(
@@ -309,17 +331,18 @@ class WirelessSync:
                         site_id=int(sites_by_slug[out.site.casefold()].id),
                         serial=d.serial,
                         status=args.status,
+                        tag_slug=tag_slug,
                     )
                     if err is None:
                         created += 1
                         ctx.reporter.success(f"{d.name}: created in site {out.site!r}")
                         if out.ip_cidr:
-                            ip_status, ip_detail = _assign_ip(
+                            ip_status, ip_detail = assign_primary_ip(
                                 nb,
                                 device=device,
-                                interface_name=args.ip_interface,
                                 address=out.ip_cidr,
                                 vrf_id=out.ip_vrf_id,
+                                interface_name=args.ip_interface,
                             )
                             if ip_status == "error":
                                 ip_failures.append(d.name)
@@ -343,6 +366,7 @@ class WirelessSync:
 
         return _result(
             apply=apply,
+            tag_slug=tag_slug,
             changes=changes,
             data=data,
             created=created,
@@ -367,8 +391,9 @@ class WirelessSync:
         sites: list[Site],
         default_site: Site | None,
         prefixes: list[Prefix],
-        templates_by_type: dict[int, list[tuple[str, str]]],
+        templates_by_type: dict[int, list[Any]],
         ip_interface_override: str | None,
+        tag_slug: str,
     ) -> _Outcome:
         match = None
         if d.serial and d.serial.casefold() in by_serial:
@@ -377,11 +402,11 @@ class WirelessSync:
             match = by_name[d.name.casefold()]
 
         if match is not None:
-            if _TAG_SLUG in normalize_tags(getattr(match, "tags", [])):
-                return _Outcome(d, "in-sync")
-            return _Outcome(d, "tag")
+            if tag_slug.casefold() in normalize_tags(getattr(match, "tags", [])):
+                return _Outcome(d, "in-sync", existing=match)
+            return _Outcome(d, "tag", existing=match)
 
-        device_type = match_device_type(d.model_candidates, device_types)
+        device_type = match_record(d.model_candidates, device_types)
         if device_type is None:
             return _Outcome(d, "blocked", reason=f"no NetBox device type matches model {d.model!r}")
 
@@ -417,8 +442,10 @@ class WirelessSync:
                     if ip_interface_override:
                         ip_interface = ip_interface_override
                     else:
-                        rows = templates_by_type.get(int(device_type.id), [])
-                        ip_interface = pick_wired_interface(rows) or _FALLBACK_INTERFACE_NAME
+                        template = pick_wired_record(templates_by_type.get(int(device_type.id), []))
+                        ip_interface = (
+                            str(template.name) if template is not None else FALLBACK_INTERFACE_NAME
+                        )
 
         return _Outcome(
             d,
@@ -433,61 +460,44 @@ class WirelessSync:
         )
 
 
-def _require_role(nb: Any, slug: str) -> Any:
-    role = nb.dcim.device_roles.get(slug=slug)
-    if role is None:
+def _require_role_in_branch(nb: Any, tree: RoleTree, slug: str, branch: str | None) -> Any:
+    """The role to create a device with — it must exist *and* sit in the wireless branch."""
+    role = require_role(nb, slug)
+    if branch is not None and not tree.is_within(slug, branch):
         raise ToolError(
-            f"NetBox has no device role with slug {slug!r}",
-            fix=f"create a {slug!r} device role in NetBox first",
+            f"device role {slug!r} is not inside the wireless branch ({branch!r}), so "
+            "devices created with it would be invisible to every wireless tool",
+            fix=f"set {slug!r}'s parent to {branch!r} (or a role beneath it) in NetBox",
         )
     return role
 
 
-def _load_prefixes(nb: Any) -> list[Prefix]:
-    """All NetBox Prefixes, parsed to CIDR networks. Malformed ones are skipped."""
-    prefixes: list[Prefix] = []
-    for p in nb.ipam.prefixes.all():
-        try:
-            network = ipaddress.ip_network(str(p.prefix), strict=False)
-        except ValueError:
-            continue
-        vrf = getattr(p, "vrf", None)
-        vrf_id = int(vrf.id) if vrf is not None else None
-        prefixes.append(Prefix(id=int(p.id), network=network, vrf_id=vrf_id))
-    return prefixes
+def _role_note(device: Any, tree: RoleTree, branch: str | None) -> str:
+    """A warning if an existing device's role puts it outside the wireless branch."""
+    slug = device_role_slug(device)
+    if branch is None or slug is None or tree.is_within(slug, branch):
+        return ""
+    return (
+        f"exists in NetBox with role {slug!r}, outside the wireless branch ({branch!r}) — "
+        "wireless tools won't target it until its role is moved into that branch"
+    )
 
 
-def _load_interface_templates(nb: Any) -> dict[int, list[tuple[str, str]]]:
-    """device_type id -> [(interface name, type), ...] from its interface templates.
+def _load_interface_templates(nb: Any) -> dict[int, list[Any]]:
+    """device_type id -> its interface-template records.
 
     This is what lets plan mode preview the interface an IP would attach to
     without creating anything: NetBox auto-creates a device's interfaces from
     its device type's interface template, so the template is a faithful
     preview of what the device will actually have.
     """
-    by_type: dict[int, list[tuple[str, str]]] = {}
-    for t in nb.dcim.interface_templates.all():
-        dt = getattr(t, "device_type", None)
-        dt_id = int(dt.id) if dt is not None else None
-        if dt_id is None:
+    by_type: dict[int, list[Any]] = {}
+    for template in nb.dcim.interface_templates.all():
+        device_type = getattr(template, "device_type", None)
+        if device_type is None:
             continue
-        by_type.setdefault(dt_id, []).append((str(getattr(t, "name", "")), _type_value(t)))
+        by_type.setdefault(int(device_type.id), []).append(template)
     return by_type
-
-
-def _type_value(record: Any) -> str:
-    """Normalize a pynetbox choice field: a nested ``{value, label}`` record or a plain string."""
-    t = getattr(record, "type", "")
-    return str(getattr(t, "value", t))
-
-
-def _role_key(nb: Any) -> str:
-    """NetBox >= 3.6 names the device-role field ``role``; older ones ``device_role``."""
-    try:
-        major, minor = (int(p) for p in str(nb.version).split(".")[:2])
-        return "role" if (major, minor) >= (3, 6) else "device_role"
-    except Exception:
-        return "role"
 
 
 def _create_device(
@@ -500,6 +510,7 @@ def _create_device(
     site_id: int,
     serial: str,
     status: str,
+    tag_slug: str,
 ) -> tuple[Any, str | None]:
     """Create one NetBox device. Returns ``(device, None)``, or ``(None, error text)``."""
     body: dict[str, Any] = {
@@ -508,7 +519,7 @@ def _create_device(
         role_key: role_id,
         "site": site_id,
         "status": status,
-        "tags": [{"slug": _TAG_SLUG}],
+        "tags": [{"slug": tag_slug}],
     }
     if serial:
         body["serial"] = serial
@@ -519,93 +530,10 @@ def _create_device(
     return device, None
 
 
-def _assign_ip(
-    nb: Any,
-    *,
-    device: Any,
-    interface_name: str | None,
-    address: str,
-    vrf_id: int | None,
-) -> tuple[str, str]:
-    """Create/attach ``address`` on ``device`` and make it the primary IPv4.
-
-    ``interface_name``, if given, is used exactly (created if the device
-    doesn't have it — an explicit override, so it's trusted as-is). Otherwise
-    the device's own interfaces — normally already populated from its NetBox
-    device type's interface template (wired ports alongside any radios) — are
-    searched for the first wired-Ethernet interface by name
-    (:func:`bunnyauto.interface_match.pick_wired_interface`); a device with no
-    wired interface at all (no template) gets a generic one created as a last
-    resort.
-
-    Returns ``(status, detail)``: ``status`` is ``"created"``, ``"exists"``, or
-    ``"error"``; ``detail`` is the interface name used on success, or the error
-    text on failure.
-    """
-    try:
-        interfaces = list(nb.dcim.interfaces.filter(device_id=int(device.id)))
-        if interface_name:
-            interface = next((i for i in interfaces if str(i.name) == interface_name), None)
-            if interface is None:
-                interface = nb.dcim.interfaces.create(
-                    {"device": int(device.id), "name": interface_name, "type": "other"}
-                )
-        else:
-            picked = pick_wired_interface([(str(i.name), _type_value(i)) for i in interfaces])
-            interface = (
-                next((i for i in interfaces if str(i.name) == picked), None) if picked else None
-            )
-            if interface is None:
-                interface = nb.dcim.interfaces.create(
-                    {
-                        "device": int(device.id),
-                        "name": _FALLBACK_INTERFACE_NAME,
-                        "type": "other",
-                    }
-                )
-
-        existing = nb.ipam.ip_addresses.get(address=address)
-        if existing is None:
-            body: dict[str, Any] = {
-                "address": address,
-                "status": "active",
-                "assigned_object_type": "dcim.interface",
-                "assigned_object_id": int(interface.id),
-            }
-            if vrf_id is not None:
-                body["vrf"] = vrf_id
-            ip_obj = nb.ipam.ip_addresses.create(body)
-            result = "created"
-        else:
-            if getattr(existing, "assigned_object_id", None) != int(interface.id):
-                existing.update(
-                    {
-                        "assigned_object_type": "dcim.interface",
-                        "assigned_object_id": int(interface.id),
-                    }
-                )
-            ip_obj = existing
-            result = "exists"
-
-        device.update({"primary_ip4": int(ip_obj.id)})
-    except Exception as exc:  # pynetbox RequestError etc.
-        return "error", str(exc)
-    return result, str(interface.name)
-
-
-def _add_tag(device: Any) -> bool | str:
-    """Add the ``wireless`` tag to an existing device. ``True`` on success, else error text."""
-    try:
-        slugs = sorted(set(normalize_tags(getattr(device, "tags", [])) + [_TAG_SLUG]))
-        device.update({"tags": [{"slug": s} for s in slugs]})
-    except Exception as exc:
-        return str(exc)
-    return True
-
-
 def _result(
     *,
     apply: bool,
+    tag_slug: str,
     changes: list[str],
     data: dict[str, Any],
     created: int,
@@ -635,7 +563,7 @@ def _result(
     elif create_planned or tag_planned:
         summary = (
             f"{create_planned} device(s) missing from NetBox, "
-            f"{tag_planned} need the {_TAG_SLUG!r} tag — run with --apply"
+            f"{tag_planned} need the {tag_slug!r} tag — run with --apply"
         )
     else:
         summary = f"NetBox is in sync with the Conductor across {total} device(s)"

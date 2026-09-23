@@ -75,7 +75,7 @@ class FortiGateClient:
     def interfaces(self) -> list[dict[str, Any]]:
         """Configured interfaces — IPv4 ``ip``/``secondaryip``, IPv6 under ``ipv6``.
 
-        Used only for the interface-conflict note in ``fw-subnet-check``: is the
+        Used only for the interface-conflict note in ``security subnet-check``: is the
         queried subnet already assigned to a live interface, not just an address
         object.
         """

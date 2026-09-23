@@ -1,6 +1,6 @@
 """What every tool is, and the argument helpers they share.
 
-A tool is not a class hierarchy — it is any object with the four members in the
+A tool is not a class hierarchy — it is any object with the members of the
 :class:`Tool` protocol. Keeping it structural means a tool is trivial to write
 and to fake in a test.
 
@@ -27,16 +27,20 @@ __all__ = [
     "EXIT_CODES",
     "COMMON_ARG_DESTS",
     "add_common_arguments",
+    "add_scope_arguments",
+    "add_ssh_arguments",
     "timeouts_from_args",
 ]
 
-#: argparse ``dest`` names contributed by :func:`add_common_arguments`. The hub
-#: skips prompting for these (they all have safe defaults / resolve later).
+#: argparse ``dest`` names contributed by :func:`add_scope_arguments` /
+#: :func:`add_ssh_arguments`. The hub skips prompting for these (they all have
+#: safe defaults / resolve later).
 COMMON_ARG_DESTS = frozenset(
     {
         "config",
         "tag",
         "force_tag",
+        "role",
         "region",
         "site",
         "legacy_ssh",
@@ -53,12 +57,16 @@ COMMON_ARG_DESTS = frozenset(
 class Tool(Protocol):
     """The shape the registry and both entry points rely on."""
 
-    #: CLI subcommand and hub menu key, e.g. ``"send-command"``.
+    #: CLI subcommand and hub menu key within its category, e.g. ``"send-command"``.
     name: str
     #: One line shown in ``--help`` and the hub menu.
     summary: str
-    #: ``True`` ⇒ the tool builds a direct NetBox client and honours ``--apply``.
+    #: ``True`` ⇒ the tool writes to NetBox and honours ``--apply`` (plans otherwise).
     writes: bool
+    #: Which :data:`~bunnyauto.categories.CATEGORIES` entry it belongs to
+    #: (``"wired"``, ``"wireless"``, ...). The category decides the NetBox role
+    #: branch the tool is confined to; see :mod:`bunnyauto.scope`.
+    category: str
 
     # Optional, default ``True`` when a tool does not define them — read by both
     # entry points as ``getattr(tool, "needs_devices", True)`` /
@@ -76,8 +84,12 @@ class Tool(Protocol):
         ...
 
 
-def add_common_arguments(parser: argparse.ArgumentParser) -> None:
-    """Options every tool accepts. Used as the subparser ``parents=[...]`` base."""
+def add_scope_arguments(parser: argparse.ArgumentParser, *, role: bool = True) -> None:
+    """Which devices a run may touch: ``--tag`` / ``--role`` / ``--region`` / ``--site``.
+
+    For every tool that selects NetBox devices. ``role=False`` leaves out
+    ``--role`` for a tool that isn't confined to one category's branch.
+    """
     selection = parser.add_argument_group("target selection")
     selection.add_argument(
         "--config",
@@ -94,6 +106,15 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="allow a --tag that is not the selected environment's default_tag",
     )
+    if role:
+        selection.add_argument(
+            "--role",
+            default=None,
+            help=(
+                "narrow to one NetBox device role (slug) inside this category's branch, "
+                "including its child roles (default: the whole branch)"
+            ),
+        )
     selection.add_argument(
         "--region",
         default=os.getenv("BUNNYAUTO_REGION"),
@@ -108,6 +129,9 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
         help="further narrow to devices at this NetBox site (slug)",
     )
 
+
+def add_ssh_arguments(parser: argparse.ArgumentParser) -> None:
+    """Netmiko/SSH tuning, for tools that log into devices over SSH."""
     ssh = parser.add_argument_group("SSH tuning")
     ssh.add_argument(
         "--legacy-ssh",
@@ -122,6 +146,12 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
     ssh.add_argument(
         "--global-delay-factor", type=positive_float, default=None, dest="delay_factor"
     )
+
+
+def add_common_arguments(parser: argparse.ArgumentParser) -> None:
+    """Scope + SSH options: everything an SSH-to-devices tool accepts."""
+    add_scope_arguments(parser)
+    add_ssh_arguments(parser)
 
 
 def timeouts_from_args(args: argparse.Namespace) -> dict[str, float]:
