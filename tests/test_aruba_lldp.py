@@ -5,17 +5,23 @@ from __future__ import annotations
 from bunnyauto.aruba.lldp import parse_lldp_neighbors
 
 PAYLOAD = {
-    "_meta": ["AP Name", "Chassis Name", "Port ID"],
+    "_meta": ["AP", "Interface", "Neighbor", "Chassis Name", "Port ID", "Port Desc"],
     "AP LLDP Neighbors": [
         {
-            "AP Name": "hq-idf1-ap01",
+            "AP": "hq-idf1-ap01",
+            "Interface": "eth0",
+            "Neighbor": "1",
             "Chassis Name": "hq-idf1-sw01",
             "Port ID": "GigabitEthernet1/0/24",
+            "Port Desc": "GigabitEthernet1/0/24",
         },
         {
-            "AP Name": "hq-idf1-ap02",
+            "AP": "hq-idf1-ap02",
+            "Interface": "eth0",
+            "Neighbor": "",
             "Chassis Name": "",  # no neighbor reported
             "Port ID": "",
+            "Port Desc": "",
         },
     ],
 }
@@ -30,8 +36,17 @@ def test_parse_lldp_neighbors():
 
 
 def test_row_missing_any_required_field_is_skipped():
-    assert parse_lldp_neighbors([{"AP Name": "ap1"}]) == []
-    assert parse_lldp_neighbors([{"AP Name": "ap1", "Chassis Name": "sw1"}]) == []
+    assert parse_lldp_neighbors([{"AP": "ap1"}]) == []
+    assert parse_lldp_neighbors([{"AP": "ap1", "Chassis Name": "sw1"}]) == []
+
+
+def test_ap_column_is_recognized():
+    """Regression: real hardware's AP-identity column is literally 'AP', not
+    'AP Name' — every row was being skipped entirely before this was added,
+    since ap_name is required before anything else is even attempted."""
+    row = {"AP": "hq-idf1-ap01", "Chassis Name": "sw1", "Port ID": "Gi1/0/24"}
+    (neighbor,) = parse_lldp_neighbors([row])
+    assert neighbor.ap_name == "hq-idf1-ap01"
 
 
 def test_both_chassis_name_and_chassis_id_are_kept_as_candidates():

@@ -160,7 +160,7 @@ def _args(**over) -> argparse.Namespace:
 AP_ROW = {"Name": "hq-idf1-ap01", "AP Type": "515"}
 AP_ROW_WITH_VERSION = {**AP_ROW, "Software Version": "8.10.0.5"}
 LLDP_ROW = {
-    "AP Name": "hq-idf1-ap01",
+    "AP": "hq-idf1-ap01",
     "Chassis Name": "hq-idf1-sw01",
     "Port ID": "Gi1/0/24",
 }

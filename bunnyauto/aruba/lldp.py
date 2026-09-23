@@ -3,17 +3,20 @@
 Pure — no I/O. Command name confirmed against real AOS 8 hardware (all WLC
 models) 2026-09-22 — unlike most Aruba field names in this package, this one
 is not a guess. Field names inside each row are likewise now confirmed
-against real output (2026-09-23): the neighbor's identity is under
-``Chassis Name`` *or* ``Chassis ID`` (which one actually holds a usable
-hostname vs. e.g. a MAC depends on how the neighboring switch is configured
-to advertise its chassis ID — not something Aruba controls), and its port
-under ``Port ID`` or ``Port Desc`` (both are the *neighbor's own* port, per
-live testing — not the AP's local port). Every candidate for a field is kept,
-not just the first non-empty one, so the caller can try each against NetBox
-and use whichever one actually resolves — same "try progressively more
-candidates" pattern as :func:`bunnyauto.devicetype_match.match_device_type`'s
-``model_candidates``, since which field holds the useful value isn't
-knowable in advance.
+against real output: the row identifies the local AP under the column
+``AP`` (not ``"AP Name"`` — confirmed 2026-09-23; the row also carries an
+``Interface`` column for the AP's *own* local port and a ``Neighbor`` column
+of unconfirmed meaning, neither of which this parser currently uses). The
+neighbor's identity is under ``Chassis Name`` *or* ``Chassis ID`` (which one
+actually holds a usable hostname vs. e.g. a MAC depends on how the
+neighboring switch is configured to advertise its chassis ID — not something
+Aruba controls), and its port under ``Port ID`` or ``Port Desc`` (both are
+the *neighbor's own* port, per live testing — not the AP's local port).
+Every candidate for a field is kept, not just the first non-empty one, so the
+caller can try each against NetBox and use whichever one actually resolves —
+same "try progressively more candidates" pattern as
+:func:`bunnyauto.devicetype_match.match_device_type`'s ``model_candidates``,
+since which field holds the useful value isn't knowable in advance.
 
 A row missing any of the three fields ``wireless-enrich`` needs (which AP, at
 least one remote-system candidate, at least one remote-port candidate) is
@@ -66,7 +69,7 @@ def parse_lldp_neighbors(payload: dict[str, Any] | list[dict[str, Any]]) -> list
     """Records from ``show ap lldp neighbors``."""
     neighbors: list[LldpNeighbor] = []
     for row in _rows(payload):
-        ap_name = _get(row, "AP Name", "Name")
+        ap_name = _get(row, "AP", "AP Name", "Name")
         remote_system_candidates = _get_all(
             row,
             "Chassis Name",
