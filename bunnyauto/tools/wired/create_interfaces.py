@@ -10,7 +10,11 @@ member as its own device (:mod:`bunnyauto.netbox.stacks`). A port is checked
 and created on the member whose number it carries (``Gi2/0/1`` -> ``SwitchA-2``).
 Ports without a member number (Port-Channels, VLANs, mgmt) go to the connected
 device, or a Virtual Chassis's master. A member with no in-scope NetBox device
-gets nothing. Its ports are reported, never parked on another member.
+gets nothing. Its ports are reported, never parked on another member. A copy
+already on the connected device counts as present only when NetBox has no
+device of that member's own (:meth:`~bunnyauto.netbox.stacks.Stack.stand_in`,
+the rule ``sync-interfaces`` uses too). When the member's device exists but is
+out of scope, the copy is a leftover and the ports are reported.
 
 **Already in NetBox** means present on the port's own device under the same
 name or spelling (``Gi1/0/1`` is ``GigabitEthernet1/0/1``). On a stack member it
@@ -43,16 +47,13 @@ from bunnyauto.netbox.interfaces import (
     member_local_names,
     stack_member,
 )
-from bunnyauto.netbox.records import related_id
-from bunnyauto.netbox.stacks import Stack, resolve_stack
+from bunnyauto.netbox.stacks import Stack, is_stack_wide, own_interfaces, resolve_stack
 from bunnyauto.tools.base import Status, ToolResult, add_common_arguments
 
 if TYPE_CHECKING:
     from bunnyauto.context import Context
 
 _DISABLED_STATES = {"administratively down", "admin down", "disabled"}
-#: Stack-wide logical interfaces: one on any member of the stack means it's in NetBox.
-_STACK_WIDE_TYPES = frozenset({"lag", "virtual"})
 
 
 @dataclass(frozen=True)
@@ -268,12 +269,8 @@ def _interface_index(nb: Any, devices: list[Any]) -> dict[int, dict[str, str]]:
     """Each device's NetBox interfaces as ``{canonical name: NetBox name}``, by device id."""
     index: dict[int, dict[str, str]] = {}
     for device in devices:
-        device_id = int(device.id)
-        names = index[device_id] = {}
-        for record in nb.dcim.interfaces.filter(device_id=device_id):
-            # Only this device's own: older NetBox expanded a VC master's filter to its members.
-            if related_id(getattr(record, "device", None)) not in (None, device_id):
-                continue
+        names = index[int(device.id)] = {}
+        for record in own_interfaces(nb, device):
             names.setdefault(canonical_name(str(record.name)), str(record.name))
     return index
 
@@ -331,22 +328,20 @@ def _ownerless(
     blocked: dict[tuple[str, int], _Blocked],
 ) -> None:
     """A port whose stack member has no in-scope device: present, or blocked."""
-    connected = stack.connected
-    # Already on the connected device means it's in NetBox (a modular chassis's
-    # line-card ports look like stack members). A connected member other than 1
-    # has member-1 names from its own template, which are its ports, not member 1's.
-    template_clash = member == 1 and stack.own_member not in (None, 1)
-    if not template_clash and canonical_name(iface.name) in index.get(int(connected.id), {}):
-        plan = _plan(plans, connected, stack)
+    # Already on the connected device means it's in NetBox where that device stands
+    # in for the member (a modular chassis's line-card ports look like stack members).
+    stand_in = stack.stand_in(iface.name)
+    if stand_in is not None and canonical_name(iface.name) in index.get(int(stand_in.id), {}):
+        plan = _plan(plans, stand_in, stack)
         plan.discovered += 1
         plan.existing += 1
         return
 
-    key = (str(connected.name), member)
+    key = (str(stack.connected.name), member)
     item = blocked.get(key)
     if item is None:
         reason = stack.unresolved.get(member, "no NetBox device for this stack member")
-        item = blocked[key] = _Blocked(via=str(connected.name), member=member, reason=reason)
+        item = blocked[key] = _Blocked(via=str(stack.connected.name), member=member, reason=reason)
     item.ports.append(iface.name)
 
 
@@ -354,9 +349,10 @@ def _plan(plans: dict[int, _DevicePlan], device: Any, stack: Stack) -> _DevicePl
     device_id = int(device.id)
     plan = plans.get(device_id)
     if plan is None:
-        member = next((m for m, d in stack.members.items() if int(d.id) == device_id), None)
         via = "" if device_id == int(stack.connected.id) else str(stack.connected.name)
-        plan = plans[device_id] = _DevicePlan(device=device, via=via, member=member)
+        plan = plans[device_id] = _DevicePlan(
+            device=device, via=via, member=stack.member_number(device)
+        )
     return plan
 
 
@@ -373,7 +369,7 @@ def _stack_wide_holders(
     name: str, stack: Stack, index: dict[int, dict[str, str]], owner_id: int
 ) -> list[str]:
     """Other stack members that already have Port-Channel/VLAN ``name``."""
-    if not stack.is_stack or interface_type(name) not in _STACK_WIDE_TYPES:
+    if not stack.is_stack or not is_stack_wide(name):
         return []
     wanted = canonical_name(name)
     return [

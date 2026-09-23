@@ -7,6 +7,15 @@ interfaces; missing or ambiguous objects are reported and skipped.
 
 The NetBox client (``nb``) and the tagged Nornir inventory are supplied by the
 ``sync-interfaces`` tool; this module holds the parsing + reconciliation logic.
+
+**Stacks.** One SSH session to a stack reports every member's ports, but NetBox
+keeps each member as its own device. :func:`build_interface_search_scope`
+resolves the members with :func:`bunnyauto.netbox.stacks.resolve_stack`, the
+resolver ``create-interfaces`` uses (the device's Virtual Chassis, else the
+``<host>-<member>`` names), so both tools agree on where a port lives. Only
+devices in the run's scope are ever members. :func:`match_scoped_interface`
+matches a member's port on that member's device only, never on a same-named
+copy elsewhere in the stack.
 """
 
 from __future__ import annotations
@@ -29,6 +38,7 @@ from bunnyauto.netbox.interfaces import (
     stack_member,
 )
 from bunnyauto.netbox.records import choice_value, related_id
+from bunnyauto.netbox.stacks import Stack, is_stack_wide, own_interfaces, resolve_stack
 
 SHOW_VLAN = "show vlan brief"
 SHOW_TRUNKS = "show interfaces trunk"
@@ -102,6 +112,15 @@ class CollectedDevice:
 
 
 @dataclass
+class BlockedMember:
+    """A stack member's ports that no NetBox device this run may touch holds."""
+
+    member: int
+    reason: str
+    ports: list[str] = field(default_factory=list)
+
+
+@dataclass
 class SyncSummary:
     device: str
     dry_run: bool
@@ -111,21 +130,39 @@ class SyncSummary:
     changes: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    #: Of ``updated``: the updates that landed on another stack member's device.
+    routed: int = 0
+    #: Ports skipped because their stack member has no NetBox device in scope.
+    blocked: list[BlockedMember] = field(default_factory=list)
+    #: ``"<device>/<interface>"`` -> the stack member device that port belongs on:
+    #: copies on the wrong member, left by create-interfaces runs before stacks.
+    misplaced: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
 class InterfaceSearchScope:
-    """NetBox devices and interfaces belonging to one managed switch/stack."""
+    """One managed switch or stack: its in-scope NetBox devices and their interfaces."""
 
-    connected_device: Any
-    master_device: Any
-    virtual_chassis: Any | None
-    members_by_position: dict[int, Any]
+    stack: Stack
     devices_by_id: dict[int, Any]
     indexes_by_device_id: dict[
         int,
         tuple[dict[str, list[Any]], dict[tuple[str, str], list[Any]]],
     ]
+
+
+@dataclass(frozen=True)
+class ScopedMatch:
+    """Where one reported port lives in NetBox (``interface`` on ``owner``), or why not."""
+
+    interface: Any | None = None
+    owner: Any | None = None
+    error: str | None = None
+    #: Set instead of ``error`` when the port's stack member has no NetBox device
+    #: this run may touch; the caller reports those ports per member.
+    blocked_member: int | None = None
+    #: ``(device, interface)``: copies of this member-2+ port on other members.
+    misplaced: tuple[tuple[Any, Any], ...] = ()
 
 
 @dataclass
@@ -1025,6 +1062,11 @@ def match_interface(
     by_name: dict[str, list[Any]],
     by_signature: dict[tuple[str, str], list[Any]],
 ) -> tuple[Any | None, str | None]:
+    """The one interface named ``name`` (exact, then canonical) as ``(interface, None)``.
+
+    ``(None, why)`` when more than one matches (an ambiguous name is never
+    guessed), and ``(None, None)`` when nothing does.
+    """
     exact = by_name.get(name.strip().casefold(), [])
     if len(exact) == 1:
         return exact[0], None
@@ -1037,7 +1079,7 @@ def match_interface(
     if len(canonical) > 1:
         names = ", ".join(sorted(str(item.name) for item in canonical))
         return None, f"ambiguous interface match for {name!r}: {names}"
-    return None, f"interface {name!r} does not exist on this NetBox device"
+    return None, None
 
 
 def related_ids(values: Any) -> list[int]:
@@ -1328,208 +1370,212 @@ def integer_value(value: Any) -> int | None:
         return None
 
 
-def resolve_virtual_chassis(
-    nb: Any,
-    device: Any,
-    collected: CollectedDevice,
-) -> Any | None:
-    """Resolve the device's VC relation, then an exact VC hostname fallback."""
-
-    virtual_chassis_id = related_id(getattr(device, "virtual_chassis", None))
-    if virtual_chassis_id is not None:
-        virtual_chassis = nb.dcim.virtual_chassis.get(virtual_chassis_id)
-        if virtual_chassis is None:
-            raise LookupError(
-                f"device {device.name!r} references missing Virtual Chassis ID {virtual_chassis_id}"
-            )
-        return virtual_chassis
-
-    # This supports inventories named for the stack/VC while NetBox stores the
-    # physical master device under a member-specific name.
-    for name in {str(device.name), collected.inventory_name}:
-        candidates = list(nb.dcim.virtual_chassis.filter(name=name))
-        exact = [
-            chassis for chassis in candidates if str(chassis.name).casefold() == name.casefold()
-        ]
-        if len(exact) == 1:
-            return exact[0]
-        if len(exact) > 1:
-            raise LookupError(f"multiple Virtual Chassis records are named {name!r}")
-    return None
-
-
 def build_interface_search_scope(
     nb: Any,
-    device: Any,
     collected: CollectedDevice,
+    in_scope: Iterable[Any],
+    *,
+    scope_label: str = "",
 ) -> InterfaceSearchScope:
-    """Load interfaces from a device and all of its Virtual Chassis members."""
+    """Resolve the switch's stack members and load each one's own interfaces.
 
-    virtual_chassis = resolve_virtual_chassis(nb, device, collected)
-    master_device = device
-    members_by_position: dict[int, Any] = {}
-    devices: dict[int, Any] = {int(device.id): device}
+    Membership comes from :func:`bunnyauto.netbox.stacks.resolve_stack`: the
+    device's Virtual Chassis, else the ``<host>-<member>`` names. Only
+    ``in_scope`` devices (the run's tag + role branch + region/site) are ever
+    members, so nothing outside the scope is loaded, matched or written.
+    ``scope_label`` names that scope in the reason for a member outside it.
+    """
 
-    if virtual_chassis is not None:
-        members = list(nb.dcim.devices.filter(virtual_chassis_id=virtual_chassis.id))
-        for member in members:
-            devices[int(member.id)] = member
-            position = integer_value(getattr(member, "vc_position", None))
-            if position is None:
-                continue
-            if position in members_by_position:
-                raise LookupError(
-                    f"Virtual Chassis {virtual_chassis.name!r} has multiple "
-                    f"devices at position {position}"
-                )
-            members_by_position[position] = member
-
-        master_id = related_id(getattr(virtual_chassis, "master", None))
-        if master_id is not None:
-            master_device = devices.get(master_id) or nb.dcim.devices.get(master_id)
-            if master_device is None:
-                raise LookupError(
-                    f"Virtual Chassis {virtual_chassis.name!r} references "
-                    f"missing master device ID {master_id}"
-                )
-            devices[int(master_device.id)] = master_device
-
+    device = resolve_device(nb, collected)
+    names = [state.name for state in collected.interfaces]
+    names += [state.name for state in collected.interface_metadata]
+    reported = {member for member in map(stack_member, names) if member is not None}
+    stack = resolve_stack(nb, device, reported, in_scope, scope_label=scope_label)
+    devices = {int(member.id): member for member in stack.devices()}
+    if len(devices) > 1:
+        members = ", ".join(f"member {n} = {d.name}" for n, d in sorted(stack.members.items()))
         LOGGER.info(
-            "%s: Virtual Chassis %r has member position(s): %s",
+            "%s: stack resolved by %s: %s",
             collected.inventory_name,
-            virtual_chassis.name,
-            ", ".join(str(position) for position in sorted(members_by_position)) or "none",
+            "Virtual Chassis" if stack.source == "virtual-chassis" else "<host>-<member> names",
+            members,
         )
-
-    indexes_by_device_id = {
-        device_id: interface_indexes(nb.dcim.interfaces.filter(device_id=device_id))
-        for device_id in devices
-    }
     return InterfaceSearchScope(
-        connected_device=device,
-        master_device=master_device,
-        virtual_chassis=virtual_chassis,
-        members_by_position=members_by_position,
+        stack=stack,
         devices_by_id=devices,
-        indexes_by_device_id=indexes_by_device_id,
+        indexes_by_device_id={
+            device_id: interface_indexes(own_interfaces(nb, member))
+            for device_id, member in devices.items()
+        },
     )
 
 
 def match_scoped_interface(
     discovered_name: str,
     scope: InterfaceSearchScope,
-) -> tuple[Any | None, Any | None, str | None]:
-    """Match a port on either a single-device stack or a Virtual Chassis.
+) -> ScopedMatch:
+    """Find the NetBox interface for one reported port, on the device it belongs to.
 
-    Some NetBox installations model a Cisco stack as one device containing
-    every IOS interface name (Gi1/0/1, Gi2/0/1, and so on). Others model each
-    member as a separate device in a Virtual Chassis. Always try the exact
-    interface on the connected device first; only route by VC position when
-    that direct match does not exist.
+    A port carrying a stack member's number (``Gi2/0/1``) belongs to that
+    member's device (:meth:`~bunnyauto.netbox.stacks.Stack.owner`) and is
+    matched **only there**: under the name the switch reports (exact, then
+    canonical), else under the device type's member-1 name (``Gi1/0/1`` on
+    ``SwitchA-2``, :func:`member_local_names`). A same-named interface on the
+    connected device never wins over the member. For a member-2+ port that is
+    a copy left on the wrong device, and updating it (what trying the
+    connected device first used to do) would leave the member's real port
+    stale. Such copies come back as ``misplaced``, for the report.
+
+    If the member has no in-scope device, the connected device is tried only
+    where it stands in for the member
+    (:meth:`~bunnyauto.netbox.stacks.Stack.stand_in`: NetBox models the stack
+    or chassis as that one device). Otherwise the port is ``blocked_member``.
+
+    A port without a member number (Port-Channel, VLAN, mgmt) is tried on the
+    connected device, then the Virtual Chassis master, then, for a
+    Port-Channel or another stack-wide interface, exactly one other member. A
+    standalone device keeps every port, matched by name only: a member-1 alias
+    there could be a different physical port.
     """
 
-    position = stack_member(discovered_name)
-    connected_indexes = scope.indexes_by_device_id.get(int(scope.connected_device.id))
-    if connected_indexes is not None:
-        interface, _ = match_interface(discovered_name, *connected_indexes)
-        if interface is not None:
-            return interface, scope.connected_device, None
+    stack = scope.stack
+    member = stack_member(discovered_name) if stack.is_stack else None
+    if member is None:
+        return _match_unnumbered(discovered_name, scope)
 
-    if position is not None and scope.virtual_chassis is not None:
-        owner = scope.members_by_position.get(position)
-        if owner is None:
-            return (
-                None,
-                None,
-                (
-                    f"{discovered_name}: Virtual Chassis {scope.virtual_chassis.name!r} "
-                    f"has no member at position {position}"
-                ),
-            )
-    elif position is not None:
-        # A non-VC stack can still be represented by one NetBox device. The
-        # direct lookup above is authoritative; do not alias member 2 to a
-        # member-1 interface because that could update the wrong physical port.
-        owner = scope.connected_device
-    else:
-        owner = scope.master_device
+    owner = stack.owner(discovered_name)
+    if owner is None:
+        stand_in = stack.stand_in(discovered_name)
+        if stand_in is not None:
+            indexes = scope.indexes_by_device_id[int(stand_in.id)]
+            interface, error = match_interface(discovered_name, *indexes)
+            if interface is not None:
+                return ScopedMatch(interface=interface, owner=stand_in)
+            if error:
+                return ScopedMatch(
+                    owner=stand_in,
+                    error=f"{discovered_name}: {error} on device {stand_in.name!r}",
+                )
+        return ScopedMatch(blocked_member=member)
 
-    indexes = scope.indexes_by_device_id.get(int(owner.id))
-    if indexes is None:
-        return None, owner, f"no interfaces were loaded for device {owner.name!r}"
-
+    # Every member device carries its template's member-1 names, so only a copy
+    # of a member-2+ port is unambiguously on the wrong device.
+    misplaced = _copies_elsewhere(discovered_name, owner, scope) if member != 1 else ()
+    indexes = scope.indexes_by_device_id[int(owner.id)]
     interface, error = match_interface(discovered_name, *indexes)
+    if interface is None and error is None:
+        interface, error = _match_template_name(discovered_name, indexes)
     if interface is not None:
-        return interface, owner, None
+        return ScopedMatch(interface=interface, owner=owner, misplaced=misplaced)
+    if error is None:
+        aliases = " / ".join(member_local_names(discovered_name))
+        error = (
+            f"interface does not exist on NetBox device {owner.name!r} (stack member "
+            f"{member}), under that name or as {aliases}; wired create-interfaces creates it"
+        )
+    else:
+        error = f"{error} on device {owner.name!r}"
+    return ScopedMatch(owner=owner, error=f"{discovered_name}: {error}", misplaced=misplaced)
 
-    # A stack-wide Port-Channel has no member number in its name. NetBox
-    # commonly stores the LAG on the VC master, but some installations attach
-    # it to another member. Search the remaining VC members and accept only a
-    # unique match so a LAG can never be attributed to the wrong device.
-    if position is None and interface_signature(discovered_name)[0] == "po":
-        lag_matches: dict[int, tuple[Any, Any]] = {}
-        for device_id, candidate_indexes in scope.indexes_by_device_id.items():
-            if device_id in {
-                int(scope.connected_device.id),
-                int(owner.id),
-            }:
+
+def _match_unnumbered(name: str, scope: InterfaceSearchScope) -> ScopedMatch:
+    """A port with no stack member to route by: a standalone device's, or stack-wide."""
+
+    stack = scope.stack
+    tried = [stack.connected]
+    if int(stack.anchor.id) != int(stack.connected.id):
+        tried.append(stack.anchor)
+    for device in tried:
+        interface, error = match_interface(name, *scope.indexes_by_device_id[int(device.id)])
+        if interface is not None:
+            return ScopedMatch(interface=interface, owner=device)
+        if error:
+            return ScopedMatch(owner=device, error=f"{name}: {error} on device {device.name!r}")
+
+    if stack.is_stack and is_stack_wide(name):
+        # NetBox may keep a Port-Channel or VLAN on any member. Accept exactly one,
+        # so it can never be attributed to the wrong device.
+        skip = {int(device.id) for device in tried}
+        holders: dict[int, tuple[Any, Any]] = {}
+        for device_id, indexes in scope.indexes_by_device_id.items():
+            if device_id in skip:
                 continue
-            candidate, _ = match_interface(
-                discovered_name,
-                *candidate_indexes,
-            )
-            if candidate is not None:
-                lag_matches[int(candidate.id)] = (
-                    candidate,
-                    scope.devices_by_id[device_id],
-                )
-        if len(lag_matches) == 1:
-            candidate, candidate_owner = next(iter(lag_matches.values()))
-            return candidate, candidate_owner, None
-        if len(lag_matches) > 1:
+            interface, _ = match_interface(name, *indexes)
+            if interface is not None:
+                holders[int(interface.id)] = (interface, scope.devices_by_id[device_id])
+        if len(holders) == 1:
+            interface, holder = next(iter(holders.values()))
+            return ScopedMatch(interface=interface, owner=holder)
+        if len(holders) > 1:
             locations = ", ".join(
-                sorted(
-                    f"{candidate_owner.name}/{candidate.name}"
-                    for candidate, candidate_owner in lag_matches.values()
-                )
+                sorted(f"{holder.name}/{interface.name}" for interface, holder in holders.values())
             )
-            return (
-                None,
-                owner,
-                (f"{discovered_name}: multiple Virtual Chassis LAG interfaces match: {locations}"),
+            return ScopedMatch(
+                owner=stack.anchor,
+                error=f"{name}: more than one stack member has this interface: {locations}",
             )
 
-    if position is not None and scope.virtual_chassis is None:
-        return (
-            None,
-            owner,
-            (
-                f"{discovered_name}: no exact/canonical interface exists on "
-                f"single-device stack {owner.name!r}; a Virtual Chassis is "
-                "required only when stack members are separate NetBox devices"
-            ),
+    where = " or ".join(repr(str(device.name)) for device in tried)
+    error = f"{name}: interface {name!r} does not exist on NetBox device {where}"
+    if not stack.is_stack and (stack_member(name) or 0) > 1:
+        error += (
+            " — NetBox models it as one device (no Virtual Chassis or <host>-<member> "
+            "stack found), so every port is looked up there"
         )
+    return ScopedMatch(owner=stack.anchor, error=error)
 
-    # Device-type templates sometimes store a VC member's ports in a
-    # member-local form (Gi1/0/3 or Gi0/3), even when IOS reports Gi2/0/3.
-    alias_matches: dict[int, Any] = {}
-    for alias in member_local_names(discovered_name):
-        alias_interface, _ = match_interface(alias, *indexes)
-        if alias_interface is not None:
-            alias_matches[int(alias_interface.id)] = alias_interface
-    if len(alias_matches) == 1:
-        return next(iter(alias_matches.values())), owner, None
-    if len(alias_matches) > 1:
-        names = ", ".join(sorted(str(item.name) for item in alias_matches.values()))
-        return (
-            None,
-            owner,
-            (
-                f"{discovered_name}: multiple member-local interfaces match on "
-                f"{owner.name!r}: {names}"
-            ),
-        )
-    return None, owner, f"{discovered_name}: {error} on device {owner.name!r}"
+
+def _match_template_name(
+    name: str,
+    indexes: tuple[dict[str, list[Any]], dict[tuple[str, str], list[Any]]],
+) -> tuple[Any | None, str | None]:
+    """A stack port under its device type's member-1 name (``Gi2/0/3`` as ``Gi1/0/3``)."""
+
+    matches: dict[int, Any] = {}
+    for alias in member_local_names(name):
+        interface, _ = match_interface(alias, *indexes)
+        if interface is not None:
+            matches[int(interface.id)] = interface
+    if len(matches) == 1:
+        return next(iter(matches.values())), None
+    if len(matches) > 1:
+        names = ", ".join(sorted(str(item.name) for item in matches.values()))
+        return None, f"multiple member-local interfaces match: {names}"
+    return None, None
+
+
+def _copies_elsewhere(
+    name: str,
+    owner: Any,
+    scope: InterfaceSearchScope,
+) -> tuple[tuple[Any, Any], ...]:
+    """Interfaces named like ``name`` on the stack's other devices, as ``(device, interface)``."""
+
+    signature = interface_signature(name)
+    return tuple(
+        (scope.devices_by_id[device_id], interface)
+        for device_id, (_by_name, by_signature) in scope.indexes_by_device_id.items()
+        if device_id != int(owner.id)
+        for interface in by_signature.get(signature, [])
+    )
+
+
+def route_note(reported_name: str, interface: Any, owner: Any, stack: Stack) -> str:
+    """The bracketed note that makes a stack port's routing reviewable in a change line.
+
+    ``" [stack member 2]"`` when the update lands on another member's device
+    than the switch was reached through; ``"reported as Gi2/0/1"`` joins it
+    when NetBox holds the port under another name (the device type's member-1
+    name). ``""`` for a port on the switch itself, under its own name.
+    """
+
+    notes: list[str] = []
+    if int(owner.id) != int(stack.connected.id):
+        member = stack.member_number(owner)
+        notes.append(f"stack member {member}" if member is not None else "another stack member")
+    if interface_signature(str(interface.name)) != interface_signature(reported_name):
+        notes.append(f"reported as {reported_name}")
+    return f" [{', '.join(notes)}]" if notes else ""
 
 
 def current_interface_state(interface: Any) -> dict[str, Any]:
@@ -1629,22 +1675,29 @@ def desired_netbox_state(
 def sync_device(
     nb: Any,
     collected: CollectedDevice,
+    scope: InterfaceSearchScope,
     vlan_cache: VlanCache,
     dry_run: bool,
 ) -> SyncSummary:
-    """Compare one device and apply only the necessary interface updates."""
+    """Compare one switch or stack and apply only the necessary interface updates.
 
-    device = resolve_device(nb, collected)
-    summary = SyncSummary(device=str(device.name), dry_run=dry_run)
-    scope = build_interface_search_scope(nb, device, collected)
+    ``scope`` is :func:`build_interface_search_scope`'s. Every change line names
+    the device the update lands on, and a bracketed :func:`route_note` marks one
+    that lands on another stack member or under a template name, so a plan
+    shows where each write goes before ``--apply``.
+    """
+
+    stack = scope.stack
+    summary = SyncSummary(device=str(stack.connected.name), dry_run=dry_run)
     contexts_by_device_id: dict[int, DeviceScopeContext] = {}
+    blocked: dict[int, BlockedMember] = {}
+    misplaced: dict[tuple[int, str], tuple[Any, Any, Any]] = {}
 
     for discovered in collected.interfaces:
-        interface, owner, error = match_scoped_interface(discovered.name, scope)
-        if error:
-            summary.skipped += 1
-            summary.errors.append(error)
+        match = _place(discovered.name, scope, summary, blocked, misplaced)
+        if match is None:
             continue
+        interface, owner = match.interface, match.owner
 
         current = current_interface_state(interface)
         owner_id = int(owner.id)
@@ -1672,10 +1725,10 @@ def sync_device(
             summary.unchanged += 1
             continue
 
-        change = f"{owner.name}/{interface.name}: {current} -> {desired}"
+        note = route_note(discovered.name, interface, owner, stack)
+        change = f"{owner.name}/{interface.name}{note}: {current} -> {desired}"
         if dry_run:
-            summary.updated += 1
-            summary.changes.append(f"DRY-RUN {change}")
+            _record_update(summary, f"DRY-RUN {change}", owner, stack)
             continue
 
         try:
@@ -1687,8 +1740,7 @@ def sync_device(
             persisted = current_interface_state(refreshed)
             if persisted != desired:
                 raise RuntimeError(f"verification failed; NetBox returned {persisted}")
-            summary.updated += 1
-            summary.changes.append(f"VERIFIED {change}")
+            _record_update(summary, f"VERIFIED {change}", owner, stack)
         except Exception as exc:
             summary.errors.append(f"{owner.name}/{interface.name}: update failed: {exc}")
 
@@ -1696,11 +1748,10 @@ def sync_device(
     # ensures a VLAN ambiguity cannot prevent an otherwise safe metadata
     # update, and includes routed or unused ports absent from VLAN output.
     for discovered in collected.interface_metadata:
-        interface, owner, error = match_scoped_interface(discovered.name, scope)
-        if error:
-            summary.skipped += 1
-            summary.errors.append(error)
+        match = _place(discovered.name, scope, summary, blocked, misplaced)
+        if match is None:
             continue
+        interface, owner = match.interface, match.owner
 
         desired_metadata: dict[str, Any] = {}
         if discovered.enabled is not None:
@@ -1718,14 +1769,14 @@ def sync_device(
             summary.unchanged += 1
             continue
 
+        note = route_note(discovered.name, interface, owner, stack)
         change = (
-            f"{owner.name}/{interface.name} metadata "
+            f"{owner.name}/{interface.name}{note} metadata "
             f"(device_status={discovered.device_status or 'unknown'}): "
             f"{current_subset} -> {desired_metadata}"
         )
         if dry_run:
-            summary.updated += 1
-            summary.changes.append(f"DRY-RUN {change}")
+            _record_update(summary, f"DRY-RUN {change}", owner, stack)
             continue
 
         try:
@@ -1742,12 +1793,79 @@ def sync_device(
                 raise RuntimeError(
                     f"metadata verification failed; NetBox returned {persisted_subset}"
                 )
-            summary.updated += 1
-            summary.changes.append(f"VERIFIED {change}")
+            _record_update(summary, f"VERIFIED {change}", owner, stack)
         except Exception as exc:
             summary.errors.append(f"{owner.name}/{interface.name}: metadata update failed: {exc}")
 
+    _report_stack_leftovers(summary, blocked, misplaced)
     return summary
+
+
+def _place(
+    name: str,
+    scope: InterfaceSearchScope,
+    summary: SyncSummary,
+    blocked: dict[int, BlockedMember],
+    misplaced: dict[tuple[int, str], tuple[Any, Any, Any]],
+) -> ScopedMatch | None:
+    """Match one reported port, or record why it's skipped. ``None`` when skipped."""
+
+    match = match_scoped_interface(name, scope)
+    for device, copy in match.misplaced:
+        misplaced.setdefault((int(device.id), str(copy.name)), (device, copy, match.owner))
+    if match.blocked_member is not None:
+        summary.skipped += 1
+        item = blocked.get(match.blocked_member)
+        if item is None:
+            reason = scope.stack.unresolved.get(
+                match.blocked_member, "no NetBox device for this stack member"
+            )
+            item = blocked[match.blocked_member] = BlockedMember(match.blocked_member, reason)
+        # The VLAN and metadata passes both report most ports; list each once.
+        if all(interface_signature(port) != interface_signature(name) for port in item.ports):
+            item.ports.append(name)
+        return None
+    if match.error:
+        summary.skipped += 1
+        summary.errors.append(match.error)
+        return None
+    return match
+
+
+def _record_update(summary: SyncSummary, change: str, owner: Any, stack: Stack) -> None:
+    """Count one planned or verified update, and whether it was routed to another member."""
+    summary.updated += 1
+    summary.changes.append(change)
+    if int(owner.id) != int(stack.connected.id):
+        summary.routed += 1
+
+
+def _report_stack_leftovers(
+    summary: SyncSummary,
+    blocked: dict[int, BlockedMember],
+    misplaced: dict[tuple[int, str], tuple[Any, Any, Any]],
+) -> None:
+    """One warning per stack member whose ports were skipped, and per device holding copies."""
+
+    for item in blocked.values():
+        summary.warnings.append(
+            f"{len(item.ports)} port(s) of stack member {item.member} not synced "
+            f"(e.g. {item.ports[0]}) — {item.reason}"
+        )
+    summary.blocked = list(blocked.values())
+
+    by_holder: dict[int, list[tuple[Any, Any, Any]]] = defaultdict(list)
+    for device, copy, owner in misplaced.values():
+        by_holder[int(device.id)].append((device, copy, owner))
+        summary.misplaced[f"{device.name}/{copy.name}"] = str(owner.name)
+    for copies in by_holder.values():
+        device, copy, owner = copies[0]
+        summary.warnings.append(
+            f"{len(copies)} interface(s) on {device.name} belong to another stack member "
+            f"(e.g. {copy.name} belongs on {owner.name}), likely left by a create-interfaces "
+            "run before stacks were handled — no longer synced; nothing is deleted, remove "
+            "them in NetBox once any cables or IPs are moved"
+        )
 
 
 def find_collected_result(multi_result: Any) -> CollectedDevice | None:

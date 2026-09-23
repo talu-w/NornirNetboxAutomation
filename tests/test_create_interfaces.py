@@ -434,6 +434,40 @@ def test_member_already_on_the_connected_device_is_not_blocked(wired):
     assert "blocked" not in result.data["core-1"]
 
 
+def test_copy_on_the_connected_device_never_stands_in_for_an_out_of_scope_member(wired):
+    # SwitchA-2 exists but is outside the scope, so SwitchA-1's GigabitEthernet2/0/1 is a
+    # leftover copy, not member 2's port: the port is reported, not counted as present.
+    nb = wired(
+        existing={1: ["GigabitEthernet1/0/1", "GigabitEthernet2/0/1"]},
+        discovered={A1: ["GigabitEthernet1/0/1", "GigabitEthernet2/0/1"]},
+        devices=_stack(members=1),
+        everywhere=[*_stack(members=1), _Device(2, A2)],
+    )
+
+    result = TOOL.run(_ctx(nb=nb), _args())
+
+    assert result.status is Status.PARTIAL
+    (blocked,) = result.data[A1]["blocked"]
+    assert (blocked["member"], blocked["ports"]) == (2, ["GigabitEthernet2/0/1"])
+    assert blocked["reason"].startswith(f"{A2} is outside this run's scope")
+
+
+def test_line_card_ports_stay_present_when_the_other_chassis_is_out_of_scope(wired):
+    # core-2 is a separately managed chassis (its own IP), merely left out of the scope.
+    core1 = _Device(1, "core-1", ip="10.0.0.1/24")
+    nb = wired(
+        existing={1: ["GigabitEthernet1/0/1", "GigabitEthernet2/0/1"]},
+        discovered={"core-1": ["GigabitEthernet1/0/1", "GigabitEthernet2/0/1"]},
+        devices=[core1],
+        everywhere=[core1, _Device(2, "core-2", ip="10.0.0.2/24")],
+    )
+
+    result = TOOL.run(_ctx(nb=nb), _args())
+
+    assert result.status is Status.OK
+    assert "blocked" not in result.data["core-1"]
+
+
 def test_switch_with_its_own_management_ip_is_never_a_stack_member(wired):
     # core-1 and core-2 are a redundant pair of chassis, not one stack.
     nb = wired(

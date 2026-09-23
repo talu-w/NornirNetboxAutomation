@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from bunnyauto.netbox.stacks import management_ip, resolve_stack
+from bunnyauto.netbox.stacks import (
+    is_stack_wide,
+    management_ip,
+    own_interfaces,
+    resolve_stack,
+)
 
 
 def _device(id_, name, *, ip=None, chassis=None, position=None):
@@ -135,3 +140,100 @@ def test_management_ip_reads_every_shape():
     )
     assert management_ip(SimpleNamespace(primary_ip=None, primary_ip4="10.0.0.3/24")) == "10.0.0.3"
     assert management_ip(SimpleNamespace(primary_ip=None)) is None
+
+
+# ---------------------------------------------------------------------------
+# claimed members and stand-ins: may the connected device hold an ownerless port?
+# ---------------------------------------------------------------------------
+
+
+def test_member_missing_from_netbox_lets_the_connected_device_stand_in():
+    # One NetBox device for the whole stack: its copy of member 2's port is the port.
+    stack = resolve_stack(_NB(everywhere=[A1]), A1, {1, 2}, [A1])
+
+    assert stack.claimed == set()
+    assert stack.stand_in("Gi2/0/1") is A1
+
+
+def test_member_outside_the_scope_is_claimed_and_never_stood_in_for():
+    stack = resolve_stack(_NB(everywhere=[A1, A2]), A1, {1, 2}, [A1])
+
+    assert stack.claimed == {2}
+    assert stack.stand_in("Gi2/0/1") is None
+
+
+def test_ambiguous_member_is_claimed():
+    dup = _device(4, "SwitchA-2.other.example.com")
+    stack = resolve_stack(_NB(), A1, {1, 2}, [A1, A2, dup])
+
+    assert stack.claimed == {2}
+    assert stack.stand_in("Gi2/0/1") is None
+
+
+def test_out_of_scope_sibling_with_its_own_ip_is_a_separate_switch_not_a_claim():
+    # core-2 is left out by --site, but it's a separately managed chassis.
+    core1 = _device(1, "core-1", ip="10.0.0.1/24")
+    core2 = _device(2, "core-2", ip="10.0.0.2/24")
+    stack = resolve_stack(_NB(everywhere=[core1, core2]), core1, {1, 2}, [core1])
+
+    assert stack.unresolved[2] == (
+        "core-2 has its own management IP (10.0.0.2), so it is a separate switch, "
+        "not a member of this stack"
+    )
+    assert stack.claimed == set()
+    assert stack.stand_in("Gi2/0/1") is core1
+
+
+def test_member_one_port_seen_through_member_two_has_no_stand_in():
+    # SwitchA-2's template calls its own Gi2/0/x GigabitEthernet1/0/x, so a
+    # GigabitEthernet1/0/1 on it is never member 1's port.
+    a2 = _device(2, "SwitchA-2", ip="10.0.0.11/24")
+    stack = resolve_stack(_NB(), a2, {1, 2}, [a2])
+
+    assert stack.claimed == set()  # member 1 simply isn't in NetBox
+    assert stack.stand_in("Gi1/0/1") is None
+    assert stack.stand_in("Po1") is None  # not ownerless: it goes to the anchor
+
+
+def test_resolved_members_and_standalone_devices_need_no_stand_in():
+    assert resolve_stack(_NB(), A1, {1, 2}, [A1, A2]).stand_in("Gi2/0/1") is None
+    sw = _device(9, "core-a", ip="10.0.0.9/24")
+    assert resolve_stack(_NB(), sw, {1, 2}, [sw]).stand_in("Gi2/0/1") is None
+
+
+def test_virtual_chassis_member_outside_the_scope_is_claimed_a_missing_position_is_not():
+    top = _device(10, "bldg-a-top", chassis=7, position=1)
+    bottom = _device(11, "bldg-a-bottom", chassis=7, position=2)
+    chassis = {7: SimpleNamespace(name="bldg-a", master={"id": 10})}
+    nb = _NB(everywhere=[top, bottom], chassis=chassis)
+
+    stack = resolve_stack(nb, top, {1, 2, 3}, [top])
+
+    assert stack.claimed == {2}
+    assert stack.stand_in("Gi2/0/1") is None
+    assert stack.stand_in("Gi3/0/1") is top
+
+
+def test_member_number_of_each_stack_device():
+    stack = resolve_stack(_NB(), A1, {1, 2}, [A1, A2, A3])
+
+    assert stack.member_number(A2) == 2
+    assert stack.member_number(A3) is None  # named like a member, but reported no ports
+
+
+def test_stack_wide_interfaces_are_port_channels_and_virtual_ones():
+    assert is_stack_wide("Port-channel1")
+    assert is_stack_wide("Vlan10")
+    assert is_stack_wide("Loopback0")
+    assert not is_stack_wide("GigabitEthernet2/0/1")
+
+
+def test_own_interfaces_drop_other_members_ports():
+    # Older NetBox answered a VC master's device_id filter with every member's ports.
+    mine = SimpleNamespace(name="Gi1/0/1", device={"id": 10})
+    members = SimpleNamespace(name="Gi2/0/1", device={"id": 11})
+    nb = SimpleNamespace(
+        dcim=SimpleNamespace(interfaces=SimpleNamespace(filter=lambda device_id: [mine, members]))
+    )
+
+    assert own_interfaces(nb, SimpleNamespace(id=10)) == [mine]
