@@ -8,6 +8,8 @@ own LLDP configuration, not on anything Aruba controls. An exact
 normalized by expanding known family abbreviations before comparing. No match,
 or more than one NetBox interface normalizing the same way, returns ``None`` —
 same "never guess" rule as the rest of this project's matching helpers.
+``fi`` -> ``fivegigabitethernet`` added 2026-09-23 (owner-confirmed
+abbreviation seen in this fleet; ``gi``/``te`` already covered it).
 
 Also home to :func:`stack_member_hint`, which reads the stack-member number
 back out of a ``<member>/<module>/<port>``-shaped port id (confirmed
@@ -34,11 +36,13 @@ _FAMILY_ALIASES: tuple[tuple[str, str], ...] = (
     ("hundredgigabitethernet", "hundredgigabitethernet"),
     ("twentyfivegigabitethernet", "twentyfivegigabitethernet"),
     ("tengigabitethernet", "tengigabitethernet"),
+    ("fivegigabitethernet", "fivegigabitethernet"),
     ("gigabitethernet", "gigabitethernet"),
     ("fastethernet", "fastethernet"),
     ("hu", "hundredgigabitethernet"),
     ("twe", "twentyfivegigabitethernet"),
     ("te", "tengigabitethernet"),
+    ("fi", "fivegigabitethernet"),
     ("gi", "gigabitethernet"),
     ("ge", "gigabitethernet"),
     ("fa", "fastethernet"),

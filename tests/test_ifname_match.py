@@ -15,6 +15,8 @@ def test_normalize_expands_known_abbreviations():
     assert normalize_port_name("GigabitEthernet1/0/24") == "gigabitethernet1/0/24"
     assert normalize_port_name("Te1/1/1") == "tengigabitethernet1/1/1"
     assert normalize_port_name("Fa0/1") == "fastethernet0/1"
+    assert normalize_port_name("Fi1/0/49") == "fivegigabitethernet1/0/49"
+    assert normalize_port_name("FiveGigabitEthernet1/0/49") == "fivegigabitethernet1/0/49"
 
 
 def test_normalize_handles_a_space_between_prefix_and_number():
@@ -33,6 +35,12 @@ def test_match_interface_exact():
 def test_match_interface_abbreviated_form():
     names = ["GigabitEthernet1/0/24", "GigabitEthernet1/0/25"]
     assert match_interface("Gi1/0/24", names) == "GigabitEthernet1/0/24"
+
+
+def test_match_interface_five_gig_abbreviated_form():
+    """Owner-confirmed abbreviation: 'Fi' for FiveGigabitEthernet."""
+    names = ["FiveGigabitEthernet1/0/49"]
+    assert match_interface("Fi1/0/49", names) == "FiveGigabitEthernet1/0/49"
 
 
 def test_match_interface_no_match_returns_none():
