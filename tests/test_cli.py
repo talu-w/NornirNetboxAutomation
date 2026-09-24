@@ -179,6 +179,42 @@ def test_main_returns_tool_exit_code(monkeypatch, fake_registry):
     assert tool.ran_with is not None
 
 
+@pytest.mark.parametrize(("json_flag", "expected"), [([], "terminal"), (["--json"], None)])
+def test_main_hands_the_tool_a_terminal_but_never_in_json_mode(
+    monkeypatch, fake_registry, json_flag, expected
+):
+    fake_registry(_FakeTool(result=ToolResult(status=Status.OK, summary="ok")))
+    captured = {}
+
+    def _fake_build_context(**kwargs):
+        captured.update(kwargs)
+        return _FakeCtx()
+
+    monkeypatch.setattr(cli, "build_context", _fake_build_context)
+    monkeypatch.setattr(cli, "terminal_input", lambda: "terminal")
+
+    cli.main(["--env", "test", *json_flag, "wired", "send-command", "show version"])
+
+    assert captured["ask_fn"] == expected
+
+
+def test_subnet_check_apply_help_is_its_own():
+    parser = cli.build_parser()
+    security = next(
+        action
+        for action in parser._subparsers._group_actions[0].choices["security"]._actions
+        if isinstance(action, argparse._SubParsersAction)
+    )
+    subnet_check = security.choices["subnet-check"]
+    options = {opt: action for action in subnet_check._actions for opt in action.option_strings}
+    assert {"--apply", "--yes", "--name", "--comment"} <= set(options)
+    assert "create an address object" in options["--apply"].help
+    args = parser.parse_args(
+        ["--env", "test", "security", "subnet-check", "10.20.30.0/24", "--apply", "--yes"]
+    )
+    assert args.apply is True and args.yes is True and args.name is None
+
+
 def test_main_friendly_error(monkeypatch, fake_registry, capsys):
     fake_registry(_FakeTool())
 

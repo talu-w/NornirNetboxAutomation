@@ -21,6 +21,7 @@ from bunnyauto.categories import CATEGORIES, DEFAULT_ROLES
 from bunnyauto.common import env_flag
 from bunnyauto.context import build_context
 from bunnyauto.errors import BunnyautoError
+from bunnyauto.prompts import terminal_input
 from bunnyauto.reporting import make_reporter
 from bunnyauto.tools import REGISTRY
 from bunnyauto.tools.base import timeouts_from_args
@@ -86,7 +87,8 @@ def build_parser() -> argparse.ArgumentParser:
                 tool_parser.add_argument(
                     "--apply",
                     action="store_true",
-                    help="apply the change (default: plan only, nothing written)",
+                    help=getattr(tool, "apply_help", None)
+                    or "apply the change (default: plan only, nothing written)",
                 )
                 tool_parser.add_argument(
                     "--yes",
@@ -215,6 +217,8 @@ def main(argv: list[str] | None = None) -> int:
             need_netbox=getattr(tool, "needs_netbox", True),
             category=CATEGORIES[args.category],
             role=getattr(args, "role", None),
+            # A tool's mid-run question needs someone at a terminal; never in --json.
+            ask_fn=None if args.json else terminal_input(),
         )
         ctx.banner()
         result = tool.run(ctx, args)

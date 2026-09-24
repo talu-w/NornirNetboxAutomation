@@ -12,6 +12,7 @@ from bunnyauto.environments import Environment
 from bunnyauto.errors import ToolError
 from bunnyauto.result import Status, ToolResult
 from bunnyauto.tools.netbox.import_device_type import TOOL as IMPORT_DEVICE_TYPE
+from bunnyauto.tools.security.subnet_check import TOOL as SUBNET_CHECK
 from bunnyauto.tools.wired.send_command import TOOL as SEND_COMMAND
 
 
@@ -50,6 +51,11 @@ class _FakeTool:
 class _WriteTool(_FakeTool):
     name = "writer"
     writes = True
+
+
+class _SelfConfirmingTool(_WriteTool):
+    name = "asks-itself"
+    confirms_writes = True
 
 
 class _FakeCtx:
@@ -145,6 +151,17 @@ def test_prompt_for_args_write_tool_asks_apply():
     assert args.yes is False  # never prompted
 
 
+def test_prompt_for_args_tool_that_confirms_its_own_writes_is_not_asked_apply():
+    script = _Script("10.20.30.0/24", "n")  # the subnet, then --fw-insecure
+    args = hub.prompt_for_args(SUBNET_CHECK, input_fn=script)
+    assert args.subnet == "10.20.30.0/24"
+    assert args.fw_insecure is False
+    assert args.apply is True  # on, so the tool may offer — and asks before writing
+    assert args.yes is False
+    assert args.name is None  # string options keep their defaults; the tool asks
+    assert not any("apply" in prompt for prompt in script.prompts)
+
+
 # ---------------------------------------------------------------------------
 # environment menu
 # ---------------------------------------------------------------------------
@@ -234,6 +251,32 @@ def test_main_protected_apply_requires_typed_name(env_file, creds, monkeypatch):
 
     assert code == 0
     assert fake.ran is False  # confirmation failed -> tool never ran
+
+
+def test_main_self_confirming_tool_is_not_gated_up_front(env_file, creds, monkeypatch):
+    fake = _SelfConfirmingTool(ToolResult(status=Status.OK, summary="free"))
+    monkeypatch.setattr(hub, "REGISTRY", {"security": {"asks-itself": fake}})
+    captured = {}
+
+    def _fake_build_context(**kwargs):
+        from bunnyauto.environments import resolve_environment
+
+        env = resolve_environment(kwargs["env"], kwargs.get("env_file"))
+        captured.update(kwargs)
+        return _FakeCtx(env, apply=kwargs.get("apply", False))
+
+    monkeypatch.setattr(hub, "build_context", _fake_build_context)
+
+    # env 2 (prod, protected), area 1, tool 1, its positional, quit — no apply
+    # question and no typed name before the run: the tool asks for itself.
+    script = _Script("2", "1", "1", "10.20.30.0/24", "q")
+    code = hub.main(["--env-file", str(env_file)], input_fn=script)
+
+    assert code == 0
+    assert fake.ran is True
+    assert captured["apply"] is True
+    assert captured["assume_yes"] is False
+    assert captured["ask_fn"] is script
 
 
 def test_main_back_then_quit(env_file, creds, monkeypatch):

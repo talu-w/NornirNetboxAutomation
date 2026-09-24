@@ -10,6 +10,11 @@ Tools get their devices from here, never by building their own queries:
 :meth:`Context.target_hosts` (the Nornir inventory, for SSH tools) and
 :meth:`Context.target_devices` (NetBox records, for NetBox-first tools) both
 apply the same tag + role branch + region/site scope.
+
+A tool that needs an answer mid-run — "the subnet is free; create it?" — asks
+through :meth:`Context.confirm` / :meth:`Context.ask` /
+:meth:`Context.confirm_protected`, never ``input()``: the entry point decides
+whether anyone is there to answer (see :mod:`bunnyauto.prompts`).
 """
 
 from __future__ import annotations
@@ -20,6 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from bunnyauto import prompts
 from bunnyauto.common import (
     build_netbox,
     build_nornir,
@@ -37,6 +43,7 @@ if TYPE_CHECKING:
     from nornir.core import Nornir
 
     from bunnyauto.categories import Category
+    from bunnyauto.prompts import InputFn
     from bunnyauto.reporting import Reporter
 
 DEFAULT_CONFIG_FILE = "config.yaml"
@@ -96,6 +103,10 @@ class Context:
     creds: Credentials
     reporter: Reporter
     environment: Environment
+    #: Reads the operator's answer mid-run (``input``-shaped): the hub's prompt, or
+    #: ``input`` on a CLI terminal. ``None`` when nobody is there to answer — CI,
+    #: ``--json``, a pipe — so a question is never left hanging.
+    ask_fn: InputFn | None = None
     _nr: Nornir | None = None
     _nb: Any = None
     _roles: RoleTree | None = None
@@ -143,6 +154,43 @@ class Context:
             site=settings.site,
         )
 
+    @property
+    def interactive(self) -> bool:
+        """Will a question actually reach someone? (Not with ``--yes``, nor in CI.)"""
+        return self.ask_fn is not None and not self.settings.assume_yes
+
+    def confirm(self, question: str) -> bool:
+        """A yes/no question to the operator mid-run; Enter means no.
+
+        ``--yes`` answers yes without asking; with nobody there to answer, the
+        answer is no.
+        """
+        if self.settings.assume_yes:
+            return True
+        if self.ask_fn is None:
+            return False
+        return prompts.ask_bool(question, default=False, input_fn=self.ask_fn)
+
+    def ask(self, question: str, default: str) -> str:
+        """A free-text answer; Enter keeps ``default``, as do ``--yes`` and no one to ask."""
+        if not self.interactive:
+            return default
+        return prompts.ask(question, default=default, input_fn=self.ask_fn)
+
+    def confirm_protected(self, action: str) -> bool:
+        """The production gate: type the environment's name before ``action`` happens.
+
+        Passes straight through for an unprotected environment, and with ``--yes``
+        (a pipeline's gate is its own — the ``production`` environment's reviewers).
+        """
+        if not self.settings.protected or self.settings.assume_yes:
+            return True
+        if self.ask_fn is None:
+            return False
+        name = self.environment.name
+        self.reporter.say(f"This will {action} in PRODUCTION.")
+        return self.ask_fn(f"Type the environment name ({name}) to proceed: ").strip() == name
+
     def netbox(self) -> Any:
         """Direct NetBox API client (object reads/writes, role tree, scope checks)."""
         if self._nb is None:
@@ -189,6 +237,7 @@ def build_context(
     need_netbox: bool = True,
     category: Category | None = None,
     role: str | None = None,
+    ask_fn: InputFn | None = None,
 ) -> Context:
     """Resolve the environment, run preflight, and return a ready ``Context``.
 
@@ -200,6 +249,9 @@ def build_context(
     the tool doesn't use NetBox at all); ``role`` is ``--role``, a narrower role
     inside it. Neither touches NetBox here — :meth:`Context.scope` validates them
     against the role tree the first time a tool asks for devices.
+
+    ``ask_fn`` is how a tool's mid-run question reaches the operator (``None``:
+    nobody to ask — see :attr:`Context.ask_fn`).
     """
     environment = resolve_environment(env, env_file)
 
@@ -261,4 +313,5 @@ def build_context(
         creds=creds,
         reporter=reporter,
         environment=environment,
+        ask_fn=ask_fn,
     )

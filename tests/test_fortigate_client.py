@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import ipaddress
+
 import pytest
 import requests
 
 from bunnyauto.errors import FirewallError
-from bunnyauto.firewall.fortigate import FortiGateClient
+from bunnyauto.firewall.fortigate import FortiGateClient, NewAddress
 
 
 class _Resp:
@@ -22,9 +24,11 @@ class _Resp:
 
 
 class _FakeSession:
-    """Minimal stand-in for requests.Session; routes GETs by URL suffix."""
+    """Minimal stand-in for requests.Session; routes GETs by URL suffix, answers POSTs."""
 
     routes: dict[str, object] = {}
+    post_result: object = None
+    posts: list[tuple[str, dict]] = []
 
     def __init__(self):
         self.verify = None
@@ -41,6 +45,12 @@ class _FakeSession:
                 return result
         return _Resp(404, {})
 
+    def post(self, url, **kw):
+        _FakeSession.posts.append((url, kw))
+        if isinstance(_FakeSession.post_result, Exception):
+            raise _FakeSession.post_result
+        return _FakeSession.post_result
+
     def close(self):
         self.closed = True
 
@@ -48,6 +58,8 @@ class _FakeSession:
 @pytest.fixture(autouse=True)
 def _fake_session(monkeypatch):
     _FakeSession.routes = {}
+    _FakeSession.post_result = _Resp(200, {"status": "success", "http_status": 200})
+    _FakeSession.posts = []
     monkeypatch.setattr(requests, "Session", _FakeSession)
 
 
@@ -107,3 +119,57 @@ def test_interfaces_endpoint():
     )
     rows = _client().interfaces()
     assert rows[0]["name"] == "port10"
+
+
+# --- create_address: the one write -----------------------------------------
+
+
+def _new(subnet="10.20.30.0/24", name="10.20.30.0/24", comment="made here"):
+    return NewAddress(name=name, network=ipaddress.ip_network(subnet), comment=comment)
+
+
+def test_create_address_posts_an_ipmask_object_to_the_vdom():
+    _client(vdom="branch").create_address(_new())
+    [(url, kw)] = _FakeSession.posts
+    assert url == "https://fw.example.com/api/v2/cmdb/firewall/address"
+    assert kw["params"] == {"vdom": "branch"}
+    assert kw["json"] == {
+        "name": "10.20.30.0/24",
+        "type": "ipmask",
+        "subnet": "10.20.30.0 255.255.255.0",
+        "comment": "made here",
+    }
+
+
+def test_create_address_ipv6_goes_to_address6():
+    _client().create_address(_new("2001:db8:1::/64", "v6", comment=""))
+    [(url, kw)] = _FakeSession.posts
+    assert url.endswith("/api/v2/cmdb/firewall/address6")
+    assert kw["json"] == {"name": "v6", "type": "ipprefix", "ip6": "2001:db8:1::/64"}
+
+
+def test_create_address_read_only_token_is_a_friendly_error():
+    _FakeSession.post_result = _Resp(403, {})
+    with pytest.raises(FirewallError, match="refused the write") as info:
+        _client().create_address(_new())
+    assert "read-write" in info.value.fix
+
+
+def test_create_address_fortios_error_body_is_reported():
+    _FakeSession.post_result = _Resp(
+        500, {"status": "error", "http_status": 500, "error": -5, "cli_error": "duplicate"}
+    )
+    with pytest.raises(FirewallError, match=r"HTTP 500, FortiOS error -5: duplicate"):
+        _client().create_address(_new())
+
+
+def test_create_address_non_json_error_still_names_the_status():
+    _FakeSession.post_result = _Resp(500, bad_json=True)
+    with pytest.raises(FirewallError, match=r"HTTP 500\)"):
+        _client().create_address(_new())
+
+
+def test_create_address_unreachable():
+    _FakeSession.post_result = requests.ConnectionError("boom")
+    with pytest.raises(FirewallError, match="could not reach the firewall"):
+        _client().create_address(_new())

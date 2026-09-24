@@ -11,7 +11,10 @@
 #   protected     optional; true means an --apply needs a typed confirmation
 #   fw_url        optional; base URL of that network's FortiGate REST API
 #   fw_token_env  optional; env var holding that firewall's API token
-#                 (required if fw_url is set — used by `security subnet-check`)
+#                 (required if fw_url is set — used by `security subnet-check`).
+#                 Read access is enough to check a subnet; creating the address
+#                 object it offers for a free one needs read-write access to
+#                 firewall addresses.
 #   aruba_url     optional; base URL of that network's Aruba Mobility Conductor
 #                 REST API (include :4343 if that is the API port). Used by
 #                 `wireless sync`, which also logs into each WLC the Conductor

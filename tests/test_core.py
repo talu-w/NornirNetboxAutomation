@@ -15,7 +15,7 @@ from bunnyauto.common import (
     normalize_tags,
     ssl_verify_setting,
 )
-from bunnyauto.context import Credentials, Settings, build_context
+from bunnyauto.context import Context, Credentials, Settings, build_context
 from bunnyauto.environments import Environment, load_environments, resolve_environment
 from bunnyauto.errors import (
     BunnyautoError,
@@ -574,3 +574,83 @@ def test_reporter_json_render(capsys):
     out = capsys.readouterr().out
     assert '"status": "ok"' in out
     assert '"exit_code": 0' in out
+
+
+# ---------------------------------------------------------------------------
+# Context mid-run prompts (confirm / ask / confirm_protected)
+# ---------------------------------------------------------------------------
+
+
+class _Answers:
+    def __init__(self, *answers: str):
+        self.answers = list(answers)
+        self.prompts: list[str] = []
+
+    def __call__(self, prompt: str) -> str:
+        self.prompts.append(prompt)
+        return self.answers.pop(0)
+
+
+def _prompt_ctx(*answers: str, protected=False, yes=False, terminal=True) -> Context:
+    environment = Environment(
+        name="prod" if protected else "test",
+        nb_url="https://nb.example.com",
+        default_tag="nornirtest",
+        token_env="NB_TOKEN",
+        protected=protected,
+    )
+    return Context(
+        settings=_settings(protected=protected, assume_yes=yes),
+        creds=Credentials(username="", password="", nb_token=""),
+        reporter=Reporter(json_mode=True),
+        environment=environment,
+        ask_fn=_Answers(*answers) if terminal else None,
+    )
+
+
+def test_confirm_asks_and_enter_means_no():
+    assert _prompt_ctx("y").confirm("Create it") is True
+    ctx = _prompt_ctx("")
+    assert ctx.confirm("Create it") is False
+    assert ctx.ask_fn.prompts == ["Create it [y/N]: "]
+
+
+def test_confirm_with_nobody_to_ask_is_no_and_yes_flag_is_yes():
+    assert _prompt_ctx(terminal=False).confirm("Create it") is False
+    assert _prompt_ctx(terminal=False, yes=True).confirm("Create it") is True
+    ctx = _prompt_ctx(yes=True)  # --yes on a terminal: answered, not asked
+    assert ctx.confirm("Create it") is True
+    assert ctx.ask_fn.prompts == []
+
+
+def test_ask_keeps_the_default_unless_someone_answers():
+    assert _prompt_ctx("custom").ask("Name", default="dflt") == "custom"
+    assert _prompt_ctx("").ask("Name", default="dflt") == "dflt"
+    assert _prompt_ctx(terminal=False).ask("Name", default="dflt") == "dflt"
+    assert _prompt_ctx(yes=True).ask("Name", default="dflt") == "dflt"
+
+
+def test_interactive_means_a_question_reaches_someone():
+    assert _prompt_ctx().interactive is True
+    assert _prompt_ctx(terminal=False).interactive is False
+    assert _prompt_ctx(yes=True).interactive is False
+
+
+def test_confirm_protected_needs_the_typed_name_only_in_production():
+    assert _prompt_ctx().confirm_protected("create x") is True  # not asked at all
+    assert _prompt_ctx("prod", protected=True).confirm_protected("create x") is True
+    assert _prompt_ctx("y", protected=True).confirm_protected("create x") is False
+    assert _prompt_ctx(protected=True, terminal=False).confirm_protected("create x") is False
+    assert _prompt_ctx(protected=True, yes=True).confirm_protected("create x") is True
+
+
+def test_build_context_passes_ask_fn_through(env_file, nornir_config, _creds_env):
+    answers = _Answers()
+    ctx = build_context(
+        env="test",
+        reporter=Reporter(json_mode=True),
+        env_file=env_file,
+        config_file=nornir_config,
+        ask_fn=answers,
+    )
+    assert ctx.ask_fn is answers

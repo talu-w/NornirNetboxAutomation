@@ -74,6 +74,13 @@ class Tool(Protocol):
     #   needs_devices: bool  -> False skips the NORNIR_USERNAME/PASSWORD check
     #   needs_netbox:  bool  -> False skips the environment's NetBox-token check
     # A firewall-only tool sets both to False so it runs with just its own token.
+    #
+    # Optional, for write tools, read via ``getattr`` too:
+    #   confirms_writes: bool -> True: the tool asks before it writes, once it knows
+    #       what it would write (``ctx.confirm`` / ``ctx.confirm_protected``). The hub
+    #       then runs it with --apply on instead of asking --apply up front; the CLI
+    #       still needs --apply, and --yes answers the tool's questions in advance.
+    #   apply_help: str -> the CLI's ``--apply`` help, when the generic text doesn't fit.
 
     def add_arguments(self, parser: argparse.ArgumentParser) -> None:
         """Register the tool's own options on its subparser."""

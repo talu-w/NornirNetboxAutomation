@@ -12,18 +12,19 @@ from __future__ import annotations
 
 import argparse
 import os
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 
 from bunnyauto.categories import CATEGORIES
 from bunnyauto.context import build_context
 from bunnyauto.environments import Environment, load_environments
 from bunnyauto.errors import BunnyautoError, ToolError
 from bunnyauto.preflight import USERNAME_VAR
+from bunnyauto.prompts import InputFn
+from bunnyauto.prompts import ask as _ask
+from bunnyauto.prompts import ask_bool as _ask_bool
 from bunnyauto.reporting import Reporter, make_reporter
 from bunnyauto.tools import REGISTRY
 from bunnyauto.tools.base import COMMON_ARG_DESTS, Tool, timeouts_from_args
-
-InputFn = Callable[[str], str]
 
 _QUIT = {"q", "quit", "exit"}
 _BACK = {"b", "back", ""}
@@ -181,11 +182,15 @@ def prompt_for_args(tool: Tool, *, input_fn: InputFn = input) -> argparse.Namesp
     Positionals are always asked. Boolean flags the tool defines itself (plus
     ``--apply`` for write tools) are asked as yes/no. Everything from
     :func:`add_common_arguments` keeps its default.
+
+    A tool that ``confirms_writes`` itself is not asked ``--apply``: it runs with
+    it on and asks once it knows what it would write.
     """
+    confirms_itself = tool.writes and getattr(tool, "confirms_writes", False)
     parser = argparse.ArgumentParser(add_help=False)
     tool.add_arguments(parser)
     if tool.writes:
-        parser.add_argument("--apply", action="store_true")
+        parser.add_argument("--apply", action="store_true", default=confirms_itself)
         parser.add_argument("--yes", action="store_true")
 
     namespace = argparse.Namespace()
@@ -195,7 +200,7 @@ def prompt_for_args(tool: Tool, *, input_fn: InputFn = input) -> argparse.Namesp
 
     for action in parser._actions:
         dest = action.dest
-        if dest in ("help", "yes"):
+        if dest in ("help", "yes") or (dest == "apply" and confirms_itself):
             continue
         if not action.option_strings:  # positional
             raw = _ask(action.help or dest, input_fn=input_fn)
@@ -238,7 +243,10 @@ def _run_tool(
         site=getattr(args, "site", None),
         legacy_ssh=getattr(args, "legacy_ssh", False),
         apply=getattr(args, "apply", False),
-        assume_yes=True,  # the hub does its own confirming, below
+        # Never --yes: the hub confirms an --apply below, and a tool that asks
+        # mid-run (ctx.confirm) asks through input_fn like every other prompt.
+        assume_yes=False,
+        ask_fn=input_fn,
         timeouts=timeouts_from_args(args),
         need_devices=getattr(tool, "needs_devices", True),
         need_netbox=getattr(tool, "needs_netbox", True),
@@ -247,7 +255,12 @@ def _run_tool(
     )
     try:
         ctx.banner()
-        if ctx.settings.apply and not _confirm_apply(ctx.environment, reporter, input_fn):
+        asks_later = getattr(tool, "confirms_writes", False)
+        if (
+            ctx.settings.apply
+            and not asks_later
+            and not _confirm_apply(ctx.environment, reporter, input_fn)
+        ):
             reporter.say("not applying — nothing was changed")
             return
         result = tool.run(ctx, args)
@@ -262,25 +275,6 @@ def _confirm_apply(environment: Environment, reporter: Reporter, input_fn: Input
         typed = input_fn(f"Type the environment name ({environment.name}) to proceed: ").strip()
         return typed == environment.name
     return _ask_bool("Apply these changes now", default=False, input_fn=input_fn)
-
-
-# ---------------------------------------------------------------------------
-# small prompt helpers
-# ---------------------------------------------------------------------------
-
-
-def _ask(prompt: str, *, default: str | None = None, input_fn: InputFn = input) -> str:
-    suffix = f" [{default}]" if default else ""
-    raw = input_fn(f"{prompt}{suffix}: ").strip()
-    return raw or (default or "")
-
-
-def _ask_bool(prompt: str, *, default: bool = False, input_fn: InputFn = input) -> bool:
-    hint = "Y/n" if default else "y/N"
-    raw = input_fn(f"{prompt} [{hint}]: ").strip().casefold()
-    if not raw:
-        return default
-    return raw in {"y", "yes"}
 
 
 if __name__ == "__main__":  # pragma: no cover
