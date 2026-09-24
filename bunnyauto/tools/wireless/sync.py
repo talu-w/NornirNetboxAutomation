@@ -23,16 +23,22 @@ live data.
 
 * **Missing from NetBox: created.** The device type is matched from the Aruba
   model by token containment (:mod:`bunnyauto.netbox.tokens`), the site from the
-  hostname prefix (or ``--default-site``), the role is ``wireless-controller`` /
-  ``wireless-access-point`` (it must exist and sit inside the wireless branch,
-  or the device would be invisible to role-scoped tools), and the device gets
-  the environment's tag.
+  hostname prefix (or ``--default-site``), and the device gets the
+  environment's tag. The role (slugs from the environment's ``roles:``): a WLC
+  gets ``wireless-controller``, which must exist. An AP gets
+  ``wireless-access-point``, or, when NetBox has no such role, is filed under
+  the wireless branch root (``wireless-network``, "Wireless Network"). With
+  neither, the run fails before anything is written. A role the tool would use
+  that sits outside the wireless branch is refused: devices given it would be
+  invisible to role-scoped tools.
 * **Already in NetBox: updated** to what the network reports. The
   environment's tag is added and a changed serial is corrected (a swapped AP
-  keeps its name); for APs, the platform, IP and cables below. Role, site,
-  device type and name are never changed. A name that differs from the
-  Conductor's (the device was matched by serial) is only noted, since an
-  unprovisioned AP reports its MAC as its name.
+  keeps its name); for APs, the role, platform, IP and cables below. An AP
+  whose role isn't ``wireless-access-point`` is **moved to it**; when NetBox has
+  no such role, the AP's current role is only noted. A WLC's role, and every
+  device's site, device type and name, are never changed. A name that differs
+  from the Conductor's (the device was matched by serial) is only noted, since
+  an unprovisioned AP reports its MAC as its name.
 * **Platform** (APs): the reported version (``"8.10.0.5"``) is matched, never
   created, against a NetBox Platform like ``"AOS 8"``.
 * **IP** (every new device, and every AP): the reported IP, with the mask and
@@ -62,8 +68,8 @@ live data.
   ``--apply``, ``DRIFT`` (10) for a plan with changes, ``OK`` (0) when in sync.
 
 These are informational only, never a failure: an AP with no LLDP neighbor, no
-recognized version field, an existing cable left alone, and a role outside the
-wireless branch.
+recognized version field, an existing cable left alone, a WLC role outside the
+wireless branch, and an AP role noted because NetBox has no AP role.
 
 Nothing is ever deleted, and no device type, site, role or platform is ever
 created. Plans by default; ``--apply`` writes. Auth is the shared device login
@@ -176,8 +182,12 @@ class _Run:
     prefixes: list[Prefix]
     platforms: list[Any]
     templates_by_type: dict[int, list[Any]]
-    role_by_kind: dict[str, Any]
+    role_by_kind: dict[str, Any]  # the role each kind of device is created with
     role_key: str
+    #: The AP role every AP belongs in, and its slug; ``ap_role`` is ``None``
+    #: when NetBox has no such role.
+    ap_role: Any
+    ap_role_slug: str
     interface_cache: dict[int, list[Any]] = field(default_factory=dict)
 
 
@@ -311,14 +321,26 @@ class WirelessSync:
             _classify(d, by_serial, by_name, device_types, sites, default_site) for d in wireless
         ]
 
-        # Only require a role to exist if this run actually needs to create a
-        # device of that kind — a run that only updates needs neither, and one
-        # that only ever creates APs doesn't need the WLC role (or vice versa).
+        # The AP role is looked up whenever APs are in the run: new APs are created
+        # with it and existing APs are moved to it. When NetBox has no such role,
+        # new APs are filed under the wireless branch root instead (it must exist:
+        # ctx.scope() above already refused to run without it) and existing APs
+        # only get a note. The WLC role is required only if a WLC is created.
+        roles = ctx.environment.roles
+        has_aps = any(d.kind == "ap" for d in wireless)
+        ap_role_slug = roles[_ROLE_KEY_BY_KIND["ap"]]
+        ap_role = _find_role_in_branch(nb, tree, ap_role_slug, branch) if has_aps else None
         role_by_kind: dict[str, Any] = {}
-        for kind in ("ap", "wlc"):
-            if any(m.action == "create" and m.device.kind == kind for m in matches):
-                slug = ctx.environment.roles[_ROLE_KEY_BY_KIND[kind]]
-                role_by_kind[kind] = _require_role_in_branch(nb, tree, slug, branch)
+        if any(m.action == "create" and m.device.kind == "wlc" for m in matches):
+            wlc_slug = roles[_ROLE_KEY_BY_KIND["wlc"]]
+            role_by_kind["wlc"] = _require_role_in_branch(nb, tree, wlc_slug, branch)
+        if any(m.action == "create" and m.device.kind == "ap" for m in matches):
+            role_by_kind["ap"] = ap_role or require_role(nb, roles["wireless"])
+            if ap_role is None:
+                ctx.reporter.info(
+                    f"NetBox has no {ap_role_slug!r} device role — new APs are filed under "
+                    f"{str(role_by_kind['ap'].slug)!r}"
+                )
 
         run_changes: list[str] = []
         needs_tag = any(
@@ -333,7 +355,6 @@ class WirelessSync:
                 run_changes.append(f"would create NetBox tag {tag_slug!r}")
 
         creating = any(m.action == "create" for m in matches)
-        has_aps = any(d.kind == "ap" for d in wireless)
         run = _Run(
             ctx=ctx,
             nb=nb,
@@ -351,6 +372,8 @@ class WirelessSync:
             templates_by_type=_load_interface_templates(nb) if creating and not apply else {},
             role_by_kind=role_by_kind,
             role_key=role_field(nb),
+            ap_role=ap_role,
+            ap_role_slug=ap_role_slug,
         )
 
         reports: list[_Report] = []
@@ -499,11 +522,16 @@ def _create(run: _Run, match: _Match, report: _Report) -> Any:
     d = match.device
     assert match.site is not None and match.device_type is not None
     model = str(getattr(match.device_type, "model", ""))
-    report.detail.update(site=match.site.slug, device_type=model)
+    role = run.role_by_kind[d.kind]
+    report.detail.update(site=match.site.slug, device_type=model, role=str(role.slug))
     what = (
-        f"create {d.kind.upper()} in site {match.site.slug!r} (type {model!r}) "
-        f"tagged {run.tag_slug!r}"
+        f"create {d.kind.upper()} in site {match.site.slug!r} (type {model!r}, "
+        f"role {str(role.slug)!r}) tagged {run.tag_slug!r}"
     )
+    if d.kind == "ap" and run.ap_role is None:
+        report.notes.append(
+            f"filed under role {str(role.slug)!r} — NetBox has no {run.ap_role_slug!r} role"
+        )
     if not run.apply:
         report.changes.append(f"would {what}")
         return SimpleNamespace(id=0, name=d.name, platform=None, primary_ip4=None)
@@ -511,7 +539,7 @@ def _create(run: _Run, match: _Match, report: _Report) -> Any:
     body: dict[str, Any] = {
         "name": d.name,
         "device_type": int(match.device_type.id),
-        run.role_key: int(run.role_by_kind[d.kind].id),
+        run.role_key: int(role.id),
         "site": match.site.id,
         "status": run.new_status,
         "tags": [{"slug": run.tag_slug}],
@@ -528,11 +556,14 @@ def _create(run: _Run, match: _Match, report: _Report) -> Any:
 
 
 def _update_identity(run: _Run, match: _Match, report: _Report) -> None:
-    """Tag + serial of a device NetBox already has. Name, role, site and type are left alone."""
+    """Tag, serial and (APs) role of a device NetBox already has. Name, site and type are kept."""
     d, device = match.device, match.existing
-    role_note = _role_note(device, run.tree, run.branch)
-    if role_note:
-        report.notes.append(role_note)
+    if d.kind == "ap":
+        _sync_ap_role(run, device, report)
+    else:
+        role_note = _role_note(device, run.tree, run.branch)
+        if role_note:
+            report.notes.append(role_note)
     nb_name = str(getattr(device, "name", "") or "")
     if nb_name and nb_name.casefold() != d.name.casefold():
         report.notes.append(
@@ -548,6 +579,28 @@ def _update_identity(run: _Run, match: _Match, report: _Report) -> None:
         was = f" (was {current!r})" if current else ""
         what = f"set serial to {d.serial!r}{was}"
         _change(run, report, what, lambda: device.update({"serial": d.serial}))
+
+
+def _sync_ap_role(run: _Run, device: Any, report: _Report) -> None:
+    """An existing AP belongs in the AP role: moved there, or noted when NetBox has none."""
+    current = device_role_slug(device)
+    if run.ap_role is None:
+        shown = repr(current) if current else "not set"
+        report.notes.append(
+            f"role is {shown} — NetBox has no {run.ap_role_slug!r} role to move it to"
+        )
+        return
+    wanted = str(run.ap_role.slug)
+    if current is not None and current.casefold() == wanted.casefold():
+        return
+    was = f" (was {current!r})" if current else ""
+    role_id = int(run.ap_role.id)
+    _change(
+        run,
+        report,
+        f"set role to {wanted!r}{was}",
+        lambda: device.update({run.role_key: role_id}),
+    )
 
 
 def _sync_platform(run: _Run, d: WirelessDevice, device: Any, report: _Report) -> None:
@@ -757,13 +810,25 @@ def _has_tag(device: Any, slug: str) -> bool:
 def _require_role_in_branch(nb: Any, tree: RoleTree, slug: str, branch: str | None) -> Any:
     """The role to create a device with — it must exist *and* sit in the wireless branch."""
     role = require_role(nb, slug)
+    _check_in_branch(tree, slug, branch)
+    return role
+
+
+def _find_role_in_branch(nb: Any, tree: RoleTree, slug: str, branch: str | None) -> Any:
+    """The role with ``slug``, or ``None`` if NetBox has none. One outside the branch is refused."""
+    role = nb.dcim.device_roles.get(slug=slug)
+    if role is not None:
+        _check_in_branch(tree, slug, branch)
+    return role
+
+
+def _check_in_branch(tree: RoleTree, slug: str, branch: str | None) -> None:
     if branch is not None and not tree.is_within(slug, branch):
         raise ToolError(
             f"device role {slug!r} is not inside the wireless branch ({branch!r}), so "
-            "devices created with it would be invisible to every wireless tool",
+            "devices given it would be invisible to every role-scoped wireless tool",
             fix=f"set {slug!r}'s parent to {branch!r} (or a role beneath it) in NetBox",
         )
-    return role
 
 
 def _role_note(device: Any, tree: RoleTree, branch: str | None) -> str:

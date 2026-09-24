@@ -172,8 +172,11 @@ def _prefix(cidr="10.1.1.0/24", vrf=None, id_=10):
     return _Rec(id=id_, prefix=cidr, vrf=vrf)
 
 
-def _ap(*, id_=100, name="hq-idf1-ap01", serial="CN0001", tagged=True, **extra):
-    return _Rec(id=id_, name=name, serial=serial, tags=[_TAG] if tagged else [], **extra)
+_AP_ROLE_REF = _Rec(slug="wireless-access-point")
+
+
+def _ap(*, id_=100, name="hq-idf1-ap01", serial="CN0001", tagged=True, role=_AP_ROLE_REF, **extra):
+    return _Rec(id=id_, name=name, serial=serial, tags=[_TAG] if tagged else [], role=role, **extra)
 
 
 def _iface(id_, device_id, name, type_="2.5gbase-t", cable=None):
@@ -333,16 +336,18 @@ def test_missing_aruba_url(monkeypatch):
         TOOL.run(_Ctx(_nb(), aruba_url=None), _args())
 
 
-def test_missing_role(monkeypatch):
-    _aruba(monkeypatch, aps=[AP])
-    with pytest.raises(ToolError, match="device role with slug 'wireless-access-point'"):
-        TOOL.run(_Ctx(_nb(with_ap_role=False)), _args())
-
-
 def test_missing_wireless_branch_root_raises(monkeypatch):
     _aruba(monkeypatch, aps=[AP])
     with pytest.raises(RoleScopeError, match="'wireless-network'"):
         TOOL.run(_Ctx(_nb(with_branch=False)), _args())
+
+
+def test_without_the_ap_role_or_the_wireless_role_the_run_fails_before_writing(monkeypatch):
+    _aruba(monkeypatch, aps=[AP])
+    nb = _nb(with_ap_role=False, with_branch=False)
+    with pytest.raises(RoleScopeError, match="'wireless-network'"):
+        TOOL.run(_Ctx(nb, apply=True), _args())
+    assert nb.dcim.devices.created == []
 
 
 def test_role_outside_the_wireless_branch_refuses_creation(monkeypatch):
@@ -426,6 +431,113 @@ def test_apply_creates_device(monkeypatch):
     assert body["status"] == "active"
     assert body["tags"] == [{"slug": "nornirtest"}]  # the environment's tag, not 'wireless'
     assert ctx.reporter.about("hq-idf1-ap01") == [("success", "hq-idf1-ap01: created")]
+
+
+def test_new_ap_gets_the_wireless_access_point_role(monkeypatch):
+    _aruba(monkeypatch, aps=[AP])
+    nb = _nb(prefixes=[_prefix()])
+    plan = TOOL.run(_Ctx(nb), _args())
+    assert (
+        "hq-idf1-ap01: would create AP in site 'hq' (type 'AP-515', "
+        "role 'wireless-access-point') tagged 'nornirtest'"
+    ) in plan.changes
+    TOOL.run(_Ctx(nb, apply=True), _args())
+    assert nb.dcim.devices.created[0]["role"] == 7
+
+
+def test_new_ap_is_filed_under_the_wireless_role_when_there_is_no_ap_role(monkeypatch):
+    _aruba(monkeypatch, aps=[AP])
+    nb = _nb(with_ap_role=False, prefixes=[_prefix()])
+    ctx = _Ctx(nb, apply=True)
+    result = TOOL.run(ctx, _args())
+    assert result.status is Status.CHANGED  # a note, not a problem
+    assert nb.dcim.devices.created[0]["role"] == 9  # Wireless Network, the branch root
+    assert any("role 'wireless-network'" in c for c in result.changes)
+    assert any("NetBox has no 'wireless-access-point' role" in n for n in _device(result)["notes"])
+    assert (
+        "info",
+        "NetBox has no 'wireless-access-point' device role — new APs are filed under "
+        "'wireless-network'",
+    ) in ctx.reporter.lines
+
+
+def test_ap_role_outside_the_wireless_branch_is_refused(monkeypatch):
+    """Moving or creating APs in it would put them out of every wireless tool's reach."""
+    _aruba(monkeypatch, aps=[AP])
+    nb = _nb(devices=[_ap()])  # an update-only run
+    stray = _Rec(id=40, slug="elsewhere", name="Elsewhere", parent=None)
+    nb.dcim.device_roles.get(slug="wireless-access-point").parent = stray
+    nb.dcim.device_roles._items.append(stray)
+    with pytest.raises(ToolError, match="not inside the wireless branch"):
+        TOOL.run(_Ctx(nb), _args())
+
+
+def test_existing_ap_with_another_role_is_moved_to_the_ap_role(monkeypatch):
+    _aruba(monkeypatch, aps=[{**AP, "IP Address": ""}])
+    ap = _ap(role=_Rec(slug="wireless"))  # e.g. the pre-2026-09-23 AP role
+    nb = _nb(devices=[ap])
+    plan = TOOL.run(_Ctx(nb), _args())
+    assert plan.status is Status.DRIFT
+    assert "hq-idf1-ap01: would set role to 'wireless-access-point' (was 'wireless')" in (
+        plan.changes
+    )
+
+    ctx = _Ctx(nb, apply=True)
+    result = TOOL.run(ctx, _args())
+    assert result.status is Status.CHANGED
+    assert ap.updates == [{"role": 7}]
+    assert ("success", "hq-idf1-ap01: updated") in ctx.reporter.lines
+
+
+def test_existing_ap_on_older_netbox_is_moved_via_device_role(monkeypatch):
+    """NetBox < 3.6 calls the field device_role."""
+    _aruba(monkeypatch, aps=[{**AP, "IP Address": ""}])
+    ap = _ap(role=None, device_role=_Rec(slug="wireless"))
+    nb = _nb(devices=[ap])
+    nb.version = "3.5"
+    TOOL.run(_Ctx(nb, apply=True), _args())
+    assert ap.updates == [{"device_role": 7}]
+
+
+def test_existing_ap_role_failing_to_change_is_yellow(monkeypatch):
+    _aruba(monkeypatch, aps=[{**AP, "IP Address": ""}])
+
+    class _Stubborn(_Rec):
+        def update(self, body):
+            raise RuntimeError("role is protected")
+
+    ap = _Stubborn(id=100, name="hq-idf1-ap01", serial="CN0001", tags=[_TAG], role=None)
+    result = TOOL.run(_Ctx(_nb(devices=[ap]), apply=True), _args())
+    assert result.status is Status.PARTIAL
+    assert "could not set role to 'wireless-access-point'" in _device(result)["issues"][0]
+
+
+def test_existing_ap_without_an_ap_role_in_netbox_only_notes_its_role(monkeypatch):
+    _aruba(monkeypatch, aps=[{**AP, "IP Address": ""}])
+    ap = _ap(role=_Rec(slug="wireless-network"))
+    nb = _nb(devices=[ap], with_ap_role=False)
+    ctx = _Ctx(nb, apply=True)
+    result = TOOL.run(ctx, _args())
+    assert result.status is Status.OK
+    assert not hasattr(ap, "updates")
+    assert _device(result)["notes"] == [
+        "role is 'wireless-network' — NetBox has no 'wireless-access-point' role to move it to"
+    ]
+    assert (
+        "info",
+        "hq-idf1-ap01: role is 'wireless-network' — NetBox has no 'wireless-access-point' "
+        "role to move it to",
+    ) in ctx.reporter.lines
+
+
+def test_existing_wlc_role_is_never_changed(monkeypatch):
+    _aruba(monkeypatch, switches=[WLC])
+    wlc = _Rec(id=1, name="hq-wlc01", serial="CX0009", tags=[_TAG], role=_Rec(slug="elsewhere"))
+    nb = _nb(devices=[wlc])
+    nb.dcim.device_roles._items.append(_Rec(id=40, slug="elsewhere", parent=None))
+    result = TOOL.run(_Ctx(nb, apply=True), _args())
+    assert result.status is Status.OK
+    assert not hasattr(wlc, "updates")
 
 
 def test_older_netbox_uses_device_role(monkeypatch):
