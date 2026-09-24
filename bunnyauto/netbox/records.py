@@ -23,6 +23,14 @@ def related_id(value: Any) -> int | None:
     return int(value) if value is not None else None
 
 
+def related_name(value: Any) -> str:
+    """The ``name`` of a related object (``Record`` or ``{"name": ...}``), else ``""``."""
+    if value is None:
+        return ""
+    name = value.get("name") if isinstance(value, dict) else getattr(value, "name", None)
+    return str(name or "")
+
+
 def choice_value(value: Any) -> str | None:
     """The machine value of a choice field (interface ``type``, ``mode``, ...), else ``None``."""
     if value is None or isinstance(value, str):

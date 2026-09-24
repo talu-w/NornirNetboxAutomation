@@ -5,11 +5,13 @@ from __future__ import annotations
 import argparse
 import io
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 
 from bunnyauto.context import Settings
 from bunnyauto.errors import ToolError
+from bunnyauto.netbox.transceivers import Transceiver
 from bunnyauto.reporting import Reporter
 from bunnyauto.result import Status
 from bunnyauto.scope import Scope
@@ -17,7 +19,9 @@ from bunnyauto.tools.wired import create_interfaces as ci
 from bunnyauto.tools.wired.create_interfaces import (
     TOOL,
     DiscoveredInterface,
+    Discovery,
     parse_interfaces,
+    parse_inventory,
 )
 
 # Interface naming and typing are shared now — see tests/test_netbox_interfaces.py.
@@ -129,11 +133,44 @@ class _Interfaces:
 
     def create(self, payload):
         self.created.extend(payload)
-        return payload
+        return [SimpleNamespace(id=9000 + n, **item) for n, item in enumerate(payload)]
 
     def update(self, payload):
         self.updated.extend(payload)
         return payload
+
+
+class _InventoryItems:
+    """``items``: inventory items as ``SimpleNamespace`` records (see :func:`_item`)."""
+
+    def __init__(self, items=()):
+        self.items = list(items)
+        self.created: list[dict] = []
+        self.queries: list[dict] = []
+
+    def filter(self, device_id=None, serial=None):
+        self.queries.append({"device_id": device_id, "serial": serial})
+        if device_id is not None:
+            return [i for i in self.items if i.device["id"] in device_id]
+        wanted = {s.casefold() for s in serial}
+        return [i for i in self.items if (i.serial or "").casefold() in wanted]
+
+    def create(self, payload):
+        self.created.extend(payload)
+        return payload
+
+
+def _item(id_, name, device_id, *, interface_id=None, serial="", part_id="", device_name="sw1"):
+    return SimpleNamespace(
+        id=id_,
+        name=name,
+        device={"id": device_id, "name": device_name},
+        parent=None,
+        component_type="dcim.interface" if interface_id else None,
+        component_id=interface_id,
+        serial=serial,
+        part_id=part_id,
+    )
 
 
 class _Devices:
@@ -155,10 +192,13 @@ class _Devices:
 
 
 class _NB:
-    def __init__(self, devices, existing, *, everywhere=None, chassis=None, types=NETBOX_TYPES):
+    def __init__(
+        self, devices, existing, *, everywhere=None, chassis=None, types=NETBOX_TYPES, items=()
+    ):
         self.dcim = argparse.Namespace(
             devices=_Devices(devices, everywhere),
             interfaces=_Interfaces(existing, types),
+            inventory_items=_InventoryItems(items),
             virtual_chassis=argparse.Namespace(get=lambda id_: (chassis or {}).get(id_)),
         )
 
@@ -242,6 +282,9 @@ def wired(monkeypatch):
     ``discovered`` is a Nornir host for the device of that name; its ports are
     names, or ``(name, media type)`` as ``show interfaces`` reports them.
     ``types`` is what NetBox's OPTIONS answer lists (``None``: it fails).
+    ``optics`` maps a host to the transceivers its ``show inventory`` reports;
+    ``items`` are NetBox's existing inventory items; ``inventory_errors`` maps a
+    host to why its ``show inventory`` couldn't be read.
     """
 
     def _wire(
@@ -253,10 +296,15 @@ def wired(monkeypatch):
         everywhere=None,
         chassis=None,
         types=NETBOX_TYPES,
+        optics=None,
+        items=(),
+        inventory_errors=None,
     ):
         devices = devices if devices is not None else [_Device(1, "sw1")]
         by_name = {d.name: d for d in [*devices, *(everywhere or [])]}
-        nb = _NB(devices, existing, everywhere=everywhere, chassis=chassis, types=types)
+        nb = _NB(
+            devices, existing, everywhere=everywhere, chassis=chassis, types=types, items=items
+        )
 
         run_result = {}
         for name, ifaces in discovered.items():
@@ -266,7 +314,12 @@ def wired(monkeypatch):
                 else DiscoveredInterface(i)
                 for i in ifaces
             ]
-            run_result[name] = _Multi([_Item(result=ports)], failed=name in failed_hosts)
+            found = Discovery(
+                ports,
+                list((optics or {}).get(name, [])),
+                inventory_error=(inventory_errors or {}).get(name, ""),
+            )
+            run_result[name] = _Multi([_Item(result=found)], failed=name in failed_hosts)
 
         hosts = {name: _Host(name, by_name[name].id) for name in discovered}
         selected = _Selected(hosts, run_result)
@@ -851,3 +904,207 @@ def test_stack_members_template_named_port_gets_its_type_corrected(wired):
         f"{A2}: would change GigabitEthernet1/0/1 from 1000base-t to 1000base-tx "
         f"(device reports '10/100/1000BaseTX') [stack member 2, seen on {A1}]"
     ]
+
+
+# ---------------------------------------------------------------------------
+# transceivers: show inventory -> NetBox inventory items on their interfaces
+# ---------------------------------------------------------------------------
+
+SHOW_INVENTORY = """\
+NAME: "c93xx Stack", DESCR: "c93xx Stack"
+PID: C9300-48P         , VID: V02  , SN: FOC1234X0AB
+
+NAME: "Switch 1", DESCR: "C9300-48P"
+PID: C9300-48P         , VID: V02  , SN: FOC1234X0AB
+
+NAME: "Switch 1 - FRU Uplink Module 1", DESCR: "8x10G Uplink Module"
+PID: C9300-NM-8X       , VID: V01  , SN: FOC2222Y1CD
+
+NAME: "TenGigabitEthernet1/1/1", DESCR: "SFP-10GBase-SR"
+PID: SFP-10G-SR          , VID: V03  , SN: AVD1234ABCD
+
+NAME: "GigabitEthernet1/1/2", DESCR: "1000BaseSX SFP"
+PID: GLC-SX-MMD          , VID: V01  , SN: FNS1111AAAA
+
+NAME: "subslot 0/0 transceiver 0", DESCR: "GE SX"
+PID: GLC-SX-MMD          , VID: V01  , SN: FNS2222BBBB
+"""
+
+
+def test_parse_inventory_keeps_only_entries_named_after_a_port():
+    from ntc_templates.parse import parse_output
+
+    rows = parse_output(platform="cisco_ios", command="show inventory", data=SHOW_INVENTORY)
+    ports = ["Te1/1/1", "GigabitEthernet1/1/2", "GigabitEthernet1/0/1"]
+
+    optics, unplaced = parse_inventory(rows, ports)
+
+    assert optics == [
+        Transceiver(
+            "TenGigabitEthernet1/1/1", "SFP-10GBase-SR", "SFP-10G-SR", "V03", "AVD1234ABCD"
+        ),
+        Transceiver("GigabitEthernet1/1/2", "1000BaseSX SFP", "GLC-SX-MMD", "V01", "FNS1111AAAA"),
+    ]
+    # chassis, switch and uplink module aren't ports; the ISR-style name is flagged
+    assert unplaced == ["subslot 0/0 transceiver 0"]
+
+
+def test_parse_inventory_of_unstructured_output_is_empty():
+    assert parse_inventory("% Invalid input", ["Gi1/0/1"]) == ([], [])
+
+
+SR = Transceiver("TenGigabitEthernet1/1/1", "SFP-10GBase-SR", "SFP-10G-SR", "V03", "AVD1234ABCD")
+
+
+def test_optic_gets_an_inventory_item_on_its_interface(wired):
+    nb = wired(
+        existing={1: [("TenGigabitEthernet1/1/1", "10gbase-x-sfpp")]},
+        discovered={"sw1": ["TenGigabitEthernet1/1/1"]},
+        optics={"sw1": [SR]},
+    )
+
+    plan = TOOL.run(_ctx(nb=nb), _args())
+
+    assert plan.status is Status.DRIFT
+    assert plan.changes == [
+        "sw1: would create inventory item for TenGigabitEthernet1/1/1: "
+        "SFP-10G-SR (SFP-10GBase-SR, serial AVD1234ABCD)"
+    ]
+    assert "1 transceiver(s) not yet in NetBox" in plan.summary
+    assert nb.dcim.inventory_items.created == []
+
+    applied = TOOL.run(_ctx(apply=True, nb=nb), _args())
+
+    assert applied.status is Status.CHANGED
+    assert nb.dcim.inventory_items.created == [
+        {
+            "device": 1,
+            "name": "TenGigabitEthernet1/1/1",
+            "component_type": "dcim.interface",
+            "component_id": 1000,
+            "part_id": "SFP-10G-SR",
+            "serial": "AVD1234ABCD",
+            "description": "SFP-10GBase-SR",
+            "discovered": True,
+        }
+    ]
+    assert applied.data["sw1"]["transceivers_created"] == 1
+
+
+def test_optic_already_recorded_on_its_interface_is_in_sync(wired):
+    nb = wired(
+        existing={1: [("TenGigabitEthernet1/1/1", "10gbase-x-sfpp")]},
+        discovered={"sw1": ["TenGigabitEthernet1/1/1"]},
+        optics={"sw1": [SR]},
+        items=[_item(5, "Te1/1/1 optic", 1, interface_id=1000, serial="avd1234abcd")],
+    )
+
+    result = TOOL.run(_ctx(apply=True, nb=nb), _args())
+
+    assert result.status is Status.OK
+    assert nb.dcim.inventory_items.created == []
+    assert result.data["sw1"]["transceivers"][0]["action"] == "present"
+
+
+def test_optic_recorded_on_another_device_is_reported_not_duplicated(wired):
+    nb = wired(
+        existing={1: ["TenGigabitEthernet1/1/1"]},
+        discovered={"sw1": ["TenGigabitEthernet1/1/1"]},
+        optics={"sw1": [SR]},
+        items=[_item(5, "Te1/1/4", 7, interface_id=7004, serial="AVD1234ABCD", device_name="sw7")],
+    )
+    notes = io.StringIO()
+
+    result = TOOL.run(_ctx(apply=True, stream=notes, nb=nb), _args())
+
+    assert nb.dcim.inventory_items.created == []
+    assert result.status is Status.OK  # a note for a person, not a failure
+    assert "serial AVD1234ABCD is already in NetBox as 'Te1/1/4' on sw7" in notes.getvalue()
+    assert result.data["sw1"]["transceivers"][0]["action"] == "skip"
+
+
+def test_port_holding_a_different_optic_is_reported_not_replaced(wired):
+    nb = wired(
+        existing={1: ["TenGigabitEthernet1/1/1"]},
+        discovered={"sw1": ["TenGigabitEthernet1/1/1"]},
+        optics={"sw1": [SR]},
+        items=[_item(5, "TenGigabitEthernet1/1/1", 1, interface_id=1000, serial="OLD999")],
+    )
+    notes = io.StringIO()
+
+    TOOL.run(_ctx(apply=True, stream=notes, nb=nb), _args())
+
+    assert nb.dcim.inventory_items.created == []
+    assert "NetBox already has an optic (serial OLD999) on this port" in notes.getvalue()
+
+
+def test_optic_in_a_port_created_this_run_is_attached_to_the_new_interface(wired):
+    nb = wired(
+        existing={1: []}, discovered={"sw1": ["TenGigabitEthernet1/1/1"]}, optics={"sw1": [SR]}
+    )
+
+    plan = TOOL.run(_ctx(nb=nb), _args())
+    assert any("(with the new interface)" in c for c in plan.changes)
+
+    TOOL.run(_ctx(apply=True, nb=nb), _args())
+
+    (item,) = nb.dcim.inventory_items.created
+    assert item["component_id"] == 9000  # the id NetBox gave the interface just created
+
+
+def test_optic_is_not_recorded_when_its_interface_could_not_be_created(wired):
+    nb = wired(
+        existing={1: []}, discovered={"sw1": ["TenGigabitEthernet1/1/1"]}, optics={"sw1": [SR]}
+    )
+
+    def refuse(payload):
+        raise RuntimeError("400 Bad Request")
+
+    nb.dcim.interfaces.create = refuse
+
+    result = TOOL.run(_ctx(apply=True, nb=nb), _args())
+
+    assert nb.dcim.inventory_items.created == []
+    assert result.data["sw1"]["error"] == "create failed: 400 Bad Request"
+
+
+def test_stack_members_optic_goes_on_the_member_device(wired):
+    # SwitchA-2's template-named TenGigabitEthernet1/1/1 is the stack's Te2/1/1.
+    optic = Transceiver("TenGigabitEthernet2/1/1", "SFP-10GBase-LR", "SFP-10G-LR", "V01", "LR1")
+    nb = wired(
+        existing={1: ["TenGigabitEthernet1/1/1"], 2: ["TenGigabitEthernet1/1/1"]},
+        discovered={A1: ["TenGigabitEthernet1/1/1", "TenGigabitEthernet2/1/1"]},
+        devices=_stack(members=2),
+        optics={A1: [optic]},
+    )
+
+    TOOL.run(_ctx(apply=True, nb=nb), _args())
+
+    (item,) = nb.dcim.inventory_items.created
+    assert (item["device"], item["component_id"], item["name"]) == (
+        2,
+        2000,
+        "TenGigabitEthernet1/1/1",
+    )
+
+
+def test_unreadable_inventory_still_checks_interfaces(wired):
+    nb = wired(
+        existing={1: []},
+        discovered={"sw1": ["Gi1/0/1"]},
+        inventory_errors={"sw1": "show inventory failed: timed out"},
+    )
+    notes = io.StringIO()
+
+    result = TOOL.run(_ctx(stream=notes, nb=nb), _args())
+
+    assert result.status is Status.DRIFT
+    assert "transceivers not checked — show inventory failed: timed out" in notes.getvalue()
+
+
+def test_no_optics_means_no_inventory_lookups(wired):
+    nb = wired(existing={1: ["Gi1/0/1"]}, discovered={"sw1": ["Gi1/0/1"]})
+
+    TOOL.run(_ctx(nb=nb), _args())
+
+    assert nb.dcim.inventory_items.queries == []
