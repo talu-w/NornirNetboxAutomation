@@ -65,6 +65,14 @@ def test_long_and_short_spellings_are_one_interface(long, short):
     assert canonical_name(long) == canonical_name(short)
 
 
+def test_aruba_ap_lldp_port_names_match_the_ndx_template_names():
+    """An AP's LLDP table says eth1; its NetBox Data Exchange template says E1."""
+    names = [name for name, _type in AP_655_INTERFACES]
+    assert match_interface("eth1", names) == "E1"
+    assert match_interface("Eth0", names) == "E0"
+    assert canonical_name("Ethernet0") == canonical_name("E0") == "eth0"
+
+
 def test_canonical_form_is_the_short_family():
     assert canonical_name("GigabitEthernet1/0/1") == "gi1/0/1"
     assert canonical_name("Port-Channel10") == "po10"

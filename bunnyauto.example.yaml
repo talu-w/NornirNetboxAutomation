@@ -14,9 +14,11 @@
 #                 (required if fw_url is set — used by `security subnet-check`)
 #   aruba_url     optional; base URL of that network's Aruba Mobility Conductor
 #                 REST API (include :4343 if that is the API port). Used by
-#                 `wireless sync`. Auth is the shared device login
-#                 (NORNIR_USERNAME / NORNIR_PASSWORD) — no separate token — and
-#                 the Conductor's TLS certificate is always verified.
+#                 `wireless sync`, which also logs into each WLC the Conductor
+#                 reports (port 4343 unless --wlc-port). Auth is the shared
+#                 device login (NORNIR_USERNAME / NORNIR_PASSWORD) — no separate
+#                 token — and TLS certificates are verified unless
+#                 --aruba-insecure / --wlc-insecure.
 #   roles         optional; per-environment override of the top-level roles:
 #                 block below, for a NetBox whose role slugs differ.
 #
@@ -43,7 +45,7 @@
 #   wired: wired-network                          # wired branch root
 #   wireless: wireless-network                    # wireless branch root
 #   security: network-security                    # security branch root
-#   wireless-controller: wireless-controller      # WLCs: `wireless enrich` logs into these
+#   wireless-controller: wireless-controller      # WLCs: `wireless sync` creates these
 #   wireless-access-point: wireless-access-point  # APs: `wireless sync` creates these
 
 environments:

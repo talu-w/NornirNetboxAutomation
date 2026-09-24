@@ -4,8 +4,8 @@ Pure, no I/O. Every tool that compares an interface name from a device (CLI
 output, an LLDP neighbor's Port ID) with one in NetBox goes through here, so
 ``Gi1/0/24``, ``gi 1/0/24`` and ``GigabitEthernet1/0/24`` are the same port
 everywhere. (Until 2026-09-23 there were three separate alias tables: one in
-``create-interfaces``, one in the ``sync-interfaces`` engine, and one in
-``wireless enrich``'s LLDP matcher. Each was missing families the others knew.)
+``create-interfaces``, one in the ``sync-interfaces`` engine, and one in the
+wireless LLDP matcher. Each was missing families the others knew.)
 
 **Names.** :func:`interface_signature` splits a name into ``(family, rest)``
 with the family reduced to one canonical short form (``"gi"``);
@@ -76,7 +76,9 @@ FAMILY_ALIASES: dict[str, str] = {
     "fou": "fou",
     "fourhundredgige": "fou",
     "fourhundredgigabitethernet": "fou",
-    # generic Ethernet (Arista/Nexus style)
+    # generic Ethernet (Arista/Nexus style). Aruba APs: NetBox Data Exchange
+    # device types name the ports "E0"/"E1"; the AP's own LLDP table says "eth0"/"eth1".
+    "e": "eth",
     "eth": "eth",
     "et": "eth",
     "ethernet": "eth",

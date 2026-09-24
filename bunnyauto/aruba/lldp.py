@@ -7,22 +7,26 @@ against a real payload the owner supplied directly (2026-09-23): the row
 identifies the local AP under the column ``AP`` (not ``"AP Name"``), and the
 neighbor's identity under the single combined column ``Chassis Name/ID``
 (*not* two separate ``"Chassis Name"``/``"Chassis ID"`` columns — an earlier,
-wrong guess). The row also carries ``Capabilities``, ``Interface`` (the AP's
-own local port), ``Mgmt. Address`` (the neighboring switch's management IP —
-a possible future fallback match if hostname matching ever proves
-unreliable, not wired in yet) and ``Neighbor`` (meaning unconfirmed), none of
-which this parser currently uses. The neighbor's port is under ``Port ID`` or
-``Port Desc`` (both are the *neighbor's own* port, per live testing — not the
-AP's local port). Every candidate for a field is kept, not just the first
-non-empty one, so the caller can try each against NetBox and use whichever
-one actually resolves — same "try progressively more candidates" pattern as
-:func:`bunnyauto.netbox.tokens.match_record`'s ``model_candidates``,
-since which field holds the useful value isn't knowable in advance.
+wrong guess). ``Interface`` is the AP's own local port (``eth0``/``eth1``) —
+kept as :attr:`LldpNeighbor.local_port`, it's the AP's live uplink, which
+``wireless sync`` puts the AP's IP and cable on (2026-09-24). The row also
+carries ``Capabilities``, ``Mgmt. Address`` (the neighboring switch's
+management IP — a possible future fallback match if hostname matching ever
+proves unreliable, not wired in yet) and ``Neighbor`` (meaning unconfirmed),
+none of which this parser currently uses. The neighbor's port is under
+``Port ID`` or ``Port Desc`` (both are the *neighbor's own* port, per live
+testing — not the AP's local port). Every candidate for a field is kept, not
+just the first non-empty one, so the caller can try each against NetBox and
+use whichever one actually resolves — same "try progressively more
+candidates" pattern as :func:`bunnyauto.netbox.tokens.match_record`'s
+``model_candidates``, since which field holds the useful value isn't knowable
+in advance.
 
-A row missing any of the three fields ``wireless enrich`` needs (which AP, at
+A row missing any of the three fields ``wireless sync`` needs (which AP, at
 least one remote-system candidate, at least one remote-port candidate) is
 skipped rather than guessed — same "never substitute a wrong value" rule as
-the rest of this package.
+the rest of this package. So an AP port with no neighbor on it (the row
+exists, but its ``Chassis Name/ID`` is empty) is not an uplink.
 """
 
 from __future__ import annotations
@@ -44,6 +48,9 @@ class LldpNeighbor:
     ap_name: str
     remote_system_candidates: list[str]
     remote_port_candidates: list[str]
+    #: The AP's own port this neighbor was seen on (the ``Interface`` column,
+    #: e.g. ``"eth1"``), or ``""`` if the row doesn't say.
+    local_port: str = ""
 
 
 def _get(row: dict[str, Any], *keys: str) -> str:
@@ -96,6 +103,7 @@ def parse_lldp_neighbors(payload: dict[str, Any] | list[dict[str, Any]]) -> list
                 ap_name=ap_name,
                 remote_system_candidates=remote_system_candidates,
                 remote_port_candidates=remote_port_candidates,
+                local_port=_get(row, "Interface"),
             )
         )
     return neighbors

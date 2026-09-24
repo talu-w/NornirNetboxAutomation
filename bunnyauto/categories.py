@@ -70,8 +70,8 @@ CATEGORIES: dict[str, Category] = {
 
 #: Every NetBox device-role slug bunnyauto relies on, by the key ``roles:`` in
 #: bunnyauto.yaml uses to override it. The first three are category branch
-#: roots; the wireless leaves are the roles ``wireless sync`` assigns and
-#: ``wireless enrich`` logs into.
+#: roots; the wireless leaves are the roles ``wireless sync`` creates WLCs and
+#: APs with.
 DEFAULT_ROLES: dict[str, str] = {
     "wired": "wired-network",
     "wireless": "wireless-network",

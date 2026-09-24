@@ -5,7 +5,7 @@ runs the chosen tool, and returns its exit code. The interactive hub
 (:mod:`bunnyauto.hub`) does the same work with prompts instead of ``argv``.
 
 Commands are ``bunnyauto --env <env> <category> <tool> [options]``, e.g.
-``bunnyauto --env prod wired backup`` or ``bunnyauto --env test wireless enrich``;
+``bunnyauto --env prod wired backup`` or ``bunnyauto --env test wireless sync``;
 see :mod:`bunnyauto.categories`.
 """
 
@@ -29,8 +29,12 @@ from bunnyauto.tools.base import timeouts_from_args
 #: they live now. Everything else keeps its name inside its category.
 _RENAMED: dict[str, tuple[str, str]] = {
     "wireless-sync": ("wireless", "sync"),
-    "wireless-enrich": ("wireless", "enrich"),
+    "wireless-enrich": ("wireless", "sync"),
     "fw-subnet-check": ("security", "subnet-check"),
+}
+#: Tools folded into another tool of the same category: (category, old) -> new.
+_MERGED: dict[tuple[str, str], str] = {
+    ("wireless", "enrich"): "sync",  # 2026-09-24
 }
 #: Global options that take a value, so the value isn't mistaken for a category.
 _VALUE_OPTIONS = frozenset({"--env", "--env-file"})
@@ -110,12 +114,22 @@ def _category_hint(argv: list[str]) -> str | None:
     """The corrected command when a tool name is typed where a category belongs.
 
     ``bunnyauto --env test backup --raw`` -> ``bunnyauto --env test wired backup --raw``;
-    a renamed tool (``wireless-sync``) is pointed at its new name too.
+    a renamed tool (``wireless-sync``) is pointed at its new name too, and a tool
+    merged into another (``wireless enrich``) at the one that does its job now.
     """
     index = _first_positional(argv)
-    if index is None or argv[index] in REGISTRY:
+    if index is None:
         return None
     word = argv[index]
+    if word in REGISTRY:
+        old = argv[index + 1] if index + 1 < len(argv) else None
+        new = _MERGED.get((word, old)) if old else None
+        if new is None:
+            return None
+        fixed = [*argv[: index + 1], new, *argv[index + 2 :]]
+        return f"'{word} {old}' is now part of '{word} {new}' — run: " + shlex.join(
+            ["bunnyauto", *fixed]
+        )
     if word in _RENAMED:
         category, tool = _RENAMED[word]
         lead = f"{word!r} is now '{category} {tool}'"

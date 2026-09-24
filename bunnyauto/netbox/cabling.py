@@ -11,15 +11,17 @@ turns that into a cable plan without writing anything:
    shares one chassis identity, but each member is its own NetBox device.
 2. **The neighbor's port.** Its reported port names are tried against that
    device's actual interfaces (:mod:`bunnyauto.netbox.interfaces`).
-3. **The local port.** The named port if the caller knows it, otherwise the
-   local device's first wired interface.
-4. **Existing cables.** An interface that already has a cable is **never
-   touched**. It's reported as a conflict, because silently mis-correcting
-   physical wiring is worse than a note.
+3. **The local port.** The named port if the caller knows it (an AP's LLDP
+   ``Interface``), otherwise the local device's first wired interface.
+4. **Existing cables.** A cable already joining exactly these two interfaces is
+   ``"in-sync"``. Any other cable on either interface is **never touched**. It's
+   reported as a conflict, because silently mis-correcting physical wiring is
+   worse than a note. The note says so when the neighbor's port is cabled to a
+   *different* port on the same local device (the device has moved ports).
 
-This came out of ``wireless enrich`` (AP to switch, from
-``show ap lldp neighbors``). A wired CDP/LLDP cable sync would call the same two
-functions.
+This came out of the old ``wireless enrich`` (AP to switch, from
+``show ap lldp neighbors``), now part of ``wireless sync``. A wired CDP/LLDP
+cable sync would call the same two functions.
 """
 
 from __future__ import annotations
@@ -34,13 +36,14 @@ from bunnyauto.netbox.interfaces import (
     pick_wired_record,
     stack_member,
 )
+from bunnyauto.netbox.records import related_id
 
 
 @dataclass(slots=True)
 class CablePlan:
     """What :func:`plan_neighbor_cable` decided. ``a`` = the local end, ``b`` = the neighbor."""
 
-    action: str  # "create" | "conflict" | "blocked"
+    action: str  # "create" | "in-sync" | "conflict" | "blocked"
     a_interface_id: int = 0
     a_interface_name: str = ""
     b_device_name: str = ""
@@ -57,13 +60,17 @@ def plan_neighbor_cable(
     neighbor_ports: list[str],
     devices: list[Any],
     local_port: str | None = None,
+    local_interfaces: list[Any] | None = None,
     interface_cache: dict[int, list[Any]] | None = None,
 ) -> CablePlan:
     """Resolve one reported neighbor to a cable between two NetBox interfaces.
 
     ``devices`` is every NetBox device the neighbor could be; ``interface_cache``
     (device id -> interfaces) lets a caller reuse one lookup per neighbor
-    across many local devices that land on the same switch.
+    across many local devices that land on the same switch. ``local_interfaces``
+    are the local device's interfaces when the caller already has them — or a
+    preview of them, for a device that doesn't exist in NetBox yet (the plan is
+    then for display only); otherwise they're fetched.
     """
     cache = interface_cache if interface_cache is not None else {}
 
@@ -87,7 +94,8 @@ def plan_neighbor_cable(
         )
     b_iface = next(i for i in neighbor_interfaces if str(i.name) == b_name)
 
-    local_interfaces = _interfaces(nb, cache, int(local_device.id))
+    if local_interfaces is None:
+        local_interfaces = _interfaces(nb, cache, int(local_device.id))
     if local_port:
         a_name = match_interface(local_port, [str(i.name) for i in local_interfaces])
         a_iface = next((i for i in local_interfaces if str(i.name) == a_name), None)
@@ -112,12 +120,14 @@ def plan_neighbor_cable(
         b_interface_id=int(b_iface.id),
         b_interface_name=str(b_iface.name),
     )
-    if getattr(a_iface, "cable", None) or getattr(b_iface, "cable", None):
+    a_cable = getattr(a_iface, "cable", None)
+    b_cable = getattr(b_iface, "cable", None)
+    same_cable = related_id(a_cable) is not None and related_id(a_cable) == related_id(b_cable)
+    if a_cable and b_cable and same_cable:
+        plan.action = "in-sync"
+    elif a_cable or b_cable:
         plan.action = "conflict"
-        plan.note = (
-            f"{local_device.name}:{a_iface.name} or {neighbor.name}:{b_iface.name} "
-            "already has a cable — left untouched"
-        )
+        plan.note = _conflict_note(local_device, a_iface, neighbor, b_iface, local_interfaces)
     return plan
 
 
@@ -129,6 +139,32 @@ def create_cable(nb: Any, plan: CablePlan) -> None:
             "b_terminations": [{"object_type": "dcim.interface", "object_id": plan.b_interface_id}],
             "status": "connected",
         }
+    )
+
+
+def _conflict_note(
+    local_device: Any, a_iface: Any, neighbor: Any, b_iface: Any, local_interfaces: list[Any]
+) -> str:
+    b_cable = related_id(getattr(b_iface, "cable", None))
+    moved_from = next(
+        (
+            i
+            for i in local_interfaces
+            if str(i.name) != str(a_iface.name)
+            and b_cable is not None
+            and related_id(getattr(i, "cable", None)) == b_cable
+        ),
+        None,
+    )
+    if moved_from is not None:
+        return (
+            f"{neighbor.name}:{b_iface.name} is cabled to {local_device.name}:{moved_from.name} "
+            f"in NetBox, but {local_device.name} reports this link on {a_iface.name} — the "
+            "existing cable is left untouched; move it in NetBox"
+        )
+    return (
+        f"{local_device.name}:{a_iface.name} or {neighbor.name}:{b_iface.name} "
+        "already has a cable — left untouched"
     )
 
 

@@ -18,7 +18,6 @@ from bunnyauto.tools.netbox import import_device_type
 from bunnyauto.tools.netbox import scope as netbox_scope
 from bunnyauto.tools.security import subnet_check
 from bunnyauto.tools.wired import backup, create_interfaces, health, send_command, sync_interfaces
-from bunnyauto.tools.wireless import enrich as wireless_enrich
 from bunnyauto.tools.wireless import sync as wireless_sync
 
 _TOOLS: tuple[Tool, ...] = (
@@ -28,7 +27,6 @@ _TOOLS: tuple[Tool, ...] = (
     sync_interfaces.TOOL,
     health.TOOL,
     wireless_sync.TOOL,
-    wireless_enrich.TOOL,
     subnet_check.TOOL,
     import_device_type.TOOL,
     netbox_scope.TOOL,

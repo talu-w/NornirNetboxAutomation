@@ -1,7 +1,7 @@
 """Match a terse vendor string to a NetBox record by token containment.
 
 Used for device types (``wireless sync``: Aruba's ``"655"`` -> the NetBox
-device type ``"Aruba AP-655"``) and for platforms (``wireless enrich``: a
+device type ``"Aruba AP-655"``) and for platforms (also ``wireless sync``: a
 reported ``"8.10.0.5"`` becomes the candidate ``"AOS 8"`` -> the NetBox
 platform ``"AOS 8"``). Any NetBox record with name-like fields works the same
 way; pass the fields to compare as ``key_fields``.

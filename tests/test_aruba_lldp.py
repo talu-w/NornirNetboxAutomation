@@ -46,6 +46,19 @@ def test_parse_lldp_neighbors():
     assert rows[0].ap_name == "hq-idf1-ap01"
     assert rows[0].remote_system_candidates == ["hq-idf1-sw01"]
     assert rows[0].remote_port_candidates == ["GigabitEthernet1/0/24"]
+    assert rows[0].local_port == "eth0"
+
+
+def test_interface_column_is_the_aps_own_port():
+    row = {"AP": "ap1", "Interface": "eth1", "Chassis Name/ID": "sw1", "Port ID": "Gi1/0/24"}
+    (neighbor,) = parse_lldp_neighbors([row])
+    assert neighbor.local_port == "eth1"
+
+
+def test_missing_interface_column_leaves_local_port_empty():
+    row = {"AP": "ap1", "Chassis Name/ID": "sw1", "Port ID": "Gi1/0/24"}
+    (neighbor,) = parse_lldp_neighbors([row])
+    assert neighbor.local_port == ""
 
 
 def test_row_missing_any_required_field_is_skipped():

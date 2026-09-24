@@ -74,7 +74,6 @@ def test_every_category_has_its_tools():
         ["wired", "backup"],
         ["wired", "sync-interfaces"],
         ["wireless", "sync"],
-        ["wireless", "enrich"],
         ["security", "subnet-check", "10.0.0.0/24"],
         ["netbox", "import-device-type", "x.yaml"],
         ["netbox", "scope"],
@@ -103,6 +102,15 @@ def test_a_tool_is_not_reachable_from_another_category():
         (
             ["--env", "test", "fw-subnet-check", "10.1.0.0/24"],
             "run: bunnyauto --env test security subnet-check 10.1.0.0/24",
+        ),
+        (
+            ["--env", "test", "wireless-enrich", "--apply"],
+            "run: bunnyauto --env test wireless sync --apply",
+        ),
+        (
+            ["--env", "test", "wireless", "enrich", "--wlc-port", "8443"],
+            "'wireless enrich' is now part of 'wireless sync' — run: "
+            "bunnyauto --env test wireless sync --wlc-port 8443",
         ),
     ],
 )
