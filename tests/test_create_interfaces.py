@@ -43,6 +43,16 @@ def test_parse_interfaces_basic():
     assert by_name["GigabitEthernet1/0/2"].enabled is False
 
 
+def test_parse_interfaces_keeps_the_media_type():
+    rows = [
+        {"interface": "GigabitEthernet1/0/1", "media_type": "10/100/1000BaseTX"},
+        {"interface": "Port-channel1", "media_type": ""},
+    ]
+    by_name = {i.name: i for i in parse_interfaces(rows, include_virtual=False)}
+    assert by_name["GigabitEthernet1/0/1"].media_type == "10/100/1000BaseTX"
+    assert by_name["Port-channel1"].media_type == ""
+
+
 def test_parse_interfaces_include_virtual():
     rows = [{"interface": "Vlan10", "link_status": "up"}]
     assert [i.name for i in parse_interfaces(rows, include_virtual=True)] == ["Vlan10"]
@@ -68,21 +78,61 @@ class _Device:
 
 
 class _Iface:
-    def __init__(self, name: str, device_id: int | None = None):
+    def __init__(self, id_: int, name: str, device_id: int | None = None, type_=None):
+        self.id = id_
         self.name = name
         self.device = {"id": device_id} if device_id is not None else None
+        self.type = {"value": type_, "label": type_} if type_ else None
+
+
+#: A slice of NetBox's interface type choices (OPTIONS /api/dcim/interfaces/).
+NETBOX_TYPES = [
+    "virtual",
+    "lag",
+    "100base-tx",
+    "1000base-t",
+    "1000base-tx",
+    "2.5gbase-t",
+    "5gbase-t",
+    "10gbase-t",
+    "1000base-x-sfp",
+    "10gbase-x-sfpp",
+    "10gbase-x-x2",
+    "10gbase-sr",
+    "25gbase-x-sfp28",
+    "40gbase-x-qsfpp",
+    "100gbase-x-qsfp28",
+    "other",
+]
 
 
 class _Interfaces:
-    def __init__(self, existing: dict[int, list[str]]):
+    """``existing`` maps a device id to its interfaces: a name, or ``(name, type)``."""
+
+    def __init__(self, existing: dict[int, list], types=NETBOX_TYPES):
         self._existing = existing
+        self._types = types
         self.created: list[dict] = []
+        self.updated: list[dict] = []
 
     def filter(self, device_id=None):
-        return [_Iface(n, device_id) for n in self._existing.get(device_id, [])]
+        records = []
+        for n, entry in enumerate(self._existing.get(device_id, [])):
+            name, type_ = entry if isinstance(entry, tuple) else (entry, None)
+            records.append(_Iface(device_id * 1000 + n, name, device_id, type_))
+        return records
+
+    def choices(self):
+        if self._types is None:
+            raise ValueError("Unexpected format in the OPTIONS response")
+        return {"type": [{"value": t, "display_name": t.upper()} for t in self._types]}
 
     def create(self, payload):
         self.created.extend(payload)
+        return payload
+
+    def update(self, payload):
+        self.updated.extend(payload)
         return payload
 
 
@@ -105,10 +155,10 @@ class _Devices:
 
 
 class _NB:
-    def __init__(self, devices, existing, *, everywhere=None, chassis=None):
+    def __init__(self, devices, existing, *, everywhere=None, chassis=None, types=NETBOX_TYPES):
         self.dcim = argparse.Namespace(
             devices=_Devices(devices, everywhere),
-            interfaces=_Interfaces(existing),
+            interfaces=_Interfaces(existing, types),
             virtual_chassis=argparse.Namespace(get=lambda id_: (chassis or {}).get(id_)),
         )
 
@@ -189,7 +239,9 @@ def wired(monkeypatch):
 
     ``devices`` are the in-scope NetBox devices (default: one ``sw1``);
     ``everywhere`` adds devices NetBox has but the scope excludes. Each name in
-    ``discovered`` is a Nornir host for the device of that name.
+    ``discovered`` is a Nornir host for the device of that name; its ports are
+    names, or ``(name, media type)`` as ``show interfaces`` reports them.
+    ``types`` is what NetBox's OPTIONS answer lists (``None``: it fails).
     """
 
     def _wire(
@@ -200,17 +252,21 @@ def wired(monkeypatch):
         devices=None,
         everywhere=None,
         chassis=None,
+        types=NETBOX_TYPES,
     ):
         devices = devices if devices is not None else [_Device(1, "sw1")]
         by_name = {d.name: d for d in [*devices, *(everywhere or [])]}
-        nb = _NB(devices, existing, everywhere=everywhere, chassis=chassis)
+        nb = _NB(devices, existing, everywhere=everywhere, chassis=chassis, types=types)
 
         run_result = {}
         for name, ifaces in discovered.items():
-            run_result[name] = _Multi(
-                [_Item(result=[DiscoveredInterface(n) for n in ifaces])],
-                failed=name in failed_hosts,
-            )
+            ports = [
+                DiscoveredInterface(i[0], media_type=i[1])
+                if isinstance(i, tuple)
+                else DiscoveredInterface(i)
+                for i in ifaces
+            ]
+            run_result[name] = _Multi([_Item(result=ports)], failed=name in failed_hosts)
 
         hosts = {name: _Host(name, by_name[name].id) for name in discovered}
         selected = _Selected(hosts, run_result)
@@ -619,3 +675,179 @@ def test_untagged_virtual_chassis_members_get_their_own_ports(wired):
     }
     assert result.data[A2]["template_named"] == {"GigabitEthernet2/0/2": "GigabitEthernet1/0/2"}
     assert f"including {A2}, {A3} as part of its Virtual Chassis" in notes.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# interface types from the device's own media report
+# ---------------------------------------------------------------------------
+
+TX = "10/100/1000BaseTX"
+
+
+def test_new_interface_gets_the_type_the_device_reports(wired):
+    nb = wired(existing={1: []}, discovered={"sw1": [("Gi1/0/1", TX), ("Gi1/1/1", "Not Present")]})
+
+    result = TOOL.run(_ctx(apply=True, nb=nb), _args())
+
+    assert result.status is Status.CHANGED
+    types = {c["name"]: c["type"] for c in nb.dcim.interfaces.created}
+    # the old name-only guess made both 1000base-t, though Gi1/1/1 is an SFP cage
+    assert types == {"Gi1/0/1": "1000base-tx", "Gi1/1/1": "1000base-x-sfp"}
+
+
+def test_existing_interface_with_the_wrong_type_is_corrected(wired):
+    # Owner-reported: NetBox said 1000BASE-T (1GE), the switch says 10/100/1000BaseTX.
+    nb = wired(
+        existing={1: [("GigabitEthernet1/0/1", "1000base-t")]},
+        discovered={"sw1": [("GigabitEthernet1/0/1", TX)]},
+    )
+
+    plan = TOOL.run(_ctx(nb=nb), _args())
+
+    assert plan.status is Status.DRIFT
+    assert plan.changes == [
+        "sw1: would change GigabitEthernet1/0/1 from 1000base-t to 1000base-tx "
+        "(device reports '10/100/1000BaseTX')"
+    ]
+    assert plan.data["sw1"]["retype"] == [
+        {"name": "GigabitEthernet1/0/1", "from": "1000base-t", "to": "1000base-tx", "media": TX}
+    ]
+    assert "wrong type" in plan.summary
+    assert nb.dcim.interfaces.updated == []
+
+    applied = TOOL.run(_ctx(apply=True, nb=nb), _args())
+
+    assert applied.status is Status.CHANGED
+    assert nb.dcim.interfaces.updated == [{"id": 1000, "type": "1000base-tx"}]
+    assert nb.dcim.interfaces.created == []
+    assert applied.data["sw1"]["retyped"] == 1
+
+
+def test_matching_type_is_left_alone(wired):
+    nb = wired(
+        existing={1: [("Gi1/0/1", "1000base-tx"), ("Te1/1/1", "10gbase-x-sfpp")]},
+        discovered={"sw1": [("Gi1/0/1", TX), ("Te1/1/1", "SFP-10GBase-SR")]},
+    )
+
+    result = TOOL.run(_ctx(nb=nb), _args())
+
+    assert result.status is Status.OK
+    assert result.changes == []
+
+
+def test_cage_modelled_as_its_optic_or_x2_is_left_alone(wired):
+    nb = wired(
+        existing={1: [("Te1/1/1", "10gbase-sr"), ("Te1/1/2", "10gbase-x-x2")]},
+        discovered={"sw1": [("Te1/1/1", "SFP-10GBase-SR"), ("Te1/1/2", "SFP-10GBase-LR")]},
+    )
+
+    assert TOOL.run(_ctx(nb=nb), _args()).status is Status.OK
+
+
+def test_copper_type_on_a_transceiver_cage_is_corrected(wired):
+    nb = wired(
+        existing={1: [("Gi1/1/1", "1000base-t"), ("Te1/0/1", "10gbase-x-sfpp")]},
+        discovered={
+            "sw1": [
+                ("Gi1/1/1", "1000BaseSX SFP"),
+                ("Te1/0/1", "100/1000/2.5G/5G/10GBaseTX"),  # mGig copper, not SFP+
+            ]
+        },
+    )
+
+    TOOL.run(_ctx(apply=True, nb=nb), _args())
+
+    assert nb.dcim.interfaces.updated == [
+        {"id": 1000, "type": "1000base-x-sfp"},
+        {"id": 1001, "type": "10gbase-t"},
+    ]
+
+
+def test_no_usable_media_type_never_changes_a_type(wired):
+    nb = wired(
+        existing={1: [("Gi1/0/1", "other"), ("Port-channel1", "lag")]},
+        discovered={"sw1": [("Gi1/0/1", "unknown"), ("Port-channel1", "")]},
+    )
+
+    result = TOOL.run(_ctx(apply=True, nb=nb), _args())
+
+    assert result.status is Status.OK
+    assert nb.dcim.interfaces.updated == []
+
+
+def test_unmapped_media_type_is_noted_and_changes_nothing(wired):
+    nb = wired(
+        existing={1: [("Gi0/0/0", "1000base-t")]},
+        discovered={"sw1": [("Gi0/0/0", "Auto Select"), ("Gi0/0/1", "Auto Select")]},
+    )
+    notes = io.StringIO()
+
+    result = TOOL.run(_ctx(apply=True, stream=notes, nb=nb), _args())
+
+    assert nb.dcim.interfaces.updated == []
+    # the new port falls back to the name-only guess
+    assert nb.dcim.interfaces.created[0]["type"] == "1000base-t"
+    assert result.data["sw1"]["unmapped_media"] == {"Auto Select": ["Gi0/0/0", "Gi0/0/1"]}
+    assert "media type 'Auto Select' on 2 port(s)" in notes.getvalue()
+
+
+def test_type_this_netbox_lacks_falls_back_to_the_older_one(wired):
+    nb = wired(
+        existing={1: [("Gi1/0/1", "1000base-t")]},
+        discovered={"sw1": [("Gi1/0/1", TX), ("Gi1/0/2", TX)]},
+        types=[t for t in NETBOX_TYPES if t != "1000base-tx"],
+    )
+
+    TOOL.run(_ctx(apply=True, nb=nb), _args())
+
+    assert nb.dcim.interfaces.updated == []
+    assert nb.dcim.interfaces.created[0]["type"] == "1000base-t"
+
+
+def test_unreadable_type_choices_warn_and_use_long_standing_types(wired):
+    nb = wired(
+        existing={1: [("Gi1/0/1", "1000base-t")]},
+        discovered={"sw1": [("Gi1/0/1", TX), ("Gi1/1/1", "1000BaseSX SFP")]},
+        types=None,
+    )
+    notes = io.StringIO()
+
+    result = TOOL.run(_ctx(apply=True, stream=notes, nb=nb), _args())
+
+    assert result.status is Status.CHANGED
+    assert nb.dcim.interfaces.updated == []  # 1000base-t stays
+    assert nb.dcim.interfaces.created[0]["type"] == "1000base-x-sfp"
+    assert "could not read the interface types NetBox accepts" in notes.getvalue()
+
+
+def test_type_update_failure_is_reported(wired):
+    nb = wired(existing={1: [("Gi1/0/1", "1000base-t")]}, discovered={"sw1": [("Gi1/0/1", TX)]})
+
+    def refuse(payload):
+        raise RuntimeError("400 Bad Request")
+
+    nb.dcim.interfaces.update = refuse
+
+    result = TOOL.run(_ctx(apply=True, nb=nb), _args())
+
+    assert result.status is Status.ERROR
+    assert result.data["sw1"]["error"] == "type update failed: 400 Bad Request"
+
+
+def test_stack_members_template_named_port_gets_its_type_corrected(wired):
+    # SwitchA-2's GigabitEthernet1/0/1 (template name) is the switch's Gi2/0/1.
+    nb = wired(
+        existing={
+            1: [("GigabitEthernet1/0/1", "1000base-tx")],
+            2: [("GigabitEthernet1/0/1", "1000base-t")],
+        },
+        discovered={A1: [("GigabitEthernet1/0/1", TX), ("GigabitEthernet2/0/1", TX)]},
+        devices=_stack(members=2),
+    )
+
+    result = TOOL.run(_ctx(nb=nb), _args())
+
+    assert result.changes == [
+        f"{A2}: would change GigabitEthernet1/0/1 from 1000base-t to 1000base-tx "
+        f"(device reports '10/100/1000BaseTX') [stack member 2, seen on {A1}]"
+    ]

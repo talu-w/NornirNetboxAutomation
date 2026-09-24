@@ -18,10 +18,14 @@ from bunnyauto.netbox.interfaces import (
     is_wired_type,
     match_interface,
     match_interface_candidates,
+    media_is_blank,
     member_local_names,
     pick_wired_interface,
     pick_wired_record,
+    port_media,
     stack_member,
+    supported_type,
+    type_fits,
 )
 
 # Real interface set for the Aruba AP-655 device type (NetBox Data Exchange).
@@ -265,3 +269,86 @@ def test_member_local_names_keep_a_subinterface():
 def test_member_local_names_need_the_three_segment_stack_shape():
     assert member_local_names("Gi0/1") == []
     assert member_local_names("Port-channel1") == []
+
+
+# ---------------------------------------------------------------------------
+# types from the device's media report (show interfaces: "media type is ...")
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("name", "media", "types", "cage"),
+    [
+        # copper: the fastest rate listed, T vs TX as the device says
+        ("GigabitEthernet1/0/1", "10/100/1000BaseTX", ("1000base-tx", "1000base-t"), False),
+        ("GigabitEthernet0/1", "10/100/1000BaseT", ("1000base-t",), False),
+        ("FastEthernet0/1", "10/100BaseTX", ("100base-tx",), False),
+        ("TenGigabitEthernet1/0/1", "100/1000/2.5G/5G/10GBaseTX", ("10gbase-t",), False),
+        ("TwoGigabitEthernet1/0/1", "100/1000/2.5GBaseTX", ("2.5gbase-t",), False),
+        ("FiveGigabitEthernet1/0/1", "100/1000/2.5G/5GBaseTX", ("5gbase-t",), False),
+        ("Ethernet1/1", "10GBase-T", ("10gbase-t",), False),
+        ("GigabitEthernet0/0/0", "RJ45", ("1000base-t",), False),  # ISR: rate from the name
+        # transceiver cage: sized by the port's name, never by the optic in it
+        ("TenGigabitEthernet1/1/1", "SFP-10GBase-SR", ("10gbase-x-sfpp",), True),
+        ("TenGigabitEthernet1/1/2", "1000BaseSX SFP", ("10gbase-x-sfpp",), True),
+        ("GigabitEthernet1/1/1", "1000BaseLX SFP", ("1000base-x-sfp",), True),
+        ("GigabitEthernet1/1/2", "Not Present", ("1000base-x-sfp",), True),
+        ("GigabitEthernet0/0/1", "SFP", ("1000base-x-sfp",), True),
+        ("TwentyFiveGigE1/1/1", "SFP-25GBase-SR", ("25gbase-x-sfp28",), True),
+        ("FortyGigabitEthernet1/1/1", "QSFP 40G SR4", ("40gbase-x-qsfpp",), True),
+        ("HundredGigE1/0/49", "QSFP 40G SR4", ("100gbase-x-qsfp28",), True),
+        ("TenGigabitEthernet1/1/3", "SFP-10GBase-CX1", ("10gbase-x-sfpp",), True),  # DAC
+        # a generic name carries no rate, so the optic's is used
+        ("Ethernet1/49", "QSFP-100G-SR4", ("100gbase-x-qsfp28",), True),
+    ],
+)
+def test_port_media(name, media, types, cage):
+    port = port_media(name, media)
+    assert port is not None
+    assert (port.types, port.cage) == (types, cage)
+    assert port.media == media
+
+
+@pytest.mark.parametrize(
+    ("name", "media"),
+    [
+        ("Port-channel1", ""),
+        ("GigabitEthernet1/0/1", "unknown"),
+        ("Port-channel1", "N/A"),
+        ("GigabitEthernet0/0/0", "Auto Select"),  # not recognised
+        ("GigabitEthernet1/0/49", "10/100/1000BaseTX SFP"),  # dual-purpose: ambiguous
+        ("GigabitEthernet1/1/1", "1000BaseT SFP"),  # copper *and* a cage: ambiguous
+        ("Ethernet1/1", "Not Present"),  # an empty cage of no known rate
+    ],
+)
+def test_port_media_is_none_when_the_report_decides_nothing(name, media):
+    assert port_media(name, media) is None
+
+
+def test_media_is_blank():
+    assert media_is_blank("") and media_is_blank("  unknown ") and media_is_blank("N/A")
+    assert not media_is_blank("Auto Select")
+    assert not media_is_blank("Not Present")
+
+
+def test_supported_type_prefers_the_first_this_netbox_has():
+    tx = ("1000base-tx", "1000base-t")
+    assert supported_type(tx, {"1000base-t", "1000base-tx"}) == "1000base-tx"
+    assert supported_type(tx, {"1000base-t"}) == "1000base-t"  # older NetBox
+    assert supported_type(tx, None) == "1000base-t"  # choices unreadable
+    assert supported_type(("25gbase-t",), {"1000base-t"}) is None
+
+
+def test_type_fits_copper_needs_the_exact_type():
+    port = port_media("Gi1/0/1", "10/100/1000BaseTX")
+    assert type_fits(port, "1000base-tx", "1000base-tx")
+    assert not type_fits(port, "1000base-t", "1000base-tx")
+    assert not type_fits(port, None, "1000base-tx")
+
+
+def test_type_fits_a_cage_takes_any_optical_type_of_its_speed():
+    port = port_media("Te1/1/1", "SFP-10GBase-SR")
+    for current in ("10gbase-x-sfpp", "10gbase-sr", "10gbase-lr", "10gbase-x-x2", "10gbase-cu"):
+        assert type_fits(port, current, "10gbase-x-sfpp"), current
+    for current in ("10gbase-t", "1000base-x-sfp", "25gbase-x-sfp28", "virtual", "other", ""):
+        assert not type_fits(port, current, "10gbase-x-sfpp"), current

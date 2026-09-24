@@ -18,8 +18,12 @@ canonical one, and returning nothing if the match is ambiguous.
 but each is its own NetBox device. :func:`member_local_names` gives the
 member-1 names a device-type template puts on every member device.
 
-**Types.** :func:`interface_type` maps a name to the NetBox interface type a
-newly created interface gets. :func:`is_wired_type` and
+**Types.** :func:`port_media` reads a port's NetBox type from what the device
+itself reports (the ``media type is ...`` line of ``show interfaces``):
+``10/100/1000BaseTX`` is ``1000base-tx``, ``SFP-10GBase-SR`` on ``Te1/1/1`` is an
+SFP+ cage. :func:`type_fits` says whether a NetBox interface's type already
+agrees with that. :func:`interface_type` is the fallback, a guess from the name
+alone, used only when the device says nothing. :func:`is_wired_type` and
 :func:`pick_wired_interface` classify NetBox type slugs, so an IP or a cable
 lands on a wired port and never on a Wi-Fi, Bluetooth or Zigbee radio.
 """
@@ -27,7 +31,8 @@ lands on a wired port and never on a Wi-Fi, Bluetooth or Zigbee radio.
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
+from dataclasses import dataclass
 from typing import Any
 
 from bunnyauto.netbox.records import choice_value
@@ -111,6 +116,64 @@ _FAMILY_TYPES: dict[str, str] = {
     "hu": "100gbase-x-qsfp28",
     "fou": "400gbase-x-qsfpdd",
 }
+
+#: Canonical family -> the port's line rate in Mb/s. Cisco names a transceiver
+#: cage for the fastest optic it takes (``Te1/1/1`` stays ``Te`` with a 1G SFP in it).
+_FAMILY_SPEEDS: dict[str, int] = {
+    "fa": 100,
+    "gi": 1_000,
+    "tw": 2_500,
+    "fi": 5_000,
+    "te": 10_000,
+    "twe": 25_000,
+    "fo": 40_000,
+    "hu": 100_000,
+    "fou": 400_000,
+}
+
+#: A copper port's line rate -> its NetBox type.
+_COPPER_TYPES: dict[int, str] = {
+    100: "100base-tx",
+    1_000: "1000base-t",
+    2_500: "2.5gbase-t",
+    5_000: "5gbase-t",
+    10_000: "10gbase-t",
+    25_000: "25gbase-t",
+}
+#: Cisco's ``10/100/1000BaseTX``, preferred first. ``1000base-tx`` is newer in
+#: NetBox than ``1000base-t``, so an older NetBox falls back to the latter.
+_GIGABIT_TX_TYPES = ("1000base-tx", "1000base-t")
+
+#: A transceiver cage's line rate -> its NetBox type. The cage, not the optic in
+#: it, so swapping an SR for an LR never changes NetBox.
+_CAGE_TYPES: dict[int, str] = {
+    100: "100base-x-sfp",
+    1_000: "1000base-x-sfp",
+    2_500: "2.5gbase-x-sfp",
+    10_000: "10gbase-x-sfpp",
+    25_000: "25gbase-x-sfp28",
+    40_000: "40gbase-x-qsfpp",
+    50_000: "50gbase-x-sfp56",
+    100_000: "100gbase-x-qsfp28",
+    200_000: "200gbase-x-qsfp56",
+    400_000: "400gbase-x-qsfpdd",
+}
+
+#: Media types that say nothing about the port (Port-Channels, virtual ports).
+#: Compared with whitespace and underscores removed.
+_NO_MEDIA = frozenset({"", "unknown", "unknownmediatype", "n/a", "na", "none", "-", "--"})
+#: An empty transceiver cage: it's a cage, but there's no optic to name.
+_EMPTY_CAGE = frozenset({"notpresent", "notransceiver", "noxcvr", "nogbic", "nosfp"})
+#: A pluggable form factor named in the media type (``SFP-10GBase-SR``, ``QSFP 40G SR4``).
+_PLUGGABLE = re.compile(r"(?<![a-z])(?:q?sfp|osfp|cfp|gbic|xenpak|xfp|x2(?!\d))")
+#: The PMD after ``Base``: ``tx``/``t`` is copper, anything else (``sr``, ``lx``) an optic.
+_PMD = re.compile(r"base-?([a-z]+)")
+_RJ45 = re.compile(r"rj-?45")
+#: Each rate a media type lists: ``10/100/1000`` (Mb/s), ``2.5G/5G/10G``, ``40G``.
+_MEDIA_SPEED = re.compile(r"(?<![a-z0-9.])(\d+(?:\.\d+)?)(g?)(?=base|/|-|\s|$)")
+#: The line rate a NetBox Ethernet type slug starts with (``10gbase-``, ``1000base-``).
+_TYPE_SPEED = re.compile(r"^(\d+(?:\.\d+)?)(g?)base-")
+_TWISTED_PAIR = re.compile(r"^[\d.]+g?base-t(?:x|1)?$")
 
 #: Interface types that exist but aren't a physical wired port an IP belongs on.
 _NON_WIRED_TYPES = frozenset({"other-wireless", "virtual", "lag", "bridge"})
@@ -231,10 +294,129 @@ def interface_type(name: str) -> str:
     """The NetBox interface type for a port named ``name`` (``"other"`` if unknown).
 
     Port-Channels are ``lag``; loopbacks, VLAN SVIs, BDIs, IRBs and tunnels are
-    ``virtual``; physical families map to their speed's type.
+    ``virtual``; physical families map to their speed's type. A guess from the
+    name alone (``Gi`` could be copper or an SFP cage), so it's only the
+    fallback when the device reports no usable media type (:func:`port_media`).
     """
     family, _rest = interface_signature(name)
     return _FAMILY_TYPES.get(family, "other")
+
+
+@dataclass(frozen=True, slots=True)
+class PortMedia:
+    """The NetBox type a device's own media report gives one port."""
+
+    #: As the device reported it, for messages.
+    media: str
+    #: NetBox type slugs, preferred first (see :func:`supported_type`).
+    types: tuple[str, ...]
+    #: A transceiver cage, where any pluggable or optical type of ``speed`` fits.
+    cage: bool
+    #: Line rate in Mb/s.
+    speed: int
+
+
+def media_is_blank(media: str) -> bool:
+    """True if a reported media type says nothing about the port (``""``, ``unknown``, ``N/A``)."""
+    return _compact_media(media) in _NO_MEDIA
+
+
+def port_media(name: str, media: str) -> PortMedia | None:
+    """What the device's media type says port ``name``'s NetBox type is.
+
+    ``media`` is the ``media type is ...`` value from ``show interfaces``.
+
+    * **Copper** (``...BaseTX``, ``...BaseT``, ``RJ45``): the copper type of the
+      fastest rate listed, T and TX as reported. ``10/100/1000BaseTX`` is
+      ``1000base-tx``, ``100/1000/2.5G/5G/10GBaseTX`` is ``10gbase-t``.
+    * **Transceiver cage** (an optic such as ``SFP-10GBase-SR`` or ``1000BaseSX
+      SFP``, or ``Not Present``): the cage type for the port's own speed, read
+      from its name (``Te`` is SFP+ even with a 1G optic in it), so swapping an
+      optic never changes NetBox. The optic's rate is used only when the name
+      carries none (``Ethernet1/1``).
+
+    ``None`` when the report says nothing (:func:`media_is_blank`), isn't
+    recognised, or is ambiguous (copper *and* a form factor, e.g. a
+    dual-purpose ``10/100/1000BaseTX SFP`` port). Never a guess.
+    """
+    text = str(media or "").strip().casefold()
+    compact = _compact_media(text)
+    if compact in _NO_MEDIA:
+        return None
+    family, _rest = interface_signature(name)
+    port_speed = _FAMILY_SPEEDS.get(family)
+    if compact in _EMPTY_CAGE:
+        return _cage(media, port_speed)
+
+    pmd = _PMD.search(text)
+    flavor = pmd.group(1) if pmd else ""
+    copper = flavor in {"t", "tx"} or bool(_RJ45.search(text))
+    pluggable = bool(_PLUGGABLE.search(text)) or (bool(flavor) and not copper)
+    if copper == pluggable:  # ambiguous, or neither
+        return None
+
+    rates = [
+        round(float(value) * (1_000 if giga else 1)) for value, giga in _MEDIA_SPEED.findall(text)
+    ]
+    reported = max(rates, default=None)
+    if pluggable:
+        return _cage(media, port_speed or reported)
+
+    speed = reported or port_speed
+    if speed == 1_000 and flavor == "tx":
+        return PortMedia(str(media).strip(), _GIGABIT_TX_TYPES, cage=False, speed=speed)
+    copper_type = _COPPER_TYPES.get(speed or 0)
+    if copper_type is None:
+        return None
+    return PortMedia(str(media).strip(), (copper_type,), cage=False, speed=int(speed or 0))
+
+
+def supported_type(types: Iterable[str], supported: Collection[str] | None) -> str | None:
+    """The first of ``types`` this NetBox accepts, else ``None``.
+
+    ``supported`` is NetBox's own list of interface type values. When it
+    couldn't be read (``None``), the last, longest-standing type is used.
+    """
+    candidates = list(types)
+    if supported is None:
+        return candidates[-1] if candidates else None
+    return next((t for t in candidates if t in supported), None)
+
+
+def type_fits(port: PortMedia, current: str | None, wanted: str) -> bool:
+    """Whether a NetBox interface's ``current`` type already agrees with ``port``.
+
+    ``wanted`` is the type :func:`supported_type` picked for ``port``. A copper
+    port must be exactly that: ``1000base-t`` is not ``BaseTX``. A transceiver
+    cage accepts any non-copper type of its speed, so an SFP+ port someone
+    modelled as ``10gbase-sr`` or X2 is left alone.
+    """
+    value = str(current or "").strip().casefold()
+    if value == wanted:
+        return True
+    if not port.cage or _TWISTED_PAIR.match(value):
+        return False
+    return _type_speed(value) == port.speed
+
+
+def _compact_media(media: str) -> str:
+    return re.sub(r"[\s_]+", "", str(media or "")).casefold()
+
+
+def _cage(media: str, speed: int | None) -> PortMedia | None:
+    cage_type = _CAGE_TYPES.get(speed or 0)
+    if cage_type is None:
+        return None
+    return PortMedia(str(media).strip(), (cage_type,), cage=True, speed=int(speed or 0))
+
+
+def _type_speed(slug: str) -> int | None:
+    """The line rate (Mb/s) a NetBox Ethernet type slug names, else ``None``."""
+    match = _TYPE_SPEED.match(slug)
+    if not match:
+        return None
+    value, giga = match.groups()
+    return round(float(value) * (1_000 if giga else 1))
 
 
 def is_wired_type(interface_type_slug: str) -> bool:

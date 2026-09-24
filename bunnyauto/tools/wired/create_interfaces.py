@@ -1,9 +1,20 @@
-"""``wired create-interfaces`` — discover device interfaces and create the missing ones in NetBox.
+"""``wired create-interfaces`` — create the interfaces NetBox is missing, and correct their types.
 
 Ported from ``create_interfaces_netbox.py``. Plans by default; ``--apply`` writes.
-It never updates or deletes an interface — only creates ones NetBox is missing.
-Name matching and the NetBox type a new interface gets both come from
-:mod:`bunnyauto.netbox.interfaces`, shared with every other tool.
+It creates interfaces NetBox is missing and corrects the **type** of ones it has;
+it never changes anything else on an interface, and never deletes one. Name
+matching and interface types both come from :mod:`bunnyauto.netbox.interfaces`,
+shared with every other tool.
+
+**Types come from the device.** ``show interfaces`` (already run to list the
+ports) reports each port's media type: ``10/100/1000BaseTX``, ``SFP-10GBase-SR``,
+``Not Present``. That decides the NetBox type of a new interface, and an existing
+interface whose type disagrees is corrected (``1000base-t`` -> ``1000base-tx``).
+See :func:`~bunnyauto.netbox.interfaces.port_media` for the mapping. Only types
+the NetBox accepts are used (it's asked once per run). A port with no usable media
+type (Port-Channels, VLANs, ``unknown``) keeps its NetBox type, and a new one
+gets the old guess from its name. A media type bunnyauto can't map is noted,
+with its ports, and nothing is changed for it.
 
 **Stacks.** SSH to a stack lists every member's ports, but NetBox keeps each
 member as its own device (:mod:`bunnyauto.netbox.stacks`). A port is checked
@@ -45,11 +56,17 @@ from bunnyauto.netbox.devices import (
     select_tagged_inventory,
 )
 from bunnyauto.netbox.interfaces import (
+    PortMedia,
     canonical_name,
     interface_type,
+    media_is_blank,
     member_local_names,
+    port_media,
     stack_member,
+    supported_type,
+    type_fits,
 )
+from bunnyauto.netbox.records import choice_value
 from bunnyauto.netbox.stacks import Stack, is_stack_wide, own_interfaces, resolve_stack
 from bunnyauto.tools.base import Status, ToolResult, add_common_arguments
 
@@ -64,6 +81,28 @@ class DiscoveredInterface:
     name: str
     description: str = ""
     enabled: bool = True
+    #: ``show interfaces``' "media type is ..." (``10/100/1000BaseTX``), ``""`` if none.
+    media_type: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class _Existing:
+    """A NetBox interface: as much of it as this tool compares."""
+
+    id: int
+    name: str
+    type: str
+
+
+@dataclass(frozen=True, slots=True)
+class _Retype:
+    """A NetBox interface whose type disagrees with the device's media report."""
+
+    id: int
+    name: str
+    current: str
+    wanted: str
+    media: str
 
 
 @dataclass(slots=True)
@@ -77,6 +116,12 @@ class _DevicePlan:
     discovered: int = 0
     existing: int = 0
     missing: list[DiscoveredInterface] = field(default_factory=list)
+    #: Missing port -> the NetBox type it's created as.
+    types: dict[str, str] = field(default_factory=dict)
+    #: Interfaces here whose NetBox type the device's media report says is wrong.
+    retype: list[_Retype] = field(default_factory=list)
+    #: A media type bunnyauto can't map -> the ports that reported it.
+    unmapped: dict[str, list[str]] = field(default_factory=dict)
     #: Reported port -> the device-type template's member-1 name for it here.
     template_named: dict[str, str] = field(default_factory=dict)
     #: Reported Port-Channel/VLAN -> the other stack members that already have it.
@@ -84,6 +129,7 @@ class _DevicePlan:
     #: NetBox interface on this device -> the stack member it belongs on.
     misplaced: dict[str, str] = field(default_factory=dict)
     created: int = 0
+    retyped: int = 0
     error: str = ""
 
 
@@ -120,6 +166,7 @@ def parse_interfaces(rows: Any, include_virtual: bool) -> list[DiscoveredInterfa
                 name=name,
                 description=str(row.get("description") or "").strip(),
                 enabled=status not in _DISABLED_STATES,
+                media_type=str(row.get("media_type") or "").strip(),
             ),
         )
     return sorted(discovered.values(), key=lambda item: canonical_name(item.name))
@@ -143,7 +190,7 @@ def _collect(task: Task, include_virtual: bool) -> Result:
 @dataclass(slots=True)
 class CreateInterfaces:
     name: str = "create-interfaces"
-    summary: str = "Create NetBox interfaces that a device has but NetBox is missing"
+    summary: str = "Create the interfaces NetBox is missing and correct wrong interface types"
     writes: bool = True
     category: str = "wired"
 
@@ -200,6 +247,10 @@ class CreateInterfaces:
         checked_via: dict[int, str] = {}  # NetBox device id -> host its ports were seen on
         stacks_seen: dict[tuple[str, Any], str] = {}
         scope_label = ctx.scope().describe()
+        media_seen = any(
+            i.media_type for multi in run_result.values() for i in (_discovered(multi) or [])
+        )
+        supported = _supported_types(ctx, nb) if media_seen else None
 
         for host_name, multi in run_result.items():
             discovered = _discovered(multi)
@@ -229,7 +280,7 @@ class CreateInterfaces:
                     f"{host_name}: including {_names(stack.inherited)} as part of its "
                     f"Virtual Chassis, though outside this run's scope ({scope_label})"
                 )
-            for device_id in _classify(stack, discovered, index, plans, blocked):
+            for device_id in _classify(stack, discovered, index, plans, blocked, supported):
                 checked_via.setdefault(device_id, host_name)
 
         for host_name, message in unreachable.items():
@@ -247,20 +298,9 @@ class CreateInterfaces:
         ordered = sorted(plans.values(), key=lambda plan: str(plan.device.name).casefold())
         changes = _report(ctx, ordered, list(blocked.values()))
 
-        created_total = 0
         if ctx.settings.apply:
             for plan in ordered:
-                if not plan.missing:
-                    continue
-                try:
-                    plan.created = _create(nb, int(plan.device.id), plan.missing)
-                except Exception as exc:  # pynetbox RequestError etc.
-                    plan.error = f"create failed: {exc}"
-                    failures[str(plan.device.name)] = plan.error
-                    ctx.reporter.error(f"{plan.device.name}: {plan.error}")
-                    continue
-                created_total += plan.created
-                ctx.reporter.success(f"{plan.device.name}: created {plan.created} interface(s)")
+                _apply(ctx, nb, plan, failures)
 
         return _result(
             apply=ctx.settings.apply,
@@ -269,30 +309,73 @@ class CreateInterfaces:
             blocked=list(blocked.values()),
             failures=failures,
             progressed=bool(stacks_seen) and (not ordered or any(not p.error for p in ordered)),
-            created_total=created_total,
         )
+
+
+def _apply(ctx: Context, nb: Any, plan: _DevicePlan, failures: dict[str, str]) -> None:
+    """Create ``plan``'s missing interfaces and correct its wrong types."""
+    name = str(plan.device.name)
+    errors: list[str] = []
+    if plan.missing:
+        try:
+            plan.created = _create(nb, int(plan.device.id), plan.missing, plan.types)
+            ctx.reporter.success(f"{name}: created {plan.created} interface(s)")
+        except Exception as exc:  # pynetbox RequestError etc.
+            errors.append(f"create failed: {exc}")
+    if plan.retype:
+        try:
+            plan.retyped = _retype(nb, plan.retype)
+            ctx.reporter.success(f"{name}: corrected the type of {plan.retyped} interface(s)")
+        except Exception as exc:  # pynetbox RequestError etc.
+            errors.append(f"type update failed: {exc}")
+    for error in errors:
+        ctx.reporter.error(f"{name}: {error}")
+    if errors:
+        plan.error = "; ".join(errors)
+        failures[name] = plan.error
 
 
 def _names(devices: list[Any]) -> str:
     return ", ".join(sorted(str(device.name) for device in devices))
 
 
-def _interface_index(nb: Any, devices: list[Any]) -> dict[int, dict[str, str]]:
-    """Each device's NetBox interfaces as ``{canonical name: NetBox name}``, by device id."""
-    index: dict[int, dict[str, str]] = {}
+def _supported_types(ctx: Context, nb: Any) -> frozenset[str] | None:
+    """The interface type values this NetBox accepts, or ``None`` if it won't say."""
+    try:
+        choices = nb.dcim.interfaces.choices()["type"]
+        return frozenset(str(c["value"]) for c in choices if isinstance(c, dict) and "value" in c)
+    except Exception as exc:  # pynetbox RequestError, an unexpected OPTIONS shape, ...
+        ctx.reporter.warn(
+            f"could not read the interface types NetBox accepts ({exc}) — using only "
+            "long-standing ones, so a BaseTX port stays 1000base-t"
+        )
+        return None
+
+
+def _interface_index(nb: Any, devices: list[Any]) -> dict[int, dict[str, _Existing]]:
+    """Each device's NetBox interfaces as ``{canonical name: interface}``, by device id."""
+    index: dict[int, dict[str, _Existing]] = {}
     for device in devices:
         names = index[int(device.id)] = {}
         for record in own_interfaces(nb, device):
-            names.setdefault(canonical_name(str(record.name)), str(record.name))
+            names.setdefault(
+                canonical_name(str(record.name)),
+                _Existing(
+                    id=int(record.id),
+                    name=str(record.name),
+                    type=choice_value(getattr(record, "type", None)) or "",
+                ),
+            )
     return index
 
 
 def _classify(
     stack: Stack,
     discovered: list[DiscoveredInterface],
-    index: dict[int, dict[str, str]],
+    index: dict[int, dict[str, _Existing]],
     plans: dict[int, _DevicePlan],
     blocked: dict[tuple[str, int], _Blocked],
+    supported: frozenset[str] | None,
 ) -> set[int]:
     """File each discovered port under its device: present, missing, or ownerless.
 
@@ -303,7 +386,7 @@ def _classify(
         member = stack_member(iface.name) if stack.is_stack else None
         owner = stack.owner(iface.name)
         if owner is None:  # only a stack port (member is set) can lack an owner
-            _ownerless(stack, iface, int(member or 0), index, plans, blocked)
+            _ownerless(stack, iface, int(member or 0), index, plans, blocked, supported)
             continue
 
         owner_id = int(owner.id)
@@ -312,22 +395,26 @@ def _classify(
         plan.discovered += 1
         names = index.get(owner_id, {})
         wanted = canonical_name(iface.name)
-        if wanted in names:
+        if (found := names.get(wanted)) is not None:
             plan.existing += 1
-        elif member is not None and (template := _template_name(iface.name, names)):
-            plan.template_named[iface.name] = template
+            _check_type(plan, found, iface, supported)
+        elif member is not None and (template := _template_interface(iface.name, names)):
+            plan.template_named[iface.name] = template.name
+            _check_type(plan, template, iface, supported)
         elif holders := _stack_wide_holders(iface.name, stack, index, owner_id):
             plan.elsewhere[iface.name] = holders
         elif all(canonical_name(i.name) != wanted for i in plan.missing):
             plan.missing.append(iface)
+            reported = _reported_type(plan, iface, supported)
+            plan.types[iface.name] = reported[1] if reported else interface_type(iface.name)
 
         # Every member device carries the template's member-1 names, so only a copy
         # of a member-2+ port is unambiguously on the wrong device.
         if member is not None and member != 1:
             for other in stack.devices():
-                found = index.get(int(other.id), {}).get(wanted)
-                if found is not None and int(other.id) != owner_id:
-                    _plan(plans, other, stack).misplaced[found] = str(owner.name)
+                copy = index.get(int(other.id), {}).get(wanted)
+                if copy is not None and int(other.id) != owner_id:
+                    _plan(plans, other, stack).misplaced[copy.name] = str(owner.name)
     return checked
 
 
@@ -335,19 +422,23 @@ def _ownerless(
     stack: Stack,
     iface: DiscoveredInterface,
     member: int,
-    index: dict[int, dict[str, str]],
+    index: dict[int, dict[str, _Existing]],
     plans: dict[int, _DevicePlan],
     blocked: dict[tuple[str, int], _Blocked],
+    supported: frozenset[str] | None,
 ) -> None:
     """A port whose stack member has no in-scope device: present, or blocked."""
     # Already on the connected device means it's in NetBox where that device stands
     # in for the member (a modular chassis's line-card ports look like stack members).
     stand_in = stack.stand_in(iface.name)
-    if stand_in is not None and canonical_name(iface.name) in index.get(int(stand_in.id), {}):
-        plan = _plan(plans, stand_in, stack)
-        plan.discovered += 1
-        plan.existing += 1
-        return
+    if stand_in is not None:
+        found = index.get(int(stand_in.id), {}).get(canonical_name(iface.name))
+        if found is not None:
+            plan = _plan(plans, stand_in, stack)
+            plan.discovered += 1
+            plan.existing += 1
+            _check_type(plan, found, iface, supported)
+            return
 
     key = (str(stack.connected.name), member)
     item = blocked.get(key)
@@ -368,8 +459,8 @@ def _plan(plans: dict[int, _DevicePlan], device: Any, stack: Stack) -> _DevicePl
     return plan
 
 
-def _template_name(name: str, names: dict[str, str]) -> str | None:
-    """The device-type template's member-1 name for stack port ``name``, if present."""
+def _template_interface(name: str, names: dict[str, _Existing]) -> _Existing | None:
+    """The interface under the device-type template's member-1 name for stack port ``name``."""
     for alias in member_local_names(name):
         found = names.get(canonical_name(alias))
         if found is not None:
@@ -377,8 +468,40 @@ def _template_name(name: str, names: dict[str, str]) -> str | None:
     return None
 
 
+def _reported_type(
+    plan: _DevicePlan, iface: DiscoveredInterface, supported: frozenset[str] | None
+) -> tuple[PortMedia, str] | None:
+    """The device's media report for ``iface`` and the NetBox type it gives, if any.
+
+    A media type that isn't blank but can't be mapped is recorded on ``plan``.
+    """
+    port = port_media(iface.name, iface.media_type)
+    wanted = supported_type(port.types, supported) if port else None
+    if port is None or wanted is None:
+        if not media_is_blank(iface.media_type):
+            plan.unmapped.setdefault(iface.media_type, []).append(iface.name)
+        return None
+    return port, wanted
+
+
+def _check_type(
+    plan: _DevicePlan,
+    existing: _Existing,
+    iface: DiscoveredInterface,
+    supported: frozenset[str] | None,
+) -> None:
+    """Plan a type correction if ``existing`` disagrees with what the device reports."""
+    reported = _reported_type(plan, iface, supported)
+    if reported is None:
+        return
+    port, wanted = reported
+    if type_fits(port, existing.type, wanted) or any(r.id == existing.id for r in plan.retype):
+        return
+    plan.retype.append(_Retype(existing.id, existing.name, existing.type, wanted, port.media))
+
+
 def _stack_wide_holders(
-    name: str, stack: Stack, index: dict[int, dict[str, str]], owner_id: int
+    name: str, stack: Stack, index: dict[int, dict[str, _Existing]], owner_id: int
 ) -> list[str]:
     """Other stack members that already have Port-Channel/VLAN ``name``."""
     if not stack.is_stack or not is_stack_wide(name):
@@ -393,13 +516,25 @@ def _stack_wide_holders(
 
 def _report(ctx: Context, plans: list[_DevicePlan], blocked: list[_Blocked]) -> list[str]:
     """Emit each device's notes; return the planned-change lines."""
-    verb = "create" if ctx.settings.apply else "would create"
+    create, change = (
+        ("create", "change") if ctx.settings.apply else ("would create", "would change")
+    )
     changes: list[str] = []
     for plan in plans:
         name = str(plan.device.name)
         where = f" [stack member {plan.member}, seen on {plan.via}]" if plan.via else ""
         for iface in plan.missing:
-            changes.append(f"{name}: {verb} {iface.name} ({interface_type(iface.name)}){where}")
+            changes.append(f"{name}: {create} {iface.name} ({plan.types[iface.name]}){where}")
+        for item in plan.retype:
+            changes.append(
+                f"{name}: {change} {item.name} from {item.current or 'no type'} to {item.wanted} "
+                f"(device reports {item.media!r}){where}"
+            )
+        for media, ports in plan.unmapped.items():
+            ctx.reporter.info(
+                f"{name}: media type {media!r} on {len(ports)} port(s) (e.g. {ports[0]}) "
+                "isn't mapped to a NetBox type — not used to set their type"
+            )
         if plan.template_named:
             reported, template = next(iter(plan.template_named.items()))
             ctx.reporter.info(
@@ -436,7 +571,6 @@ def _result(
     blocked: list[_Blocked],
     failures: dict[str, str],
     progressed: bool,
-    created_total: int,
 ) -> ToolResult:
     data: dict[str, Any] = {}
     for plan in plans:
@@ -446,7 +580,15 @@ def _result(
             "existing": plan.existing,
             "missing": [i.name for i in plan.missing],
             "created": plan.created,
+            "retyped": plan.retyped,
         }
+        if plan.retype:
+            entry["retype"] = [
+                {"name": r.name, "from": r.current, "to": r.wanted, "media": r.media}
+                for r in plan.retype
+            ]
+        if plan.unmapped:
+            entry["unmapped_media"] = {k: list(v) for k, v in plan.unmapped.items()}
         if plan.via:
             entry["via"] = plan.via
         if plan.member is not None:
@@ -466,9 +608,13 @@ def _result(
         data.setdefault(name, {}).update({"ok": False, "error": message})
 
     blocked_ports = sum(len(item.ports) for item in blocked)
+    missing = sum(len(plan.missing) for plan in plans)
+    retypes = sum(len(plan.retype) for plan in plans)
+    created = sum(plan.created for plan in plans)
+    retyped = sum(plan.retyped for plan in plans)
     if failures or blocked_ports:
         status = Status.PARTIAL if progressed else Status.ERROR
-    elif apply and created_total:
+    elif apply and (created or retyped):
         status = Status.CHANGED
     elif changes:
         status = Status.DRIFT
@@ -476,13 +622,23 @@ def _result(
         status = Status.OK
 
     if apply:
-        summary = f"created {created_total} interface(s)"
+        summary = f"created {created} interface(s)"
+        if retypes:
+            summary += f", corrected the type of {retyped}"
     elif changes:
-        summary = f"{len(changes)} interface(s) missing from NetBox — run with --apply to create"
+        found = [f"{missing} interface(s) missing from NetBox"] if missing else []
+        if retypes:
+            found.append(
+                f"{retypes} with the wrong type"
+                if missing
+                else f"{retypes} interface(s) with the wrong type in NetBox"
+            )
+        verb = "create" if not retypes else "correct" if not missing else "create and correct"
+        summary = f"{', '.join(found)} — run with --apply to {verb}"
     elif blocked_ports:
-        summary = "no interfaces to create"
+        summary = "no interfaces to create or correct"
     else:
-        summary = "NetBox is in sync — no interfaces to create"
+        summary = "NetBox is in sync — no interfaces to create or correct"
     if blocked_ports:
         summary += (
             f"; {blocked_ports} stack port(s) skipped — their member has no NetBox device in scope"
@@ -493,12 +649,14 @@ def _result(
     return ToolResult(status=status, summary=summary, changes=changes, data=data)
 
 
-def _create(nb: Any, device_id: int, interfaces: list[DiscoveredInterface]) -> int:
+def _create(
+    nb: Any, device_id: int, interfaces: list[DiscoveredInterface], types: dict[str, str]
+) -> int:
     payload = [
         {
             "device": device_id,
             "name": iface.name,
-            "type": interface_type(iface.name),
+            "type": types.get(iface.name) or interface_type(iface.name),
             "enabled": iface.enabled,
             "description": iface.description,
         }
@@ -506,6 +664,12 @@ def _create(nb: Any, device_id: int, interfaces: list[DiscoveredInterface]) -> i
     ]
     created = nb.dcim.interfaces.create(payload)
     return len(created) if isinstance(created, list) else 1
+
+
+def _retype(nb: Any, retypes: list[_Retype]) -> int:
+    """Set each interface's type; nothing else on it is touched."""
+    updated = nb.dcim.interfaces.update([{"id": r.id, "type": r.wanted} for r in retypes])
+    return len(updated) if isinstance(updated, list) else len(retypes)
 
 
 def _discovered(multi) -> list[DiscoveredInterface] | None:
