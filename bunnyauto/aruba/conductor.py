@@ -9,8 +9,8 @@ Despite the name, this class talks to any AOS 8 box running this API — the
 Conductor itself, or one of its managed WLCs directly (each runs the identical
 ``/v1/api/login`` -> ``UIDARUBA`` -> ``/v1/configuration/showcommand`` service).
 ``wireless sync`` points one at each WLC's own address to reach per-AP data
-(LLDP neighbors, software version) that the Conductor's own aggregated view
-doesn't carry.
+(LLDP neighbors, software version, radio channels and SSIDs) that the
+Conductor's own aggregated view doesn't carry.
 
 Auth is the shared device login (``NORNIR_USERNAME`` / ``NORNIR_PASSWORD``). The
 password is sent as POST form data — never in a URL or in argv — and the session
@@ -132,6 +132,10 @@ class ArubaConductorClient:
         """Rows from ``show ap lldp neighbors`` (confirmed against real AOS 8
         hardware 2026-09-22) — each AP's wired LLDP neighbor, if any."""
         return _rows(self.showcommand("show ap lldp neighbors"))
+
+    def ap_bss_table(self) -> list[dict[str, Any]]:
+        """Rows from ``show ap bss-table``: one per SSID per radio, per AP."""
+        return _rows(self.showcommand("show ap bss-table"))
 
     def showcommand(self, command: str) -> dict[str, Any]:
         """Run one ``show`` command and return the parsed JSON object."""

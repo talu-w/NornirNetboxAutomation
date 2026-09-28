@@ -11,10 +11,11 @@ live data.
   WLCs and APs exist: name, serial, model, IP. Each is matched to NetBox by
   serial, then name.
 * **Each WLC, directly** (``show ap database long`` + ``show ap lldp
-  neighbors``), because the Conductor's aggregated view doesn't carry this
-  per-AP runtime data. Per AP: its software version, and its live wired uplinks,
-  meaning which of the AP's own ports (the LLDP ``Interface`` column, e.g.
-  ``eth1``) connects to which switch port. A WLC is reached at its NetBox
+  neighbors`` + ``show ap bss-table``), because the Conductor's aggregated view
+  doesn't carry this per-AP runtime data. Per AP: its software version, its
+  live wired uplinks (which of the AP's own ports, the LLDP ``Interface`` column
+  e.g. ``eth1``, connects to which switch port), and each radio's channel,
+  width, EIRP and SSIDs. A WLC is reached at its NetBox
   primary IPv4, or, if NetBox doesn't have one yet, at the IP the Conductor
   reports for it. Every WLC runs the same REST service as the Conductor
   (``--wlc-port``, default 4343).
@@ -67,6 +68,18 @@ live data.
   would need a deletion, so that's yellow for a person to fix. A path through a
   patch panel is in sync if it ends at the right port, else only noted.
 
+* **Radios** (APs, :mod:`bunnyauto.netbox.radios`; 2026-09-28, owner request):
+  each band's ``show ap bss-table`` rows fill the matching NetBox radio
+  interface (``2.4GHz WiFi`` / ``5GHz WiFi`` / ``6GHz WiFi``, as NetBox Data
+  Exchange device types name them) on every run: wireless role ``ap``, the
+  channel (Aruba's primary channel + width, e.g. ``52E``, converted to NetBox's
+  centre-channel value ``5g-58-5290-80``; frequency and width are sent with
+  it), transmit power (the reported EIRP, rounded) and its wireless LANs,
+  exactly the SSIDs it broadcasts. A reported SSID with no NetBox wireless LAN
+  gets one created (SSID only). A band NetBox has no radio interface for is
+  yellow; two radios on one band (dual 5 GHz), an unplaceable channel and an
+  SSID with two NetBox wireless LANs are notes.
+
 **Outcome.** Each device's line, and the run, is one of:
 
 * red, ``ERROR`` (exit 1): a device could not be created (no device-type or
@@ -84,9 +97,9 @@ role outside the wireless branch, and an AP role noted because NetBox has no AP
 role.
 
 Nothing is ever deleted, and no device type, site, role or platform is ever
-created. Plans by default; ``--apply`` writes. Auth is the shared device login
-(``NORNIR_USERNAME`` / ``NORNIR_PASSWORD``). TLS is verified unless
-``--aruba-insecure`` / ``--wlc-insecure``.
+created (wireless LANs are, SSID only). Plans by default; ``--apply`` writes.
+Auth is the shared device login (``NORNIR_USERNAME`` / ``NORNIR_PASSWORD``).
+TLS is verified unless ``--aruba-insecure`` / ``--wlc-insecure``.
 """
 
 from __future__ import annotations
@@ -102,6 +115,7 @@ from typing import TYPE_CHECKING, Any
 from bunnyauto.aruba.conductor import ArubaConductorClient
 from bunnyauto.aruba.inventory import WirelessDevice, parse_ap_database, parse_switches
 from bunnyauto.aruba.lldp import LldpNeighbor, parse_lldp_neighbors
+from bunnyauto.aruba.radios import Bss, parse_bss_table
 from bunnyauto.aruba.sitematch import Site, match_site
 from bunnyauto.common import env_flag, normalize_tags
 from bunnyauto.errors import ArubaError, ToolError
@@ -121,6 +135,13 @@ from bunnyauto.netbox.ipam import (
     load_prefixes,
     plan_primary_ip,
 )
+from bunnyauto.netbox.radios import (
+    load_channel_values,
+    load_wireless_lans,
+    plan_radio,
+    radio_interface,
+    rf_channel,
+)
 from bunnyauto.netbox.records import related_id
 from bunnyauto.netbox.roles import RoleTree, device_role_slug, require_role, role_field
 from bunnyauto.netbox.tokens import match_record
@@ -137,7 +158,8 @@ _NO_PREFIX = (
     "IP address could not be added/assigned at this time due to lack of an "
     "established prefix/IP range within NetBox."
 )
-_WLC_UNREAD = "could not read its APs' LLDP/version data"
+_WLC_UNREAD = "could not read its APs' LLDP/version/radio data"
+_BAND_ORDER = {"2.4": 0, "5": 1, "6": 2}
 
 
 @dataclass(slots=True)
@@ -158,6 +180,8 @@ class _Live:
 
     uplinks: dict[str, list[LldpNeighbor]] = field(default_factory=dict)
     versions: dict[str, str] = field(default_factory=dict)
+    #: ``show ap bss-table`` rows: one per SSID per radio.
+    radios: dict[str, list[Bss]] = field(default_factory=dict)
     #: WLC name -> why its AP data couldn't be read.
     failed: dict[str, str] = field(default_factory=dict)
     #: WLC name -> what querying it returned (the ``--json`` view).
@@ -206,6 +230,12 @@ class _Run:
     #: when NetBox has no such role.
     ap_role: Any
     ap_role_slug: str
+    #: The rf_channel values NetBox accepts (None: it wouldn't say).
+    channel_values: frozenset[str] | None = None
+    #: SSID -> its NetBox wireless LAN's id (0: one plan mode would create).
+    wlan_ids: dict[str, int] = field(default_factory=dict)
+    #: SSID -> (why it has no usable wireless LAN, whether that's a problem).
+    wlan_problems: dict[str, tuple[str, bool]] = field(default_factory=dict)
     interface_cache: dict[int, list[Any]] = field(default_factory=dict)
 
 
@@ -214,7 +244,7 @@ class WirelessSync:
     name: str = "sync"
     summary: str = (
         "Create/update NetBox WLCs and APs from the Conductor and each WLC: "
-        "IP on the AP's live uplink, platform, LLDP cabling"
+        "br0/bond0 and IP, platform, LLDP cabling, radio channels/power/SSIDs"
     )
     writes: bool = True
     category: str = "wireless"
@@ -372,6 +402,17 @@ class WirelessSync:
             else:
                 run_changes.append(f"would create NetBox tag {tag_slug!r}")
 
+        reported_ssids = sorted(
+            {
+                entry.ssid
+                for d in wireless
+                if d.kind == "ap"
+                for entry in live.radios.get(d.name.casefold(), [])
+                if entry.kind == "ap" and entry.ssid
+            }
+        )
+        wlan_ids, wlan_problems = _sync_wireless_lans(ctx, nb, reported_ssids, apply, run_changes)
+
         creating = any(m.action == "create" for m in matches)
         run = _Run(
             ctx=ctx,
@@ -392,6 +433,9 @@ class WirelessSync:
             role_key=role_field(nb),
             ap_role=ap_role,
             ap_role_slug=ap_role_slug,
+            channel_values=load_channel_values(nb) if has_aps and live.radios else None,
+            wlan_ids=wlan_ids,
+            wlan_problems=wlan_problems,
         )
 
         reports: list[_Report] = []
@@ -450,12 +494,18 @@ def _query_wlcs(
             ):
                 wlc_aps = parse_ap_database(client.ap_database())
                 rows = parse_lldp_neighbors(client.ap_lldp_neighbors())
+                bss = parse_bss_table(client.ap_bss_table())
         except ArubaError as exc:
             live.failed[wlc.name] = str(exc)
             live.wlcs[wlc.name] = {"url": url, "error": str(exc)}
             continue
 
-        live.wlcs[wlc.name] = {"url": url, "aps": len(wlc_aps), "lldp_neighbors": len(rows)}
+        live.wlcs[wlc.name] = {
+            "url": url,
+            "aps": len(wlc_aps),
+            "lldp_neighbors": len(rows),
+            "bss": len(bss),
+        }
         for ap in wlc_aps:
             if ap.os_version:
                 live.versions.setdefault(ap.name.casefold(), ap.os_version)
@@ -463,6 +513,10 @@ def _query_wlcs(
             seen = live.uplinks.setdefault(row.ap_name.casefold(), [])
             if row not in seen:  # an AP both a WLC and its standby report
                 seen.append(row)
+        for entry in bss:
+            known = live.radios.setdefault(entry.ap_name.casefold(), [])
+            if entry not in known:
+                known.append(entry)
     return live
 
 
@@ -533,6 +587,7 @@ def _sync_device(run: _Run, match: _Match) -> _Report:
         elif d.ip:
             interfaces = _sync_ip(run, match, device, interfaces, report, target=bridge)
         _sync_cables(run, device, interfaces, uplinks, report)
+        _sync_radios(run, d, interfaces, report)
     elif d.ip and match.action == "create":  # a new WLC; an existing one's IP is never touched
         _sync_ip(run, match, device, _interfaces(run, match, device), report)
     return report
@@ -795,6 +850,128 @@ def _sync_cable(
         )
         if _change(run, report, text, lambda: update_cable(run.nb, plan)) and run.apply:
             record_cable(plan, plan.cable_id, everywhere)
+    return entry
+
+
+def _sync_wireless_lans(
+    ctx: Context, nb: Any, ssids: list[str], apply: bool, run_changes: list[str]
+) -> tuple[dict[str, int], dict[str, tuple[str, bool]]]:
+    """Each reported SSID's NetBox wireless LAN, creating the missing ones (SSID only).
+
+    Returns ``(SSID -> id, SSID -> (problem, is it a failure))``. In plan mode a
+    missing wireless LAN gets id 0. Two wireless LANs with one SSID are
+    ambiguous: neither is picked.
+    """
+    ids: dict[str, int] = {}
+    problems: dict[str, tuple[str, bool]] = {}
+    if not ssids:
+        return ids, problems
+    existing = load_wireless_lans(nb)
+    for ssid in ssids:
+        found = existing.get(ssid, [])
+        if len(found) == 1:
+            ids[ssid] = int(found[0].id)
+        elif found:
+            problems[ssid] = (f"NetBox has {len(found)} wireless LANs with SSID {ssid!r}", False)
+        elif not apply:
+            ids[ssid] = 0
+            run_changes.append(f"would create wireless LAN {ssid!r}")
+        else:
+            try:
+                ids[ssid] = int(nb.wireless.wireless_lans.create({"ssid": ssid}).id)
+            except Exception as exc:  # pynetbox RequestError etc.
+                problems[ssid] = (f"wireless LAN {ssid!r} couldn't be created: {exc}", True)
+                ctx.reporter.warn(f"could not create wireless LAN {ssid!r} — {exc}")
+            else:
+                run_changes.append(f"create wireless LAN {ssid!r}")
+    return ids, problems
+
+
+def _sync_radios(run: _Run, d: WirelessDevice, interfaces: list[Any], report: _Report) -> None:
+    """Fill each radio interface with what ``show ap bss-table`` reports for its band."""
+    rows = [entry for entry in run.live.radios.get(d.name.casefold(), []) if entry.kind == "ap"]
+    if not rows:
+        note = "no radio data reported for this AP"
+        if run.live.failed:
+            note += " (not every WLC could be queried)"
+        report.detail["radio_note"] = note
+        return
+    by_band: dict[str, list[Bss]] = {}
+    for entry in rows:
+        by_band.setdefault(entry.band, []).append(entry)
+    report.detail["radios"] = [
+        _sync_radio(run, interfaces, band, by_band[band], report)
+        for band in sorted(by_band, key=lambda band: _BAND_ORDER.get(band, 9))
+    ]
+
+
+def _sync_radio(
+    run: _Run, interfaces: list[Any], band: str, rows: list[Bss], report: _Report
+) -> dict[str, Any]:
+    """Make one radio interface match one band's rows. Returns its ``--json`` entry."""
+    first = rows[0]
+    ssids = sorted({entry.ssid for entry in rows if entry.ssid})
+    entry: dict[str, Any] = {
+        "band": band,
+        "channel": first.channel_label,
+        "width": first.width,
+        "ssids": ssids,
+    }
+    if not band:
+        report.notes.append(
+            f"radio: SSIDs {', '.join(ssids)} were reported without a band — skipped"
+        )
+        return {**entry, "status": "skipped"}
+    channels = sorted({e.channel_label for e in rows})
+    if len(channels) > 1:
+        report.notes.append(
+            f"radio: {band} GHz is on more than one channel ({', '.join(channels)}), so two "
+            f"{band} GHz radios can't be told apart — skipped"
+        )
+        return {**entry, "status": "skipped"}
+    interface, why = radio_interface(interfaces, band)
+    if interface is None:
+        report.issues.append(f"radio {band} GHz: {why}")
+        return {**entry, "status": "blocked"}
+    name = str(interface.name)
+
+    channel = rf_channel(
+        band, first.channel, first.width, first.direction, values=run.channel_values
+    )
+    if channel is None:
+        report.notes.append(
+            f"radio {name!r}: channel {first.channel_label!r} ({first.width or '?'} MHz) can't "
+            "be placed in NetBox — channel left as is"
+        )
+    eirps = [e.eirp for e in rows if e.eirp is not None]
+    tx_power = max(-40, min(127, round(eirps[0]))) if eirps else None
+    problems = [run.wlan_problems[s] for s in ssids if s in run.wlan_problems]
+    for problem, is_issue in problems:
+        (report.issues if is_issue else report.notes).append(
+            f"radio {name!r}: {problem} — its wireless LANs are left as they are"
+        )
+    wlan_ids = None if problems else [run.wlan_ids[s] for s in ssids]
+
+    body = plan_radio(interface, channel=channel, tx_power=tx_power, wireless_lan_ids=wlan_ids)
+    entry.update(
+        interface=name,
+        rf_channel=channel.value if channel else None,
+        tx_power=tx_power,
+        status="in-sync" if not body else "changed",
+    )
+    if body:
+        parts = []
+        if "rf_role" in body:
+            parts.append("role 'ap'")
+        if "rf_channel" in body:
+            parts.append(f"channel {first.channel_label} ({first.width} MHz)")
+        if "tx_power" in body:
+            parts.append(f"tx power {tx_power} dBm")
+        if "wireless_lans" in body:
+            parts.append(f"SSIDs {', '.join(ssids) if ssids else '(none)'}")
+        text = f"set radio {name!r}: " + ", ".join(parts)
+        if not _change(run, report, text, lambda: interface.update(body)):
+            entry["status"] = "failed"
     return entry
 
 

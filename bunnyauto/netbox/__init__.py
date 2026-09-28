@@ -17,6 +17,7 @@ not copied into both.
 ``tokens``         terse vendor strings -> device types / platforms
 ``ipam``           containing-prefix lookup, primary-IP assignment
 ``bridging``       a Linux-style device's ports -> (bond0) -> br0, where its IP lives
-``cabling``        LLDP/CDP-style neighbor -> NetBox cable plan + create
+``cabling``        LLDP/CDP-style neighbor -> NetBox cable plan + create / re-point
+``radios``         a radio interface's channel, frequency, width, power, SSIDs
 =================  =========================================================
 """

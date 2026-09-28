@@ -88,7 +88,19 @@ class _Devices(_Endpoint):
 
 class _NB:
     def __init__(
-        self, *, roles, sites, types, devices, tags, prefixes, ips, interfaces, templates, cables
+        self,
+        *,
+        roles,
+        sites,
+        types,
+        devices,
+        tags,
+        prefixes,
+        ips,
+        interfaces,
+        templates,
+        cables,
+        wlans,
     ):
         self.version = "4.1"
         self.dcim = SimpleNamespace(
@@ -103,6 +115,7 @@ class _NB:
         self.dcim.devices = _Devices(devices, self)
         self.extras = SimpleNamespace(tags=_Endpoint(tags))
         self.ipam = SimpleNamespace(prefixes=_Endpoint(prefixes), ip_addresses=_Endpoint(ips))
+        self.wireless = SimpleNamespace(wireless_lans=_Endpoint(wlans))
 
 
 # The owner's wireless role branch (NetBox >= 4.3 nested roles):
@@ -132,6 +145,7 @@ def _nb(
     interfaces=(),
     ap_template=False,
     cables=(),
+    wlans=(),
 ):
     roles = [_BRANCH_ROLE] if with_branch else []
     wlc_role = _Rec(
@@ -176,6 +190,7 @@ def _nb(
         interfaces=list(interfaces),
         templates=templates,
         cables=list(cables),
+        wlans=list(wlans),
     )
 
 
@@ -285,7 +300,7 @@ class _Ctx:
 # --- fake Conductor / WLC client --------------------------------------
 
 
-def _aruba(monkeypatch, *, switches=(), aps=(), wlc_aps=None, lldp=(), errors=None):
+def _aruba(monkeypatch, *, switches=(), aps=(), wlc_aps=None, lldp=(), bss=(), errors=None):
     """The Conductor answers at CONDUCTOR; any other URL is a WLC.
 
     A WLC's ``show ap database long`` returns ``wlc_aps`` (default: the same
@@ -317,6 +332,9 @@ def _aruba(monkeypatch, *, switches=(), aps=(), wlc_aps=None, lldp=(), errors=No
 
         def ap_lldp_neighbors(self):
             return list(lldp)
+
+        def ap_bss_table(self):
+            return list(bss)
 
     monkeypatch.setattr(wireless_sync, "ArubaConductorClient", FakeClient)
     return calls
@@ -1247,7 +1265,7 @@ def test_failed_wlc_outside_the_device_filter_is_still_reported(monkeypatch):
     ctx = _Ctx(_nb(prefixes=[_prefix()]))
     result = TOOL.run(ctx, _args(only="aps"))
     assert result.status is Status.PARTIAL
-    assert ("warn", "hq-wlc01: could not read its APs' LLDP/version data — timed out") in (
+    assert ("warn", "hq-wlc01: could not read its APs' LLDP/version/radio data — timed out") in (
         ctx.reporter.lines
     )
 
@@ -1256,7 +1274,12 @@ def test_wlc_with_no_ap_data_is_informational(monkeypatch):
     _aruba(monkeypatch, switches=[WLC], aps=[AP], wlc_aps=[])
     result = TOOL.run(_Ctx(_nb(prefixes=[_prefix()])), _args(only="aps"))
     assert result.status is Status.DRIFT
-    assert result.data["wlcs"]["hq-wlc01"] == {"url": WLC_URL, "aps": 0, "lldp_neighbors": 0}
+    assert result.data["wlcs"]["hq-wlc01"] == {
+        "url": WLC_URL,
+        "aps": 0,
+        "lldp_neighbors": 0,
+        "bss": 0,
+    }
 
 
 # --- cables ---------------------------------------------------------------
@@ -1563,6 +1586,176 @@ def test_cable_create_failure_is_yellow(monkeypatch):
     result = _cabling_run(monkeypatch, nb, [LLDP], apply=True)
     assert result.status is Status.PARTIAL
     assert "termination already occupied" in _device(result)["issues"][0]
+
+
+# --- radios: channel, power, SSIDs ------------------------------------------
+
+
+def _radio(id_, name, device_id=100, **rf):
+    return _Rec(id=id_, device_id=device_id, name=name, type="ieee802.11ax", cable=None, **rf)
+
+
+def _bss(ssid, band="5", channel="52E", width=80, eirp="18.0", ap="hq-idf1-ap01", kind="ap"):
+    return {
+        "ap name": ap,
+        "ess": ssid,
+        "band/ht-mode/bandwidth": f"{band}GHz/HE/{width}MHz",
+        "ch/EIRP/max-EIRP": f"{channel}/{eirp}/23.0",
+        "type": kind,
+    }
+
+
+GUEST = "DavesAuto-Wireless-Guest"
+CORP_WLAN = _Rec(id=70, ssid="Corp")
+
+
+def _radio_run(monkeypatch, radios, bss, *, apply=False, wlans=(CORP_WLAN,)):
+    _aruba(monkeypatch, switches=[WLC], aps=[{**AP, "IP Address": ""}], bss=bss)
+    nb = _nb(
+        devices=[_ap()],
+        interfaces=[_iface(300, 100, "E0"), _iface(301, 100, "E1", "1000base-t"), _br0(), *radios],
+        wlans=list(wlans),
+    )
+    return nb, TOOL.run(_Ctx(nb, apply=apply), _args(only="aps"))
+
+
+def test_radios_get_channel_power_and_ssids_and_missing_wlans_are_created(monkeypatch):
+    radios = [_radio(320, "2.4GHz WiFi"), _radio(321, "5GHz WiFi")]
+    bss = [
+        _bss(GUEST, band="2.4", channel="1", width=20, eirp="10.0"),
+        _bss(GUEST),
+        _bss("Corp"),
+    ]
+    _, plan = _radio_run(monkeypatch, radios, bss)
+    assert plan.status is Status.DRIFT
+    assert plan.changes == [
+        f"would create wireless LAN {GUEST!r}",
+        "hq-idf1-ap01: would set radio '2.4GHz WiFi': role 'ap', channel 1 (20 MHz), "
+        f"tx power 10 dBm, SSIDs {GUEST}",
+        "hq-idf1-ap01: would set radio '5GHz WiFi': role 'ap', channel 52E (80 MHz), "
+        f"tx power 18 dBm, SSIDs Corp, {GUEST}",
+    ]
+
+    nb, result = _radio_run(monkeypatch, radios, bss, apply=True)
+    assert result.status is Status.CHANGED
+    (created,) = nb.wireless.wireless_lans.created
+    assert created == {"ssid": GUEST}
+    guest_id = nb.wireless.wireless_lans.get(ssid=GUEST).id
+    assert radios[0].updates == [
+        {
+            "rf_role": "ap",
+            "rf_channel": "2.4g-1-2412-22",
+            "rf_channel_frequency": 2412.0,
+            "rf_channel_width": 22.0,
+            "tx_power": 10,
+            "wireless_lans": [guest_id],
+        }
+    ]
+    assert radios[1].updates[0]["rf_channel"] == "5g-58-5290-80"
+    assert radios[1].updates[0]["wireless_lans"] == [70, guest_id]
+    assert [r["status"] for r in _device(result)["radios"]] == ["changed", "changed"]
+
+
+def test_radios_that_already_match_are_in_sync(monkeypatch):
+    radio = _radio(
+        321,
+        "5GHz WiFi",
+        rf_role="ap",
+        rf_channel="5g-58-5290-80",
+        rf_channel_frequency=5290.0,
+        rf_channel_width=80.0,
+        tx_power=18,
+        wireless_lans=[_Rec(id=70)],
+    )
+    _, result = _radio_run(monkeypatch, [radio], [_bss("Corp")], apply=True)
+    assert result.status is Status.OK
+    assert result.changes == [] and not hasattr(radio, "updates")
+    assert _device(result)["radios"][0]["status"] == "in-sync"
+
+
+def test_an_airmatch_channel_change_updates_only_the_channel(monkeypatch):
+    radio = _radio(
+        321,
+        "5GHz WiFi",
+        rf_role="ap",
+        rf_channel="5g-42-5210-80",
+        rf_channel_frequency=5210.0,
+        rf_channel_width=80.0,
+        tx_power=18,
+        wireless_lans=[_Rec(id=70)],
+    )
+    _, result = _radio_run(monkeypatch, [radio], [_bss("Corp")], apply=True)
+    assert result.changes == ["hq-idf1-ap01: set radio '5GHz WiFi': channel 52E (80 MHz)"]
+    assert radio.updates == [
+        {"rf_channel": "5g-58-5290-80", "rf_channel_frequency": 5290.0, "rf_channel_width": 80.0}
+    ]
+
+
+def test_a_band_netbox_has_no_radio_for_is_yellow(monkeypatch):
+    bss = [_bss("Corp", band="6", channel="37S", width=160)]
+    _, result = _radio_run(monkeypatch, [_radio(321, "5GHz WiFi")], bss)
+    assert result.status is Status.PARTIAL
+    assert _device(result)["issues"] == [
+        "radio 6 GHz: NetBox has no 6 GHz radio interface on it (named like '6GHz WiFi')"
+    ]
+
+
+def test_two_radios_on_one_band_are_skipped_with_a_note(monkeypatch):
+    """An AP in dual-5GHz mode: the table can't say which radio is which."""
+    bss = [_bss("Corp", channel="36E"), _bss("Corp", channel="149E")]
+    radio = _radio(321, "5GHz WiFi")
+    _, result = _radio_run(monkeypatch, [radio], bss, apply=True)
+    assert result.status is Status.OK
+    assert not hasattr(radio, "updates")
+    assert "can't be told apart" in _device(result)["notes"][0]
+
+
+def test_duplicate_wlans_leave_the_radios_wlan_list_alone(monkeypatch):
+    radio = _radio(321, "5GHz WiFi")
+    wlans = (CORP_WLAN, _Rec(id=71, ssid="Corp"))
+    _, result = _radio_run(monkeypatch, [radio], [_bss("Corp")], apply=True, wlans=wlans)
+    assert result.status is Status.CHANGED  # a note, not a problem
+    assert "wireless_lans" not in radio.updates[0]
+    assert "NetBox has 2 wireless LANs with SSID 'Corp'" in _device(result)["notes"][0]
+
+
+def test_a_wlan_that_cannot_be_created_is_yellow(monkeypatch):
+    radio = _radio(321, "5GHz WiFi")
+    _aruba(monkeypatch, switches=[WLC], aps=[{**AP, "IP Address": ""}], bss=[_bss(GUEST)])
+    nb = _nb(devices=[_ap()], interfaces=[_iface(300, 100, "E0"), _br0(), radio])
+
+    def refuse(body):
+        raise RuntimeError("permission denied")
+
+    nb.wireless.wireless_lans.create = refuse
+    result = TOOL.run(_Ctx(nb, apply=True), _args(only="aps"))
+    assert result.status is Status.PARTIAL
+    assert "wireless_lans" not in radio.updates[0]
+    assert "couldn't be created: permission denied" in _device(result)["issues"][0]
+
+
+def test_a_new_aps_radios_are_filled_from_its_template(monkeypatch):
+    _aruba(monkeypatch, switches=[WLC], aps=[{**AP, "IP Address": ""}], bss=[_bss("Corp")])
+    nb = _nb(ap_template=True, wlans=[CORP_WLAN])
+    plan = TOOL.run(_Ctx(nb), _args(only="aps"))
+    assert (
+        "hq-idf1-ap01: would set radio '5GHz WiFi': role 'ap', channel 52E (80 MHz), "
+        "tx power 18 dBm, SSIDs Corp"
+    ) in plan.changes
+
+    TOOL.run(_Ctx(nb, apply=True), _args(only="aps"))
+    ap = nb.dcim.devices.get(name="hq-idf1-ap01")
+    radio = nb.dcim.interfaces.get(device_id=ap.id, name="5GHz WiFi")
+    assert radio.updates[0]["rf_channel"] == "5g-58-5290-80"
+    assert radio.updates[0]["wireless_lans"] == [70]
+
+
+def test_air_monitors_have_no_radio_data(monkeypatch):
+    radio = _radio(321, "5GHz WiFi")
+    _, result = _radio_run(monkeypatch, [radio], [_bss("", kind="am")], apply=True)
+    assert result.status is Status.OK
+    assert not hasattr(radio, "updates")
+    assert _device(result)["radio_note"] == "no radio data reported for this AP"
 
 
 # --- registration ---------------------------------------------------------
