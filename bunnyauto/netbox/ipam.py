@@ -10,11 +10,11 @@ guessing, the same rule as :func:`bunnyauto.aruba.sitematch.match_site`.
 They are the one way a tool puts an IP on a device's wired interface and makes
 it the device's primary IP, so any future onboarding tool (wired or otherwise)
 does it the same way. Planning is separate from writing, so plan mode shows the
-exact interface before anything changes. When the device itself reports which
-port it's connected on (an AP's LLDP ``Interface``), that port wins, and an IP
-NetBox has on another of the device's interfaces is **moved** there. Without
-that, an IP is never moved. Nothing here creates a Prefix or an IP Range, or
-takes an IP another device's interface already holds.
+exact interface before anything changes. When the caller knows which interface
+holds the IP (an AP's ``br0`` bridge, see :mod:`bunnyauto.netbox.bridging`), that
+interface wins, and an IP NetBox has on another of the device's interfaces is
+**moved** there. Without that, an IP is never moved. Nothing here creates a
+Prefix or an IP Range, or takes an IP another device's interface already holds.
 """
 
 from __future__ import annotations
@@ -23,14 +23,14 @@ import ipaddress
 from dataclasses import dataclass
 from typing import Any, NamedTuple
 
-from bunnyauto.netbox.interfaces import match_interface, pick_wired_record
+from bunnyauto.netbox.interfaces import pick_wired_record
 from bunnyauto.netbox.records import related_id
 
 IPAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
 IPNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
 
 #: Created only when a device has no wired interface at all (no device-type
-#: template) and didn't report the port it's connected on — a last resort.
+#: template) and the caller named no interface — a last resort.
 FALLBACK_INTERFACE_NAME = "Ethernet0"
 
 
@@ -77,8 +77,8 @@ class IpPlan:
     interface_name: str = ""
     #: The target interface's id; ``None`` when it has to be created first.
     interface_id: int | None = None
-    #: Why that interface: ``"live"`` (the device reports it's connected there),
-    #: ``"netbox"`` (the IP is already on it), ``"first-wired"`` or ``"fallback"``.
+    #: Why that interface: ``"requested"`` (the caller named it), ``"netbox"``
+    #: (the IP is already on it), ``"first-wired"`` or ``"fallback"``.
     source: str = ""
     #: The existing NetBox IP record; ``None`` means create one.
     ip: Any = None
@@ -112,7 +112,7 @@ def plan_primary_ip(
     address: str,
     vrf_id: int | None,
     interfaces: list[Any],
-    live_ports: list[str] | None = None,
+    interface_name: str | None = None,
     existing_ips: list[Any] | None = None,
     primary_ip_id: int | None = None,
 ) -> IpPlan:
@@ -127,14 +127,11 @@ def plan_primary_ip(
 
     The interface, in order:
 
-    1. ``live_ports``, the ports the device itself reports it's connected on (an
-       AP's LLDP ``Interface``, ``eth1`` ≡ ``E1``). With more than one, the one
-       the IP is already on stays; otherwise the first by name. If none of them
-       exists on the device: a device with no wired interface at all gets the
-       reported port created, but one with other wired ports is **blocked**,
-       since NetBox and the device disagree about its hardware.
-    2. Without live ports, the interface of this device the IP is already on. It
-       is never moved on a guess.
+    1. ``interface_name``, when the caller knows where the IP lives (an AP's
+       ``br0``): that interface, created if the device doesn't have it. An IP on
+       another of the device's interfaces is moved there.
+    2. Otherwise, the interface of this device the IP is already on. It is never
+       moved on a guess.
     3. The device's first wired interface by name, or, when it has none,
        :data:`FALLBACK_INTERFACE_NAME` (created).
 
@@ -165,28 +162,13 @@ def plan_primary_ip(
                 )
                 return plan
 
-    names = [str(i.name) for i in interfaces]
-    live: list[str] = []
-    for port in live_ports or []:
-        name = match_interface(port, names)
-        if name is not None and name not in live:
-            live.append(name)
-
     target = None
-    if live_ports:
-        plan.source = "live"
-        if live:
-            keep = current is not None and str(current.name) in live
-            target = current if keep else next(i for i in interfaces if str(i.name) == min(live))
-        elif pick_wired_record(interfaces) is None:
-            plan.interface_name = live_ports[0]
-        else:
-            plan.blocked = True
-            plan.note = (
-                f"the device reports it's connected on {', '.join(live_ports)}, but its "
-                "NetBox interfaces have no match — left alone"
-            )
-            return plan
+    if interface_name:
+        plan.source = "requested"
+        wanted = interface_name.casefold()
+        target = next((i for i in interfaces if str(i.name).casefold() == wanted), None)
+        if target is None:
+            plan.interface_name = interface_name
     elif current is not None:
         target, plan.source = current, "netbox"
     else:

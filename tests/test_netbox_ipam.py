@@ -80,34 +80,42 @@ def _plan(**kw):
     return plan_primary_ip(**kw)
 
 
-def test_new_ip_goes_on_the_live_port():
-    plan = _plan(live_ports=["eth1"])
-    assert (plan.interface_name, plan.interface_id, plan.source) == ("E1", 2, "live")
+BR0 = _iface(4, "br0", "bridge")
+
+
+def test_new_ip_goes_on_the_requested_interface():
+    plan = _plan(interfaces=[*AP_PORTS, BR0], interface_name="br0")
+    assert (plan.interface_name, plan.interface_id, plan.source) == ("br0", 4, "requested")
     assert plan.ip is None and plan.set_primary
 
 
-def test_existing_ip_on_another_port_moves_to_the_live_port():
-    plan = _plan(live_ports=["eth1"], existing_ips=[_ip(1)], primary_ip_id=99)
-    assert plan.moved_from == "E0" and plan.attach
-    assert plan.interface_id == 2
+def test_existing_ip_on_a_port_moves_to_the_requested_interface():
+    """An AP's IP NetBox had on E0 (from before 2026-09-28) moves to its br0."""
+    plan = _plan(
+        interfaces=[*AP_PORTS, BR0], interface_name="br0", existing_ips=[_ip(1)], primary_ip_id=99
+    )
+    assert (plan.moved_from, plan.attach, plan.interface_id) == ("E0", True, 4)
     assert not plan.set_primary
 
 
-def test_with_two_live_ports_the_ip_stays_on_the_one_it_is_on():
-    plan = _plan(live_ports=["eth0", "eth1"], existing_ips=[_ip(2)], primary_ip_id=99)
-    assert plan.in_sync and plan.interface_name == "E1"
+def test_ip_already_on_the_requested_interface_is_in_sync():
+    plan = _plan(
+        interfaces=[*AP_PORTS, BR0], interface_name="BR0", existing_ips=[_ip(4)], primary_ip_id=99
+    )
+    assert plan.in_sync and plan.interface_name == "br0"
 
 
-def test_with_two_live_ports_a_new_ip_goes_on_the_first_by_name():
-    assert _plan(live_ports=["eth1", "eth0"]).interface_name == "E0"
+def test_a_requested_interface_the_device_lacks_is_created():
+    plan = _plan(interface_name="br0")
+    assert (plan.interface_name, plan.interface_id, plan.source) == ("br0", None, "requested")
 
 
-def test_without_live_ports_an_ip_is_never_moved():
+def test_without_a_requested_interface_an_ip_is_never_moved():
     plan = _plan(existing_ips=[_ip(2)], primary_ip_id=99)
     assert plan.in_sync and plan.source == "netbox"
 
 
-def test_without_live_ports_a_new_ip_goes_on_the_first_wired_port():
+def test_without_a_requested_interface_a_new_ip_goes_on_the_first_wired_port():
     plan = _plan()
     assert (plan.interface_name, plan.source) == ("E0", "first-wired")
 
@@ -115,16 +123,6 @@ def test_without_live_ports_a_new_ip_goes_on_the_first_wired_port():
 def test_no_wired_port_falls_back_to_creating_ethernet0():
     plan = _plan(interfaces=[_iface(3, "5GHz WiFi", "ieee802.11ax")])
     assert (plan.interface_name, plan.interface_id, plan.source) == ("Ethernet0", None, "fallback")
-
-
-def test_no_wired_port_but_a_live_one_creates_the_live_port():
-    plan = _plan(interfaces=[], live_ports=["eth1"])
-    assert (plan.interface_name, plan.interface_id) == ("eth1", None)
-
-
-def test_live_port_missing_from_a_device_with_other_wired_ports_is_blocked():
-    plan = _plan(interfaces=[_iface(1, "E0")], live_ports=["eth1"])
-    assert plan.blocked and "eth1" in plan.note
 
 
 def test_ip_on_another_devices_interface_is_blocked():
@@ -159,7 +157,7 @@ def test_ipv6_sets_primary_ip6():
 def test_a_preview_of_a_device_not_created_yet_holds_no_ip():
     """A device not created yet is previewed from its template with id 0: an IP
     some real interface already holds is someone else's, never this device's."""
-    preview = [_iface(0, "E0"), _iface(0, "E1")]
+    preview = [_iface(0, "E0"), _iface(0, "E1"), _iface(0, "br0", "bridge")]
     assert _plan(interfaces=preview, existing_ips=[_ip(5)]).blocked
-    plan = _plan(interfaces=preview, live_ports=["eth1"])
-    assert (plan.interface_name, plan.interface_id, plan.ip) == ("E1", 0, None)
+    plan = _plan(interfaces=preview, interface_name="br0")
+    assert (plan.interface_name, plan.interface_id, plan.ip) == ("br0", 0, None)

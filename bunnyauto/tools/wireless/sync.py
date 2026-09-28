@@ -41,18 +41,24 @@ live data.
   an unprovisioned AP reports its MAC as its name.
 * **Platform** (APs): the reported version (``"8.10.0.5"``) is matched, never
   created, against a NetBox Platform like ``"AOS 8"``.
+* **Bridge and bond** (APs, :mod:`bunnyauto.netbox.bridging`; 2026-09-28): an
+  AP holds its IP on a software bridge, not a port, so every AP gets a ``br0``
+  interface (type ``bridge``). The ports the AP's LLDP reports a neighbor on are
+  its uplinks: one is linked straight to ``br0`` (its ``bridge`` field); two
+  (``E0`` and ``E1``, each to its own switch) become members of a ``bond0`` LAG,
+  which is linked to ``br0``. Nothing is unlinked or removed: ``bond0`` stays
+  once it exists.
 * **IP** (every new device, and every AP): the reported IP, with the mask and
   VRF of the most specific NetBox Prefix containing it, as the device's primary
-  IP (:mod:`bunnyauto.netbox.ipam`), on the port the AP reports as its LLDP
-  uplink. An IP NetBox has on another of the AP's interfaces is **moved**: an AP
-  NetBox has on ``E0`` that reports ``eth1`` ends up on ``E1``. Without LLDP
-  data an IP is never moved; a new device's goes on its first wired interface
-  and an existing one stays where it is. A WLC's IP is only set when this tool
-  creates the WLC: an existing WLC's primary IPv4 is the address this tool logs
-  into, so Conductor data never changes it. An IP no Prefix contains is not
-  created (no Prefix or IP Range is ever created).
+  IP (:mod:`bunnyauto.netbox.ipam`). An AP's goes on ``br0``, and an IP NetBox
+  has on one of its ports (``E0``/``E1``, from before 2026-09-28) is **moved**
+  there. A new WLC's goes on its first wired interface. A WLC's IP is only set
+  when this tool creates the WLC: an existing WLC's primary IPv4 is the address
+  this tool logs into, so Conductor data never changes it. An IP no Prefix
+  contains is not created (no Prefix or IP Range is ever created).
 * **Cables** (APs): one per LLDP neighbor, from the AP's reported port to the
-  switch port (:mod:`bunnyauto.netbox.cabling`, stack members resolved by
+  switch port, so an AP with each port on its own switch gets both cables
+  (:mod:`bunnyauto.netbox.cabling`, stack members resolved by
   ``<host>-<member>``). An interface that already has a cable is **never
   touched**, only noted. The note says so when the switch port is cabled to a
   different port on the same AP; moving that cable is left to a person.
@@ -93,6 +99,7 @@ from bunnyauto.aruba.lldp import LldpNeighbor, parse_lldp_neighbors
 from bunnyauto.aruba.sitematch import Site, match_site
 from bunnyauto.common import env_flag, normalize_tags
 from bunnyauto.errors import ArubaError, ToolError
+from bunnyauto.netbox.bridging import apply_bridge_step, plan_uplink_bridge
 from bunnyauto.netbox.cabling import create_cable, plan_neighbor_cable
 from bunnyauto.netbox.devices import add_tag
 from bunnyauto.netbox.ipam import (
@@ -506,14 +513,17 @@ def _sync_device(run: _Run, match: _Match) -> _Report:
     if d.kind == "wlc" and d.name in run.live.failed:
         report.issues.append(f"{_WLC_UNREAD} — {run.live.failed[d.name]}")
 
-    uplinks = run.live.uplinks.get(d.name.casefold(), []) if d.kind == "ap" else []
-    interfaces: list[Any] | None = None
     if d.kind == "ap":
         _sync_platform(run, d, device, report)
-    if d.ip and (match.action == "create" or d.kind == "ap"):
-        interfaces = _sync_ip(run, match, device, _interfaces(run, match, device), uplinks, report)
-    if d.kind == "ap":
-        _sync_cables(run, match, device, interfaces, uplinks, report)
+        uplinks = run.live.uplinks.get(d.name.casefold(), [])
+        interfaces, bridge = _sync_bridge(run, match, device, uplinks, report)
+        if d.ip and bridge is None:
+            report.issues.append(f"IP {d.ip}: not placed, because its bridge couldn't be created")
+        elif d.ip:
+            interfaces = _sync_ip(run, match, device, interfaces, report, target=bridge)
+        _sync_cables(run, device, interfaces, uplinks, report)
+    elif d.ip and match.action == "create":  # a new WLC; an existing one's IP is never touched
+        _sync_ip(run, match, device, _interfaces(run, match, device), report)
     return report
 
 
@@ -625,15 +635,50 @@ def _sync_platform(run: _Run, d: WirelessDevice, device: Any, report: _Report) -
     )
 
 
+def _sync_bridge(
+    run: _Run, match: _Match, device: Any, uplinks: list[LldpNeighbor], report: _Report
+) -> tuple[list[Any], str | None]:
+    """Give an AP its ``br0``, plus ``bond0`` when two uplinks are cabled.
+
+    Returns the AP's interfaces afterwards (previews in plan mode) and the
+    bridge's name, or ``None`` if the bridge couldn't be created.
+    """
+    interfaces = _interfaces(run, match, device)
+    plan = plan_uplink_bridge(interfaces, [row.local_port for row in uplinks if row.local_port])
+    report.detail.update(bridge=plan.bridge, bond=plan.bond or None, uplinks=plan.uplinks)
+    report.notes.extend(plan.notes)
+
+    records = {str(i.name): i for i in interfaces}
+    for step in plan.steps:
+        written = _change(
+            run,
+            report,
+            step.text,
+            lambda step=step: apply_bridge_step(run.nb, device, step, records),
+        )
+        if not written:
+            break  # the later steps build on this one
+        if not run.apply and step.create_type:
+            records[step.interface] = SimpleNamespace(
+                id=0, name=step.interface, type=step.create_type, cable=None
+            )
+    return list(records.values()), plan.bridge if plan.bridge in records else None
+
+
 def _sync_ip(
     run: _Run,
     match: _Match,
     device: Any,
     interfaces: list[Any],
-    uplinks: list[LldpNeighbor],
     report: _Report,
+    *,
+    target: str | None = None,
 ) -> list[Any]:
-    """Put the reported IP where it belongs. Returns the interfaces, plus any it had to add."""
+    """Put the reported IP on ``target`` (an AP's bridge), or where it already is.
+
+    Without a target (a new WLC), the device's first wired interface. Returns the
+    interfaces, plus any it had to add.
+    """
     d = match.device
     try:
         addr = ipaddress.ip_address(d.ip)
@@ -651,7 +696,7 @@ def _sync_ip(
         address=cidr,
         vrf_id=prefix.vrf_id,
         interfaces=interfaces,
-        live_ports=[row.local_port for row in uplinks if row.local_port],
+        interface_name=target,
         existing_ips=list(run.nb.ipam.ip_addresses.filter(address=cidr)),
         primary_ip_id=related_id(getattr(device, primary_field, None)),
     )
@@ -676,9 +721,8 @@ def _sync_ip(
 
 def _sync_cables(
     run: _Run,
-    match: _Match,
     device: Any,
-    interfaces: list[Any] | None,
+    interfaces: list[Any],
     uplinks: list[LldpNeighbor],
     report: _Report,
 ) -> None:
@@ -688,8 +732,6 @@ def _sync_cables(
             note += " (not every WLC could be queried)"
         report.detail["cable_note"] = note
         return
-    if interfaces is None:
-        interfaces = _interfaces(run, match, device)
 
     cables: list[dict[str, Any]] = []
     for row in uplinks:
@@ -764,8 +806,6 @@ def _describe_ip(plan: IpPlan) -> str:
     target = repr(plan.interface_name)
     if plan.interface_id is None:
         target += " (new interface)"
-    if plan.source == "live":
-        target += " (the AP's LLDP uplink)"
     if plan.ip is None:
         return f"create IP address {plan.address}, attach to {target} and set as {primary}"
     if plan.moved_from:

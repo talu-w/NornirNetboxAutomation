@@ -16,6 +16,7 @@ not copied into both.
                    ``<host>-<member>`` names)
 ``tokens``         terse vendor strings -> device types / platforms
 ``ipam``           containing-prefix lookup, primary-IP assignment
+``bridging``       a Linux-style device's ports -> (bond0) -> br0, where its IP lives
 ``cabling``        LLDP/CDP-style neighbor -> NetBox cable plan + create
 =================  =========================================================
 """

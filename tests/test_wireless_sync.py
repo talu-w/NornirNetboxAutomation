@@ -183,12 +183,26 @@ def _iface(id_, device_id, name, type_="2.5gbase-t", cable=None):
     return _Rec(id=id_, device_id=device_id, name=name, type=type_, cable=cable)
 
 
-def _ap_ports(device_id=100, *, e0_cable=None, e1_cable=None):
-    return [
+BR0_ID = 310
+
+
+def _br0(device_id=100):
+    return _iface(BR0_ID, device_id, "br0", "bridge")
+
+
+def _ap_ports(device_id=100, *, e0_cable=None, e1_cable=None, br0=False, linked=()):
+    """E0/E1 and a radio. ``br0`` adds the AP's bridge; ``linked`` ports are bridged to it."""
+    ports = [
         _iface(300, device_id, "E0", cable=e0_cable),
         _iface(301, device_id, "E1", "1000base-t", cable=e1_cable),
         _iface(302, device_id, "5GHz WiFi", "ieee802.11ax"),
     ]
+    for port in ports:
+        if port.name in linked:
+            port.bridge = _Rec(id=BR0_ID)
+    if br0 or linked:
+        ports.append(_br0(device_id))
+    return ports
 
 
 SWITCH = _Rec(id=200, name="hq-idf1-sw01")
@@ -515,7 +529,7 @@ def test_existing_ap_role_failing_to_change_is_yellow(monkeypatch):
 def test_existing_ap_without_an_ap_role_in_netbox_only_notes_its_role(monkeypatch):
     _aruba(monkeypatch, aps=[{**AP, "IP Address": ""}])
     ap = _ap(role=_Rec(slug="wireless-network"))
-    nb = _nb(devices=[ap], with_ap_role=False)
+    nb = _nb(devices=[ap], with_ap_role=False, interfaces=[_br0()])
     ctx = _Ctx(nb, apply=True)
     result = TOOL.run(ctx, _args())
     assert result.status is Status.OK
@@ -734,91 +748,100 @@ def test_missing_tag_is_created_on_apply(monkeypatch):
     assert nb.extras.tags.created == [{"name": "nornirtest", "slug": "nornirtest"}]
 
 
-# --- IP: new devices -----------------------------------------------------
+# --- IP and the AP's bridge: new devices ----------------------------------
 
 
-def test_new_device_ip_without_a_template_falls_back_to_ethernet0(monkeypatch):
-    _aruba(monkeypatch, aps=[AP])
-    nb = _nb(prefixes=[_prefix()])
-
-    plan = TOOL.run(_Ctx(nb), _args())
-    assert (
-        "hq-idf1-ap01: would create IP address 10.1.1.1/24, attach to 'Ethernet0' "
-        "(new interface) and set as primary IPv4"
-    ) in plan.changes
-
-    result = TOOL.run(_Ctx(nb, apply=True), _args())
-    assert result.status is Status.CHANGED
-    (device,) = nb.dcim.devices.created
-    (iface,) = nb.dcim.interfaces.created
-    assert iface["name"] == "Ethernet0" and iface["type"] == "other"
-    (body,) = nb.ipam.ip_addresses.created
-    assert body["address"] == "10.1.1.1/24"
-    assert body["status"] == "active"
-    assert body["assigned_object_type"] == "dcim.interface"
-    new_device = nb.dcim.devices.get(name="hq-idf1-ap01")
-    assert new_device.primary_ip4 == nb.ipam.ip_addresses.all()[0].id
-
-
-def test_new_device_without_lldp_uses_the_templates_first_wired_port_never_a_radio(monkeypatch):
+def test_new_ap_gets_a_br0_that_holds_its_ip(monkeypatch):
+    """An AP holds its IP on a software bridge (br0), never on E0/E1 or a radio."""
     _aruba(monkeypatch, aps=[AP])
     nb = _nb(prefixes=[_prefix()], ap_template=True)
 
     plan = TOOL.run(_Ctx(nb), _args())
-    assert (
-        "hq-idf1-ap01: would create IP address 10.1.1.1/24, attach to 'E0' and set as primary IPv4"
-    ) in plan.changes
+    assert plan.changes[1:] == [
+        "hq-idf1-ap01: would create interface 'br0' (bridge)",
+        "hq-idf1-ap01: would create IP address 10.1.1.1/24, attach to 'br0' and set as "
+        "primary IPv4",
+    ]
 
     result = TOOL.run(_Ctx(nb, apply=True), _args())
-    assert nb.dcim.interfaces.created == []  # E0 came with the device, never recreated
-    e0 = nb.dcim.interfaces.get(name="E0")
-    assert nb.ipam.ip_addresses.created[0]["assigned_object_id"] == e0.id
-    assert _device(result)["ip_interface"] == "E0"
-    assert _device(result)["ip_interface_source"] == "first-wired"
+    assert result.status is Status.CHANGED
+    ap = nb.dcim.devices.get(name="hq-idf1-ap01")
+    br0 = nb.dcim.interfaces.get(device_id=ap.id, name="br0")
+    assert nb.dcim.interfaces.created == [{"device": ap.id, "name": "br0", "type": "bridge"}]
+    (ip,) = nb.ipam.ip_addresses.created
+    assert ip["assigned_object_id"] == br0.id
+    assert ap.primary_ip4 == nb.ipam.ip_addresses.all()[0].id
+    assert not hasattr(nb.dcim.interfaces.get(name="E0"), "updates")  # no LLDP: no port linked
+    assert _device(result)["ip_interface"] == "br0"
 
 
-def test_new_ap_ip_goes_on_the_port_its_lldp_reports(monkeypatch):
-    """The whole point of merging sync + enrich: `show ap lldp neighbors`
-    says the AP is up on eth1, so its IP lands on E1, not the E0 default."""
+def test_new_ap_without_a_template_still_gets_br0_not_ethernet0(monkeypatch):
+    _aruba(monkeypatch, aps=[AP])
+    nb = _nb(prefixes=[_prefix()])
+    TOOL.run(_Ctx(nb, apply=True), _args())
+    assert [body["name"] for body in nb.dcim.interfaces.created] == ["br0"]
+
+
+def test_new_wlc_ip_without_a_template_falls_back_to_ethernet0(monkeypatch):
+    _aruba(monkeypatch, switches=[WLC])
+    nb = _nb(prefixes=[_prefix("10.1.0.0/24")])
+
+    plan = TOOL.run(_Ctx(nb), _args())
+    assert (
+        "hq-wlc01: would create IP address 10.1.0.5/24, attach to 'Ethernet0' "
+        "(new interface) and set as primary IPv4"
+    ) in plan.changes
+
+    TOOL.run(_Ctx(nb, apply=True), _args())
+    (iface,) = nb.dcim.interfaces.created
+    assert iface["name"] == "Ethernet0" and iface["type"] == "other"
+
+
+def test_new_ap_with_one_uplink_links_that_port_to_br0(monkeypatch):
+    """LLDP says the AP is up on eth1: E1 is linked to br0 and cabled; the IP is on br0."""
     _aruba(monkeypatch, switches=[WLC], aps=[AP], lldp=[LLDP])
     nb = _nb(prefixes=[_prefix()], ap_template=True, devices=[SWITCH], interfaces=[_switch_port()])
 
     plan = TOOL.run(_Ctx(nb), _args(only="aps"))
     assert plan.status is Status.DRIFT
-    assert (
-        "hq-idf1-ap01: would create IP address 10.1.1.1/24, attach to 'E1' "
-        "(the AP's LLDP uplink) and set as primary IPv4"
-    ) in plan.changes
-    assert "hq-idf1-ap01: would create cable E1 <-> hq-idf1-sw01:GigabitEthernet1/0/24" in (
-        plan.changes
-    )
+    assert plan.changes[1:] == [
+        "hq-idf1-ap01: would create interface 'br0' (bridge)",
+        "hq-idf1-ap01: would link 'E1' to bridge 'br0'",
+        "hq-idf1-ap01: would create IP address 10.1.1.1/24, attach to 'br0' and set as "
+        "primary IPv4",
+        "hq-idf1-ap01: would create cable E1 <-> hq-idf1-sw01:GigabitEthernet1/0/24",
+    ]
 
     result = TOOL.run(_Ctx(nb, apply=True), _args(only="aps"))
     assert result.status is Status.CHANGED
     ap = nb.dcim.devices.get(name="hq-idf1-ap01")
+    br0 = nb.dcim.interfaces.get(device_id=ap.id, name="br0")
     e1 = nb.dcim.interfaces.get(device_id=ap.id, name="E1")
-    assert nb.ipam.ip_addresses.created[0]["assigned_object_id"] == e1.id
+    assert e1.updates == [{"bridge": br0.id}]
+    assert nb.ipam.ip_addresses.created[0]["assigned_object_id"] == br0.id
     (cable,) = nb.dcim.cables.created
     assert cable["a_terminations"] == [{"object_type": "dcim.interface", "object_id": e1.id}]
     assert cable["b_terminations"] == [{"object_type": "dcim.interface", "object_id": 400}]
-    assert _device(result)["ip_interface_source"] == "live"
+    assert (_device(result)["bond"], _device(result)["uplinks"]) == (None, ["E1"])
 
 
 def test_new_device_without_wired_ports_gets_the_lldp_port_created(monkeypatch):
-    """No template at all: create the port the AP reports, not a guessed 'Ethernet0'."""
+    """No template at all: create the port the AP reports, so its cable can land."""
     _aruba(monkeypatch, switches=[WLC], aps=[AP], lldp=[LLDP])
     nb = _nb(prefixes=[_prefix()], devices=[SWITCH], interfaces=[_switch_port()])
 
     plan = TOOL.run(_Ctx(nb), _args(only="aps"))
-    assert any("attach to 'eth1' (new interface)" in c for c in plan.changes)
+    assert "hq-idf1-ap01: would create interface 'eth1'" in plan.changes
     assert "hq-idf1-ap01: would create cable eth1 <-> hq-idf1-sw01:GigabitEthernet1/0/24" in (
         plan.changes
     )
 
     result = TOOL.run(_Ctx(nb, apply=True), _args(only="aps"))
     assert result.status is Status.CHANGED
-    (iface,) = nb.dcim.interfaces.created
-    assert iface["name"] == "eth1"
+    assert [(b["name"], b["type"]) for b in nb.dcim.interfaces.created] == [
+        ("br0", "bridge"),
+        ("eth1", "other"),
+    ]
     assert len(nb.dcim.cables.created) == 1
 
 
@@ -843,7 +866,7 @@ def test_ip_already_in_netbox_unassigned_is_attached_not_recreated(monkeypatch):
     result = TOOL.run(_Ctx(nb, apply=True), _args())
     assert result.status is Status.CHANGED
     assert nb.ipam.ip_addresses.created == []
-    assert loose.assigned_object_id == nb.dcim.interfaces.get(name="E0").id
+    assert loose.assigned_object_id == nb.dcim.interfaces.get(name="br0").id
     assert nb.dcim.devices.get(name="hq-idf1-ap01").primary_ip4 == 99
 
 
@@ -899,7 +922,7 @@ def test_ip_held_by_another_device_is_never_taken(monkeypatch):
     assert "another device's interface" in _device(result)["issues"][0]
 
 
-# --- IP: devices NetBox already has ------------------------------------
+# --- IP and the AP's bridge: devices NetBox already has -------------------
 
 
 def _ip_on(interface_id, address="10.1.1.1/24", id_=99):
@@ -912,8 +935,79 @@ def _ip_on(interface_id, address="10.1.1.1/24", id_=99):
     )
 
 
-def test_existing_ap_ip_is_moved_to_the_port_lldp_reports(monkeypatch):
-    """Wap-A-1 is on E0 in NetBox from before; its LLDP says eth1 now."""
+SW2 = _Rec(id=201, name="hq-idf1-sw02")
+LLDP_E0 = {**LLDP, "Interface": "eth0"}
+LLDP_E1_SW2 = {**LLDP, "Chassis Name/ID": "hq-idf1-sw02", "Port ID": "Gi1/0/7"}
+
+
+def test_ap_cabled_to_two_switches_gets_bond0_and_both_cables(monkeypatch):
+    """Each of the AP's ports goes to its own switch: E0 + E1 are bonded into
+    bond0, bond0 is linked to br0, the IP moves from E0 (where it was before
+    2026-09-28) to br0, and each port is cabled to its own switch."""
+    _aruba(monkeypatch, switches=[WLC], aps=[AP], lldp=[LLDP_E0, LLDP_E1_SW2])
+    ip = _ip_on(300)  # E0
+    ap = _ap(primary_ip4=_Rec(id=99))
+    nb = _nb(
+        prefixes=[_prefix()],
+        ips=[ip],
+        devices=[ap, SWITCH, SW2],
+        interfaces=[*_ap_ports(), _switch_port(), _switch_port(401, 201, "GigabitEthernet1/0/7")],
+    )
+
+    plan = TOOL.run(_Ctx(nb), _args(only="aps"))
+    assert plan.status is Status.DRIFT
+    assert plan.changes == [
+        "hq-idf1-ap01: would create interface 'br0' (bridge)",
+        "hq-idf1-ap01: would create interface 'bond0' (LAG) in bridge 'br0'",
+        "hq-idf1-ap01: would add 'E0' to LAG 'bond0'",
+        "hq-idf1-ap01: would add 'E1' to LAG 'bond0'",
+        "hq-idf1-ap01: would move IP address 10.1.1.1/24 from 'E0' to 'br0'",
+        "hq-idf1-ap01: would create cable E0 <-> hq-idf1-sw01:GigabitEthernet1/0/24",
+        "hq-idf1-ap01: would create cable E1 <-> hq-idf1-sw02:GigabitEthernet1/0/7",
+    ]
+
+    result = TOOL.run(_Ctx(nb, apply=True), _args(only="aps"))
+    assert result.status is Status.CHANGED
+    br0 = nb.dcim.interfaces.get(device_id=100, name="br0")
+    bond0 = nb.dcim.interfaces.get(device_id=100, name="bond0")
+    assert (br0.type, bond0.type, bond0.bridge) == ("bridge", "lag", br0.id)
+    for port in ("E0", "E1"):
+        assert nb.dcim.interfaces.get(device_id=100, name=port).updates == [{"lag": bond0.id}]
+    assert ip.assigned_object_id == br0.id
+    assert not hasattr(ap, "updates")  # it was already the primary IP
+    pairs = {
+        (c["a_terminations"][0]["object_id"], c["b_terminations"][0]["object_id"])
+        for c in nb.dcim.cables.created
+    }
+    assert pairs == {(300, 400), (301, 401)}
+    assert (_device(result)["bond"], _device(result)["uplinks"]) == ("bond0", ["E0", "E1"])
+
+    again = TOOL.run(_Ctx(nb), _args(only="aps"))  # and the next run finds nothing to do
+    assert [c for c in again.changes if "cable" not in c] == []
+
+
+def test_single_uplink_ap_gaining_a_second_uplink_moves_into_a_bond(monkeypatch):
+    _aruba(monkeypatch, switches=[WLC], aps=[{**AP, "IP Address": ""}], lldp=[LLDP_E0, LLDP_E1_SW2])
+    nb = _nb(
+        devices=[_ap(), SWITCH, SW2],
+        interfaces=[
+            *_ap_ports(linked=("E0",)),
+            _switch_port(),
+            _switch_port(401, 201, "GigabitEthernet1/0/7"),
+        ],
+    )
+    plan = TOOL.run(_Ctx(nb), _args(only="aps"))
+    assert "hq-idf1-ap01: would add 'E0' to LAG 'bond0' and clear its own bridge link" in (
+        plan.changes
+    )
+    TOOL.run(_Ctx(nb, apply=True), _args(only="aps"))
+    bond0 = nb.dcim.interfaces.get(device_id=100, name="bond0")
+    e0 = nb.dcim.interfaces.get(device_id=100, name="E0")
+    assert e0.updates == [{"lag": bond0.id, "bridge": None}]
+
+
+def test_existing_ap_ip_on_a_port_moves_to_br0(monkeypatch):
+    """Wap-A-1's IP is on E0 in NetBox from before; it belongs on br0."""
     _aruba(monkeypatch, switches=[WLC], aps=[AP], lldp=[LLDP])
     ip = _ip_on(300)  # E0
     ap = _ap(primary_ip4=_Rec(id=99))
@@ -925,46 +1019,48 @@ def test_existing_ap_ip_is_moved_to_the_port_lldp_reports(monkeypatch):
     )
 
     plan = TOOL.run(_Ctx(nb), _args(only="aps"))
-    assert plan.status is Status.DRIFT
-    assert (
-        "hq-idf1-ap01: would move IP address 10.1.1.1/24 from 'E0' to 'E1' (the AP's LLDP uplink)"
-    ) in plan.changes
+    assert "hq-idf1-ap01: would move IP address 10.1.1.1/24 from 'E0' to 'br0'" in plan.changes
 
     ctx = _Ctx(nb, apply=True)
     result = TOOL.run(ctx, _args(only="aps"))
     assert result.status is Status.CHANGED
-    assert ip.assigned_object_id == 301  # E1
+    assert ip.assigned_object_id == nb.dcim.interfaces.get(device_id=100, name="br0").id
     assert not hasattr(ap, "updates")  # already its primary: no device write
     assert ("success", "hq-idf1-ap01: updated") in ctx.reporter.lines
 
 
-def test_existing_ap_ip_is_never_moved_without_lldp(monkeypatch):
+def test_existing_ap_ip_moves_to_br0_even_without_lldp(monkeypatch):
+    """br0 is where an AP's IP lives, whatever LLDP says, so no evidence is needed."""
     _aruba(monkeypatch, switches=[WLC], aps=[AP])  # no LLDP rows
     ip = _ip_on(301)  # E1
-    ap = _ap(primary_ip4=_Rec(id=99))
-    nb = _nb(prefixes=[_prefix()], ips=[ip], devices=[ap], interfaces=_ap_ports())
+    nb = _nb(
+        prefixes=[_prefix()],
+        ips=[ip],
+        devices=[_ap(primary_ip4=_Rec(id=99))],
+        interfaces=_ap_ports(br0=True),
+    )
     result = TOOL.run(_Ctx(nb, apply=True), _args(only="aps"))
-    assert result.status is Status.OK
-    assert ip.assigned_object_id == 301
-    assert _device(result)["ip_interface_source"] == "netbox"
+    assert result.status is Status.CHANGED
+    assert ip.assigned_object_id == BR0_ID
+    assert _device(result)["ip_interface_source"] == "requested"
 
 
-def test_existing_ap_missing_its_ip_gets_it(monkeypatch):
+def test_existing_ap_missing_its_ip_gets_it_on_br0(monkeypatch):
     _aruba(monkeypatch, aps=[AP])
     ap = _ap(primary_ip4=None)
-    nb = _nb(prefixes=[_prefix()], devices=[ap], interfaces=_ap_ports())
+    nb = _nb(prefixes=[_prefix()], devices=[ap], interfaces=_ap_ports(br0=True))
     result = TOOL.run(_Ctx(nb, apply=True), _args())
     assert result.status is Status.CHANGED
-    assert nb.ipam.ip_addresses.created[0]["assigned_object_id"] == 300  # E0
+    assert nb.ipam.ip_addresses.created[0]["assigned_object_id"] == BR0_ID
     assert ap.updates == [{"primary_ip4": nb.ipam.ip_addresses.all()[0].id}]
 
 
 def test_existing_ap_with_a_new_ip_gets_it_as_primary_old_one_left(monkeypatch):
     """A DHCP'd AP whose address changed: the new IP becomes primary, the old one stays."""
     _aruba(monkeypatch, aps=[{**AP, "IP Address": "10.1.1.9"}])
-    old = _ip_on(300, "10.1.1.1/24", id_=98)
+    old = _ip_on(BR0_ID, "10.1.1.1/24", id_=98)
     ap = _ap(primary_ip4=_Rec(id=98))
-    nb = _nb(prefixes=[_prefix()], ips=[old], devices=[ap], interfaces=_ap_ports())
+    nb = _nb(prefixes=[_prefix()], ips=[old], devices=[ap], interfaces=_ap_ports(br0=True))
     result = TOOL.run(_Ctx(nb, apply=True), _args())
     assert result.status is Status.CHANGED
     assert nb.ipam.ip_addresses.created[0]["address"] == "10.1.1.9/24"
@@ -972,15 +1068,18 @@ def test_existing_ap_with_a_new_ip_gets_it_as_primary_old_one_left(monkeypatch):
     assert ap.primary_ip4 != 98
 
 
-def test_existing_ap_ip_already_right_is_left_alone(monkeypatch):
-    _aruba(monkeypatch, switches=[WLC], aps=[AP], lldp=[{**LLDP, "Interface": "eth0"}])
-    ip = _ip_on(300)
+def test_existing_ap_already_right_is_left_alone(monkeypatch):
+    _aruba(monkeypatch, switches=[WLC], aps=[AP], lldp=[LLDP_E0])
+    ip = _ip_on(BR0_ID)
     ap = _ap(primary_ip4=_Rec(id=99))
     nb = _nb(
         prefixes=[_prefix()],
         ips=[ip],
         devices=[ap, SWITCH],
-        interfaces=[*_ap_ports(e0_cable=_Rec(id=5)), _switch_port(cable=_Rec(id=5))],
+        interfaces=[
+            *_ap_ports(e0_cable=_Rec(id=5), linked=("E0",)),
+            _switch_port(cable=_Rec(id=5)),
+        ],
     )
     ctx = _Ctx(nb, apply=True)
     result = TOOL.run(ctx, _args(only="aps"))
@@ -991,47 +1090,22 @@ def test_existing_ap_ip_already_right_is_left_alone(monkeypatch):
     assert ctx.reporter.about("hq-idf1-ap01") == [("success", "hq-idf1-ap01: in sync")]
 
 
-def test_lldp_port_the_device_does_not_have_is_yellow(monkeypatch):
-    """NetBox says the AP only has E0; the AP says it's up on eth1. Don't guess."""
-    _aruba(monkeypatch, switches=[WLC], aps=[AP], lldp=[LLDP])
-    ap = _ap()
-    nb = _nb(
-        prefixes=[_prefix()],
-        devices=[ap, SWITCH],
-        interfaces=[_iface(300, 100, "E0"), _switch_port()],
-    )
-    result = TOOL.run(_Ctx(nb, apply=True), _args(only="aps"))
+def test_a_bridge_that_cannot_be_created_leaves_the_ip_unplaced(monkeypatch):
+    _aruba(monkeypatch, aps=[AP])
+    ip = _ip_on(300)
+    nb = _nb(prefixes=[_prefix()], ips=[ip], devices=[_ap()], interfaces=_ap_ports())
+
+    def refuse(body):
+        raise RuntimeError("permission denied")
+
+    nb.dcim.interfaces.create = refuse
+    result = TOOL.run(_Ctx(nb, apply=True), _args())
     assert result.status is Status.PARTIAL
-    assert nb.ipam.ip_addresses.created == []
-    issues = _device(result)["issues"]
-    assert any("reports it's connected on eth1" in i for i in issues)
-    assert any("no interface matching 'eth1'" in i for i in issues)
-
-
-def test_two_uplinks_get_two_cables_and_the_ip_on_the_first(monkeypatch):
-    rows = [
-        {**LLDP, "Interface": "eth1", "Chassis Name/ID": "hq-idf1-sw02", "Port ID": "Gi1/0/7"},
-        {**LLDP, "Interface": "eth0"},
+    assert _device(result)["issues"] == [
+        "could not create interface 'br0' (bridge): permission denied",
+        "IP 10.1.1.1: not placed, because its bridge couldn't be created",
     ]
-    _aruba(monkeypatch, switches=[WLC], aps=[AP], lldp=rows)
-    sw2 = _Rec(id=201, name="hq-idf1-sw02")
-    nb = _nb(
-        prefixes=[_prefix()],
-        devices=[_ap(), SWITCH, sw2],
-        interfaces=[
-            *_ap_ports(),
-            _switch_port(),
-            _switch_port(401, 201, "GigabitEthernet1/0/7"),
-        ],
-    )
-    result = TOOL.run(_Ctx(nb, apply=True), _args(only="aps"))
-    assert result.status is Status.CHANGED
-    assert nb.ipam.ip_addresses.created[0]["assigned_object_id"] == 300  # E0
-    pairs = {
-        (c["a_terminations"][0]["object_id"], c["b_terminations"][0]["object_id"])
-        for c in nb.dcim.cables.created
-    }
-    assert pairs == {(301, 401), (300, 400)}
+    assert ip.assigned_object_id == 300  # left where it was
 
 
 # --- platform ------------------------------------------------------------
@@ -1079,7 +1153,7 @@ def test_new_ap_gets_its_platform_after_creation(monkeypatch):
 
 def test_platform_already_in_sync_is_a_noop(monkeypatch):
     _aruba(monkeypatch, aps=[{**AP, "Software Version": "8.10.0.5", "IP Address": ""}])
-    nb = _nb(devices=[_ap(platform=_Rec(id=50))])
+    nb = _nb(devices=[_ap(platform=_Rec(id=50))], interfaces=[_br0()])
     nb.dcim.platforms._items.append(_Rec(id=50, name="AOS 8", slug="aos-8"))
     result = TOOL.run(_Ctx(nb), _args())
     assert result.status is Status.OK
@@ -1088,7 +1162,7 @@ def test_platform_already_in_sync_is_a_noop(monkeypatch):
 
 def test_no_version_field_is_informational(monkeypatch):
     _aruba(monkeypatch, aps=[{**AP, "IP Address": ""}])
-    result = TOOL.run(_Ctx(_nb(devices=[_ap()])), _args())
+    result = TOOL.run(_Ctx(_nb(devices=[_ap()], interfaces=[_br0()])), _args())
     assert result.status is Status.OK
     assert "no software/version field" in _device(result)["platform_note"]
 
@@ -1182,7 +1256,7 @@ def _cabling_nb(*, ap_ports=None, switch_ports=None, devices=(), prefixes=()):
         prefixes=list(prefixes),
         devices=[_ap(), SWITCH, *devices],
         interfaces=[
-            *(_ap_ports() if ap_ports is None else ap_ports),
+            *(_ap_ports(linked=("E1",)) if ap_ports is None else ap_ports),
             *([_switch_port()] if switch_ports is None else switch_ports),
         ],
     )
@@ -1288,10 +1362,11 @@ def test_unmatched_switch_port_is_yellow(monkeypatch):
 
 
 def test_ap_without_the_reported_port_is_yellow(monkeypatch):
-    nb = _cabling_nb(ap_ports=[_iface(302, 100, "5GHz WiFi", "ieee802.11ax")])
+    """NetBox says the AP has only E0; the AP says it's cabled on eth1. Don't guess."""
+    nb = _cabling_nb(ap_ports=[_iface(300, 100, "E0"), _br0()])
     result = _cabling_run(monkeypatch, nb, [LLDP])
     assert result.status is Status.PARTIAL
-    assert "no interface matching 'eth1'" in _device(result)["issues"][0]
+    assert _device(result)["issues"] == ["cable: 'hq-idf1-ap01' has no interface matching 'eth1'"]
 
 
 def test_existing_cable_on_either_end_is_left_alone(monkeypatch):
@@ -1306,7 +1381,8 @@ def test_switch_port_cabled_to_the_aps_other_port_is_explained_not_moved(monkeyp
     """The old cable is on E0; the AP now reports eth1. Existing cables are
     never touched, but the note says exactly what's stale."""
     nb = _cabling_nb(
-        ap_ports=_ap_ports(e0_cable=_Rec(id=7)), switch_ports=[_switch_port(cable=_Rec(id=7))]
+        ap_ports=_ap_ports(e0_cable=_Rec(id=7), linked=("E1",)),
+        switch_ports=[_switch_port(cable=_Rec(id=7))],
     )
     result = _cabling_run(monkeypatch, nb, [LLDP], apply=True)
     assert result.status is Status.OK
