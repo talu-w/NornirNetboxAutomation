@@ -35,17 +35,24 @@ class _Endpoint:
     def __init__(self, items=()):
         self._items = list(items)
         self.created: list[dict] = []
+        self.bulk_updated: list[dict] = []
 
     def all(self):
         return list(self._items)
 
-    def get(self, **kw):
+    def get(self, id_=None, **kw):  # like pynetbox: get(<id>) or get(field=value)
+        if id_ is not None:
+            kw["id"] = id_
         return next(iter(self.filter(**kw)), None)
 
     def filter(self, **kw):
         return [
             item for item in self._items if all(getattr(item, k, None) == v for k, v in kw.items())
         ]
+
+    def update(self, objects):  # pynetbox's bulk PATCH: a list of {"id": ..., ...}
+        self.bulk_updated.extend(objects)
+        return True
 
     def create(self, body):
         self.created.append(body)
@@ -80,7 +87,9 @@ class _Devices(_Endpoint):
 
 
 class _NB:
-    def __init__(self, *, roles, sites, types, devices, tags, prefixes, ips, interfaces, templates):
+    def __init__(
+        self, *, roles, sites, types, devices, tags, prefixes, ips, interfaces, templates, cables
+    ):
         self.version = "4.1"
         self.dcim = SimpleNamespace(
             device_roles=_Endpoint(roles),
@@ -89,7 +98,7 @@ class _NB:
             interfaces=_Endpoint(interfaces),
             interface_templates=_Endpoint(templates),
             platforms=_Endpoint(),
-            cables=_Endpoint(),
+            cables=_Endpoint(cables),
         )
         self.dcim.devices = _Devices(devices, self)
         self.extras = SimpleNamespace(tags=_Endpoint(tags))
@@ -122,6 +131,7 @@ def _nb(
     ips=(),
     interfaces=(),
     ap_template=False,
+    cables=(),
 ):
     roles = [_BRANCH_ROLE] if with_branch else []
     wlc_role = _Rec(
@@ -165,6 +175,7 @@ def _nb(
         ips=list(ips),
         interfaces=list(interfaces),
         templates=templates,
+        cables=list(cables),
     )
 
 
@@ -1251,7 +1262,7 @@ def test_wlc_with_no_ap_data_is_informational(monkeypatch):
 # --- cables ---------------------------------------------------------------
 
 
-def _cabling_nb(*, ap_ports=None, switch_ports=None, devices=(), prefixes=()):
+def _cabling_nb(*, ap_ports=None, switch_ports=None, devices=(), prefixes=(), cables=()):
     return _nb(
         prefixes=list(prefixes),
         devices=[_ap(), SWITCH, *devices],
@@ -1259,7 +1270,28 @@ def _cabling_nb(*, ap_ports=None, switch_ports=None, devices=(), prefixes=()):
             *(_ap_ports(linked=("E1",)) if ap_ports is None else ap_ports),
             *([_switch_port()] if switch_ports is None else switch_ports),
         ],
+        cables=list(cables),
     )
+
+
+def _cable(id_, a, b):
+    """A NetBox cable between two ``(interface id, device name, port name)`` ends,
+    shaped like pynetbox's terminations (``object_type``/``object_id``/``object``)."""
+
+    def end(interface_id, device, port, object_type="dcim.interface"):
+        return {
+            "object_type": object_type,
+            "object_id": interface_id,
+            "object": {"name": port, "device": {"name": device}},
+        }
+
+    return _Rec(id=id_, a_terminations=[end(*a)], b_terminations=[end(*b)])
+
+
+AP_E0 = (300, "hq-idf1-ap01", "E0")
+AP_E1 = (301, "hq-idf1-ap01", "E1")
+SW_24 = (400, "hq-idf1-sw01", "GigabitEthernet1/0/24")
+SW_5 = (405, "hq-idf1-sw01", "GigabitEthernet1/0/5")
 
 
 def _cabling_run(monkeypatch, nb, rows, *, apply=False):
@@ -1369,27 +1401,156 @@ def test_ap_without_the_reported_port_is_yellow(monkeypatch):
     assert _device(result)["issues"] == ["cable: 'hq-idf1-ap01' has no interface matching 'eth1'"]
 
 
-def test_existing_cable_on_either_end_is_left_alone(monkeypatch):
-    nb = _cabling_nb(switch_ports=[_switch_port(cable=_Rec(id=1))])
+def test_ap_moved_to_another_switch_port_gets_its_cable_repointed(monkeypatch):
+    """NetBox has E1 on Gi1/0/5; LLDP says Gi1/0/24. The same cable is re-pointed."""
+    nb = _cabling_nb(
+        ap_ports=_ap_ports(e1_cable=_Rec(id=7), linked=("E1",)),
+        switch_ports=[
+            _switch_port(),
+            _switch_port(405, name="GigabitEthernet1/0/5", cable=_Rec(id=7)),
+        ],
+        cables=[_cable(7, AP_E1, SW_5)],
+    )
+    plan = _cabling_run(monkeypatch, nb, [LLDP])
+    assert plan.status is Status.DRIFT
+    assert plan.changes == [
+        "hq-idf1-ap01: would update cable #7: hq-idf1-sw01:GigabitEthernet1/0/5 -> "
+        "hq-idf1-sw01:GigabitEthernet1/0/24, now E1 <-> hq-idf1-sw01:GigabitEthernet1/0/24"
+    ]
+    assert nb.dcim.cables.bulk_updated == []
+
     result = _cabling_run(monkeypatch, nb, [LLDP], apply=True)
-    assert result.status is Status.OK  # informational only, never a failure
-    assert nb.dcim.cables.created == []
-    assert any("already has a cable" in n for n in _device(result)["notes"])
+    assert result.status is Status.CHANGED
+    assert nb.dcim.cables.bulk_updated == [
+        {
+            "id": 7,
+            "a_terminations": [{"object_type": "dcim.interface", "object_id": 301}],
+            "b_terminations": [{"object_type": "dcim.interface", "object_id": 400}],
+        }
+    ]
+    assert nb.dcim.cables.created == []  # re-pointed, not recreated
+    assert _device(result)["cables"][0]["cable_id"] == 7
 
 
-def test_switch_port_cabled_to_the_aps_other_port_is_explained_not_moved(monkeypatch):
-    """The old cable is on E0; the AP now reports eth1. Existing cables are
-    never touched, but the note says exactly what's stale."""
+def test_cable_on_the_aps_other_port_is_moved_to_the_reported_port(monkeypatch):
+    """The old cable is on E0 (the pre-merge first-wired pick); the AP reports eth1.
+    The cable's AP end moves from E0 to E1."""
     nb = _cabling_nb(
         ap_ports=_ap_ports(e0_cable=_Rec(id=7), linked=("E1",)),
         switch_ports=[_switch_port(cable=_Rec(id=7))],
+        cables=[_cable(7, AP_E0, SW_24)],
+    )
+    plan = _cabling_run(monkeypatch, nb, [LLDP])
+    assert plan.changes == [
+        "hq-idf1-ap01: would update cable #7: hq-idf1-ap01:E0 -> hq-idf1-ap01:E1, now "
+        "E1 <-> hq-idf1-sw01:GigabitEthernet1/0/24"
+    ]
+    result = _cabling_run(monkeypatch, nb, [LLDP], apply=True)
+    assert result.status is Status.CHANGED
+    (body,) = nb.dcim.cables.bulk_updated
+    assert body["a_terminations"] == [{"object_type": "dcim.interface", "object_id": 301}]
+    assert body["b_terminations"] == [{"object_type": "dcim.interface", "object_id": 400}]
+
+
+def test_both_ports_cabled_elsewhere_is_yellow_and_nothing_is_deleted(monkeypatch):
+    nb = _cabling_nb(
+        ap_ports=_ap_ports(e1_cable=_Rec(id=7), linked=("E1",)),
+        switch_ports=[_switch_port(cable=_Rec(id=8))],
+        cables=[_cable(7, AP_E1, SW_5), _cable(8, (999, "hq-idf1-ap09", "E0"), SW_24)],
     )
     result = _cabling_run(monkeypatch, nb, [LLDP], apply=True)
+    assert result.status is Status.PARTIAL
+    assert nb.dcim.cables.bulk_updated == [] and nb.dcim.cables.created == []
+    (issue,) = _device(result)["issues"]
+    assert "are each cabled to something else in NetBox" in issue
+    assert "would delete a cable" in issue
+
+
+def test_patch_panel_path_that_reaches_the_reported_port_is_in_sync(monkeypatch):
+    e1 = _iface(301, 100, "E1", "1000base-t", cable=_Rec(id=9))
+    e1.bridge = _Rec(id=BR0_ID)
+    e1.link_peers_type = "dcim.frontport"
+    e1.connected_endpoints_type = "dcim.interface"
+    e1.connected_endpoints = [_Rec(id=400)]
+    nb = _cabling_nb(ap_ports=[_iface(300, 100, "E0"), e1, _br0()])
+    result = _cabling_run(monkeypatch, nb, [LLDP], apply=True)
     assert result.status is Status.OK
-    assert nb.dcim.cables.created == []
+    assert _device(result)["cables"][0]["status"] == "in-sync"
+
+
+def test_patch_panel_cable_that_goes_elsewhere_is_only_noted(monkeypatch):
+    """NetBox can't be corrected from one LLDP report once a patch panel is in the
+    path, so it's left alone and noted, never re-pointed."""
+    e1 = _iface(301, 100, "E1", "1000base-t", cable=_Rec(id=9))
+    e1.bridge = _Rec(id=BR0_ID)
+    e1.link_peers_type = "dcim.frontport"
+    panel_port = {
+        "object_type": "dcim.frontport",
+        "object_id": 77,
+        "object": {"name": "1", "device": {"name": "idf1-panel"}},
+    }
+    cable = _cable(9, AP_E1, SW_5)
+    cable.b_terminations = [panel_port]
+    nb = _cabling_nb(ap_ports=[_iface(300, 100, "E0"), e1, _br0()], cables=[cable])
+    result = _cabling_run(monkeypatch, nb, [LLDP], apply=True)
+    assert result.status is Status.OK
+    assert nb.dcim.cables.bulk_updated == []
     (note,) = _device(result)["notes"]
-    assert "cabled to hq-idf1-ap01:E0" in note and "reports this link on E1" in note
-    assert "move it in NetBox" in note
+    assert "runs into a patch panel" in note and "left alone" in note
+
+
+def test_a_port_freed_by_one_ap_is_cabled_to_the_next(monkeypatch):
+    """AP1 moved from Gi1/0/5 to Gi1/0/24 and AP2 took Gi1/0/5, in the same run: AP1's
+    cable is re-pointed first, and AP2 then sees Gi1/0/5 as free and gets a new
+    cable, instead of taking AP1's."""
+    ap2_row = {"Name": "hq-idf1-ap02", "AP Type": "515", "Serial #": "CN0002"}
+    lldp = [
+        LLDP,
+        {
+            "AP": "hq-idf1-ap02",
+            "Interface": "eth0",
+            "Chassis Name/ID": "hq-idf1-sw01",
+            "Port ID": "Gi1/0/5",
+        },
+    ]
+    _aruba(monkeypatch, switches=[WLC], aps=[{**AP, "IP Address": ""}, ap2_row], lldp=lldp)
+    ap2 = _ap(id_=110, name="hq-idf1-ap02", serial="CN0002")
+    nb = _nb(
+        devices=[_ap(), ap2, SWITCH],
+        interfaces=[
+            *_ap_ports(e1_cable=_Rec(id=7), linked=("E1",)),
+            _iface(310, 110, "E0"),
+            _iface(311, 110, "br0", "bridge"),
+            _switch_port(),
+            _switch_port(405, name="GigabitEthernet1/0/5", cable=_Rec(id=7)),
+        ],
+        cables=[_cable(7, AP_E1, SW_5)],
+    )
+    result = TOOL.run(_Ctx(nb, apply=True), _args(only="aps"))
+    assert result.status is Status.CHANGED
+    assert [u["id"] for u in nb.dcim.cables.bulk_updated] == [7]
+    (created,) = nb.dcim.cables.created
+    assert created["a_terminations"] == [{"object_type": "dcim.interface", "object_id": 310}]
+    assert created["b_terminations"] == [{"object_type": "dcim.interface", "object_id": 405}]
+
+
+def test_cable_update_failure_is_yellow(monkeypatch):
+    nb = _cabling_nb(
+        ap_ports=_ap_ports(e1_cable=_Rec(id=7), linked=("E1",)),
+        switch_ports=[
+            _switch_port(),
+            _switch_port(405, name="GigabitEthernet1/0/5", cable=_Rec(id=7)),
+        ],
+        cables=[_cable(7, AP_E1, SW_5)],
+    )
+
+    def boom(objects):
+        raise RuntimeError("cable is locked")
+
+    nb.dcim.cables.update = boom
+    result = _cabling_run(monkeypatch, nb, [LLDP], apply=True)
+    assert result.status is Status.PARTIAL
+    assert "could not update cable #7" in _device(result)["issues"][0]
 
 
 def test_cable_create_failure_is_yellow(monkeypatch):

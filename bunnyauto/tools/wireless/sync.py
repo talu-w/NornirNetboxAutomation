@@ -59,9 +59,13 @@ live data.
 * **Cables** (APs): one per LLDP neighbor, from the AP's reported port to the
   switch port, so an AP with each port on its own switch gets both cables
   (:mod:`bunnyauto.netbox.cabling`, stack members resolved by
-  ``<host>-<member>``). An interface that already has a cable is **never
-  touched**, only noted. The note says so when the switch port is cabled to a
-  different port on the same AP; moving that cable is left to a person.
+  ``<host>-<member>``). **NetBox is corrected to what LLDP reports** (owner
+  decision 2026-09-28, replacing the 2026-09-22 never-touch rule): a cable
+  NetBox has on one of the two ports but to the wrong place (the AP re-patched
+  to another switch port, or its E0 cable now on E1) is **re-pointed**, keeping
+  the cable object; nothing is deleted. Both ports cabled to different places
+  would need a deletion, so that's yellow for a person to fix. A path through a
+  patch panel is in sync if it ends at the right port, else only noted.
 
 **Outcome.** Each device's line, and the run, is one of:
 
@@ -69,13 +73,15 @@ live data.
   site match, or NetBox refused it);
 * yellow, ``PARTIAL`` (exit 2): the device exists or was created, but something
   else couldn't be done: an IP (including "no containing Prefix"), a
-  platform, a cable, a tag or serial update, or a WLC that couldn't be queried;
+  platform, a cable (including one NetBox has wired differently that can't be
+  re-pointed), a tag or serial update, or a WLC that couldn't be queried;
 * green: everything the network reported is in NetBox: ``CHANGED`` (20) after
   ``--apply``, ``DRIFT`` (10) for a plan with changes, ``OK`` (0) when in sync.
 
 These are informational only, never a failure: an AP with no LLDP neighbor, no
-recognized version field, an existing cable left alone, a WLC role outside the
-wireless branch, and an AP role noted because NetBox has no AP role.
+recognized version field, a cable path through a patch panel left alone, a WLC
+role outside the wireless branch, and an AP role noted because NetBox has no AP
+role.
 
 Nothing is ever deleted, and no device type, site, role or platform is ever
 created. Plans by default; ``--apply`` writes. Auth is the shared device login
@@ -100,7 +106,12 @@ from bunnyauto.aruba.sitematch import Site, match_site
 from bunnyauto.common import env_flag, normalize_tags
 from bunnyauto.errors import ArubaError, ToolError
 from bunnyauto.netbox.bridging import apply_bridge_step, plan_uplink_bridge
-from bunnyauto.netbox.cabling import create_cable, plan_neighbor_cable
+from bunnyauto.netbox.cabling import (
+    create_cable,
+    plan_neighbor_cable,
+    record_cable,
+    update_cable,
+)
 from bunnyauto.netbox.devices import add_tag
 from bunnyauto.netbox.ipam import (
     IpPlan,
@@ -733,40 +744,58 @@ def _sync_cables(
         report.detail["cable_note"] = note
         return
 
-    cables: list[dict[str, Any]] = []
-    for row in uplinks:
-        plan = plan_neighbor_cable(
-            run.nb,
-            local_device=device,
-            neighbor_names=row.remote_system_candidates,
-            neighbor_ports=row.remote_port_candidates,
-            devices=run.devices,
-            local_port=row.local_port or None,
-            local_interfaces=interfaces,
-            interface_cache=run.interface_cache,
-        )
-        far = f"{plan.b_device_name}:{plan.b_interface_name}"
-        entry: dict[str, Any] = {
-            "local": plan.a_interface_name or row.local_port,
-            "neighbor": far if plan.b_interface_name else "",
-            "status": plan.action,
-        }
-        if plan.note:
-            entry["note"] = plan.note
-        cables.append(entry)
+    report.detail["cables"] = [_sync_cable(run, device, interfaces, row, report) for row in uplinks]
 
-        if plan.action == "blocked":
-            report.issues.append(f"cable: {plan.note}")
-        elif plan.action == "conflict":
-            report.notes.append(plan.note)
-        elif plan.action == "create":
-            _change(
-                run,
-                report,
-                f"create cable {plan.a_interface_name} <-> {far}",
-                lambda plan=plan: create_cable(run.nb, plan),
-            )
-    report.detail["cables"] = cables
+
+def _sync_cable(
+    run: _Run, device: Any, interfaces: list[Any], row: LldpNeighbor, report: _Report
+) -> dict[str, Any]:
+    """Make NetBox's cable for one LLDP neighbor match it. Returns its ``--json`` entry.
+
+    A missing cable is created; a cable NetBox has on one of the two ports but
+    to the wrong place is re-pointed (never deleted). Both ports cabled to
+    different places can't be fixed without deleting one (yellow); a path
+    through a patch panel is only noted.
+    """
+    plan = plan_neighbor_cable(
+        run.nb,
+        local_device=device,
+        neighbor_names=row.remote_system_candidates,
+        neighbor_ports=row.remote_port_candidates,
+        devices=run.devices,
+        local_port=row.local_port or None,
+        local_interfaces=interfaces,
+        interface_cache=run.interface_cache,
+    )
+    far = f"{plan.b_device_name}:{plan.b_interface_name}"
+    entry: dict[str, Any] = {
+        "local": plan.a_interface_name or row.local_port,
+        "neighbor": far if plan.b_interface_name else "",
+        "status": plan.action,
+    }
+    if plan.note:
+        entry["note"] = plan.note
+    everywhere = [interfaces, *run.interface_cache.values()]
+
+    if plan.action in ("blocked", "conflict"):
+        report.issues.append(f"cable: {plan.note}")
+    elif plan.action == "untouched":
+        report.notes.append(plan.note)
+    elif plan.action == "create":
+        created: list[Any] = []
+        text = f"create cable {plan.a_interface_name} <-> {far}"
+        if _change(run, report, text, lambda: created.append(create_cable(run.nb, plan))):
+            if created:  # written, not planned: later APs in this run see the new cable
+                record_cable(plan, related_id(created[0]) or 0, everywhere)
+    elif plan.action == "update":
+        entry.update(cable_id=plan.cable_id, replaced=plan.replaced)
+        text = (
+            f"update cable #{plan.cable_id}: {plan.replaced} -> {plan.replacement}, now "
+            f"{plan.a_interface_name} <-> {far}"
+        )
+        if _change(run, report, text, lambda: update_cable(run.nb, plan)) and run.apply:
+            record_cable(plan, plan.cable_id, everywhere)
+    return entry
 
 
 def _interfaces(run: _Run, match: _Match, device: Any) -> list[Any]:

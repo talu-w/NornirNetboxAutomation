@@ -1,4 +1,4 @@
-"""Plan and create a NetBox cable from what a device reports about its neighbor.
+"""Plan and write a NetBox cable from what a device reports about its neighbor.
 
 A neighbor protocol (LLDP, CDP) reports, for one local port, the neighbor's
 identity and the neighbor's own port. Either can appear under several fields,
@@ -13,20 +13,38 @@ turns that into a cable plan without writing anything:
    device's actual interfaces (:mod:`bunnyauto.netbox.interfaces`).
 3. **The local port.** The named port if the caller knows it (an AP's LLDP
    ``Interface``), otherwise the local device's first wired interface.
-4. **Existing cables.** A cable already joining exactly these two interfaces is
-   ``"in-sync"``. Any other cable on either interface is **never touched**. It's
-   reported as a conflict, because silently mis-correcting physical wiring is
-   worse than a note. The note says so when the neighbor's port is cabled to a
-   *different* port on the same local device (the device has moved ports).
+4. **What NetBox has now** (owner decision 2026-09-28: the reported data is
+   trusted, so NetBox is corrected to match it; this replaced the 2026-09-22
+   "never touch an existing cable" rule):
+
+   * ``"in-sync"``: one cable already joins the two ports, directly or through
+     patch panels (the local port's traced path ends at the neighbor's port).
+   * ``"create"``: neither port has a cable.
+   * ``"update"``: exactly one of them has a cable, straight to some other
+     interface. That cable is **re-pointed**: its stale end is swapped for the
+     free port, so the cable keeps its id, label and history. Nothing is ever
+     deleted.
+   * ``"conflict"``: both ports have *different* direct cables. Joining them
+     would mean deleting one, so it's left for a person.
+   * ``"untouched"``: a cable runs into a patch panel (front/rear port), a
+     circuit or anything else that isn't an interface, or it has several
+     terminations per end. NetBox's path there can't be corrected from one
+     neighbor report, so it's only noted.
+
+:func:`create_cable` / :func:`update_cable` write a plan; :func:`record_cable`
+mirrors the result on in-memory interface records so later plans in the same
+run see it.
 
 This came out of the old ``wireless enrich`` (AP to switch, from
 ``show ap lldp neighbors``), now part of ``wireless sync``. A wired CDP/LLDP
-cable sync would call the same two functions.
+cable sync would call the same functions.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Iterable
+from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any
 
 from bunnyauto.netbox.hostnames import match_hostname_candidates, with_stack_suffix
@@ -38,18 +56,27 @@ from bunnyauto.netbox.interfaces import (
 )
 from bunnyauto.netbox.records import related_id
 
+_INTERFACE = "dcim.interface"
+
 
 @dataclass(slots=True)
 class CablePlan:
     """What :func:`plan_neighbor_cable` decided. ``a`` = the local end, ``b`` = the neighbor."""
 
-    action: str  # "create" | "in-sync" | "conflict" | "blocked"
+    action: str  # "create" | "update" | "in-sync" | "conflict" | "untouched" | "blocked"
     a_interface_id: int = 0
     a_interface_name: str = ""
     b_device_name: str = ""
     b_interface_id: int = 0
     b_interface_name: str = ""
     note: str = ""
+    #: ``"update"`` only: the cable being re-pointed, its end that's being
+    #: replaced (``device:port``) and the replacement, and the new terminations.
+    cable_id: int = 0
+    replaced: str = ""
+    replaced_id: int = 0
+    replacement: str = ""
+    terminations: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
 
 
 def plan_neighbor_cable(
@@ -70,7 +97,8 @@ def plan_neighbor_cable(
     across many local devices that land on the same switch. ``local_interfaces``
     are the local device's interfaces when the caller already has them — or a
     preview of them, for a device that doesn't exist in NetBox yet (the plan is
-    then for display only); otherwise they're fetched.
+    then for display only); otherwise they're fetched. An ``"update"`` plan
+    reads the stale cable from NetBox.
     """
     cache = interface_cache if interface_cache is not None else {}
 
@@ -120,52 +148,153 @@ def plan_neighbor_cable(
         b_interface_id=int(b_iface.id),
         b_interface_name=str(b_iface.name),
     )
+    a_end = f"{local_device.name}:{a_iface.name}"
+    b_end = f"{neighbor.name}:{b_iface.name}"
     a_cable = getattr(a_iface, "cable", None)
     b_cable = getattr(b_iface, "cable", None)
-    same_cable = related_id(a_cable) is not None and related_id(a_cable) == related_id(b_cable)
-    if a_cable and b_cable and same_cable:
+
+    if _same_cable(a_cable, b_cable) or _path_reaches(a_iface, b_iface):
         plan.action = "in-sync"
-    elif a_cable or b_cable:
-        plan.action = "conflict"
-        plan.note = _conflict_note(local_device, a_iface, neighbor, b_iface, local_interfaces)
+    elif not a_cable and not b_cable:
+        pass  # "create"
+    elif a_cable and b_cable:
+        if _direct(a_iface) and _direct(b_iface):
+            plan.action = "conflict"
+            plan.note = (
+                f"{a_end} and {b_end} are each cabled to something else in NetBox, but "
+                f"{local_device.name} reports them connected to each other; joining them "
+                "would delete a cable, so fix it in NetBox"
+            )
+        else:
+            plan.action = "untouched"
+            plan.note = (
+                f"{a_end} and {b_end} are cabled through a patch panel or other object in "
+                "NetBox whose path doesn't join them — left alone; check that path in NetBox"
+            )
+    else:
+        holder, newcomer, newcomer_end = (
+            (a_iface, b_iface, b_end) if a_cable else (b_iface, a_iface, a_end)
+        )
+        _plan_repoint(nb, plan, holder, newcomer, newcomer_end, a_cable or b_cable)
     return plan
 
 
-def create_cable(nb: Any, plan: CablePlan) -> None:
-    """Create the cable a ``"create"`` plan describes. Raises on a NetBox error."""
-    nb.dcim.cables.create(
+def _plan_repoint(
+    nb: Any, plan: CablePlan, holder: Any, newcomer: Any, newcomer_end: str, cable_ref: Any
+) -> None:
+    """Make ``plan`` re-point the cable on ``holder`` so its other end is ``newcomer``."""
+    cable_id = related_id(cable_ref)
+    cable = nb.dcim.cables.get(cable_id) if cable_id else None
+    if cable is None:
+        plan.action = "untouched"
+        plan.note = f"cable #{cable_id} on {holder.name} couldn't be read from NetBox — left alone"
+        return
+    sides = {side: list(_field(cable, f"{side}_terminations") or []) for side in ("a", "b")}
+    holder_side = next(
+        (
+            side
+            for side, terms in sides.items()
+            if len(terms) == 1 and _termination(terms[0]) == (_INTERFACE, int(holder.id))
+        ),
+        None,
+    )
+    other_side = {"a": "b", "b": "a"}.get(holder_side or "")
+    stale = sides[other_side] if other_side else []
+    if other_side is None or len(stale) != 1 or _termination(stale[0])[0] != _INTERFACE:
+        plan.action = "untouched"
+        plan.note = (
+            f"cable #{cable_id} on {holder.name} runs into a patch panel or other object in "
+            f"NetBox, not straight to an interface — left alone; check that path in NetBox"
+        )
+        return
+    plan.action = "update"
+    plan.cable_id = int(cable_id)
+    plan.replaced = _termination_name(stale[0])
+    plan.replaced_id = int(_termination(stale[0])[1])
+    plan.replacement = newcomer_end
+    plan.terminations = {
+        f"{holder_side}_terminations": [{"object_type": _INTERFACE, "object_id": int(holder.id)}],
+        f"{other_side}_terminations": [{"object_type": _INTERFACE, "object_id": int(newcomer.id)}],
+    }
+
+
+def create_cable(nb: Any, plan: CablePlan) -> Any:
+    """Create the cable a ``"create"`` plan describes and return it. Raises on a NetBox error."""
+    return nb.dcim.cables.create(
         {
-            "a_terminations": [{"object_type": "dcim.interface", "object_id": plan.a_interface_id}],
-            "b_terminations": [{"object_type": "dcim.interface", "object_id": plan.b_interface_id}],
+            "a_terminations": [{"object_type": _INTERFACE, "object_id": plan.a_interface_id}],
+            "b_terminations": [{"object_type": _INTERFACE, "object_id": plan.b_interface_id}],
             "status": "connected",
         }
     )
 
 
-def _conflict_note(
-    local_device: Any, a_iface: Any, neighbor: Any, b_iface: Any, local_interfaces: list[Any]
-) -> str:
-    b_cable = related_id(getattr(b_iface, "cable", None))
-    moved_from = next(
-        (
-            i
-            for i in local_interfaces
-            if str(i.name) != str(a_iface.name)
-            and b_cable is not None
-            and related_id(getattr(i, "cable", None)) == b_cable
-        ),
-        None,
-    )
-    if moved_from is not None:
-        return (
-            f"{neighbor.name}:{b_iface.name} is cabled to {local_device.name}:{moved_from.name} "
-            f"in NetBox, but {local_device.name} reports this link on {a_iface.name} — the "
-            "existing cable is left untouched; move it in NetBox"
-        )
-    return (
-        f"{local_device.name}:{a_iface.name} or {neighbor.name}:{b_iface.name} "
-        "already has a cable — left untouched"
-    )
+def update_cable(nb: Any, plan: CablePlan) -> None:
+    """Re-point the cable an ``"update"`` plan describes. Raises on a NetBox error.
+
+    Sent as a plain PATCH body (pynetbox's bulk ``update``), so both termination
+    lists go to NetBox exactly as planned.
+    """
+    nb.dcim.cables.update([{"id": plan.cable_id, **plan.terminations}])
+
+
+def record_cable(plan: CablePlan, cable_id: int, interface_lists: Iterable[list[Any]]) -> None:
+    """Mirror a cable just written to NetBox on the in-memory interface records.
+
+    Both ends of ``plan`` get the cable, and an ``"update"``'s replaced end loses
+    it, so a later plan in the same run (another AP on a freed switch port)
+    sees NetBox as it now is. Call it only after a real write, never in plan
+    mode. Preview records (id 0) are never touched.
+    """
+    ref = SimpleNamespace(id=cable_id)
+    ends = {plan.a_interface_id, plan.b_interface_id} - {0}
+    for records in interface_lists:
+        for iface in records:
+            iface_id = related_id(iface)
+            if not iface_id:
+                continue
+            if iface_id in ends:
+                iface.cable, iface.link_peers_type = ref, _INTERFACE
+            elif plan.replaced_id and iface_id == plan.replaced_id:
+                iface.cable, iface.link_peers_type = None, None
+
+
+def _same_cable(a_cable: Any, b_cable: Any) -> bool:
+    a_id = related_id(a_cable)
+    return bool(a_cable and b_cable) and a_id is not None and a_id == related_id(b_cable)
+
+
+def _path_reaches(a_iface: Any, b_iface: Any) -> bool:
+    """True if ``a_iface``'s traced cable path (through patch panels) ends at ``b_iface``."""
+    if getattr(a_iface, "connected_endpoints_type", None) not in (None, _INTERFACE):
+        return False
+    endpoints = getattr(a_iface, "connected_endpoints", None) or []
+    return any(related_id(e) == int(b_iface.id) for e in endpoints)
+
+
+def _direct(iface: Any) -> bool:
+    """True if the interface's cable runs straight to another interface."""
+    return getattr(iface, "link_peers_type", None) in (None, _INTERFACE)
+
+
+def _field(obj: Any, key: str) -> Any:
+    if obj is None:
+        return None
+    return obj.get(key) if isinstance(obj, dict) else getattr(obj, key, None)
+
+
+def _termination(term: Any) -> tuple[str, int]:
+    """``(object_type, object_id)`` of a cable termination (a pynetbox object or a dict)."""
+    return str(_field(term, "object_type") or ""), int(_field(term, "object_id") or 0)
+
+
+def _termination_name(term: Any) -> str:
+    obj = _field(term, "object")
+    name, device = _field(obj, "name"), _field(_field(obj, "device"), "name")
+    if name and device:
+        return f"{device}:{name}"
+    object_type, object_id = _termination(term)
+    return f"{object_type} #{object_id}"
 
 
 def _interfaces(nb: Any, cache: dict[int, list[Any]], device_id: int) -> list[Any]:
