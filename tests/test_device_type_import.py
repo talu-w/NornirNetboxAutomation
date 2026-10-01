@@ -11,7 +11,12 @@ import pytest
 from bunnyauto.errors import ToolError
 from bunnyauto.reporting import Reporter
 from bunnyauto.result import Status
-from bunnyauto.tools.netbox.import_device_type import TOOL, load_device_type_yaml, slugify
+from bunnyauto.tools.netbox.import_device_type import (
+    TOOL,
+    load_device_type_yaml,
+    slugify,
+    yaml_files,
+)
 
 # --- fake pynetbox ---------------------------------------------------
 
@@ -83,8 +88,8 @@ class _Ctx:
         return self._nb
 
 
-def _args(file: Path) -> argparse.Namespace:
-    return argparse.Namespace(file=file)
+def _args(path: Path) -> argparse.Namespace:
+    return argparse.Namespace(path=path)
 
 
 AP_YAML = """\
@@ -360,6 +365,177 @@ def test_image_fields_produce_a_note_not_a_change(tmp_path):
     nb = _NB()
     result = TOOL.run(_Ctx(nb), _args(path))
     assert not any("image" in c for c in result.changes)
+
+
+# --- a folder of files --------------------------------------------------
+
+SWITCH_YAML = """\
+manufacturer: HPE
+model: Aruba 6300M
+slug: hpe-aruba-6300m
+interfaces:
+- name: 1/1/1
+  type: 1000base-t
+"""
+
+PDU_YAML = """\
+manufacturer: Acme
+model: PDU
+slug: acme-pdu
+power-ports:
+- name: PSU1
+  type: iec-60320-c14
+"""
+
+
+def _folder(tmp_path: Path, files: dict[str, str]) -> Path:
+    folder = tmp_path / "types"
+    folder.mkdir()
+    for name, text in files.items():
+        (folder / name).write_text(text)
+    return folder
+
+
+def _pdu_in_netbox() -> dict:
+    return {
+        "manufacturers": [_Rec(id=7, name="Acme", slug="acme")],
+        "device_types": [_Rec(id=70, model="PDU", slug="acme-pdu")],
+        "templates": {"power_port_templates": [_Rec(id=71, name="PSU1", device_type_id=70)]},
+    }
+
+
+def test_yaml_files_only_top_level_yaml_and_yml_by_name(tmp_path):
+    folder = _folder(
+        tmp_path,
+        {
+            "b.yml": PDU_YAML,
+            "A.yaml": AP_YAML,
+            "notes.txt": "x",
+            "._A.yaml": "macOS junk",
+        },
+    )
+    (folder / "sub").mkdir()
+    (folder / "sub" / "c.yaml").write_text(SWITCH_YAML)
+    assert [p.name for p in yaml_files(folder)] == ["A.yaml", "b.yml"]
+
+
+def test_empty_folder_is_friendly_error(tmp_path):
+    folder = _folder(tmp_path, {"readme.txt": "nothing here"})
+    with pytest.raises(ToolError, match="has no .yaml or .yml files"):
+        TOOL.run(_Ctx(_NB()), _args(folder))
+
+
+def test_folder_plan_checks_each_file(tmp_path):
+    folder = _folder(
+        tmp_path,
+        {"ap-655.yaml": AP_YAML, "6300m.yaml": SWITCH_YAML, "pdu.yaml": PDU_YAML},
+    )
+    nb = _NB(**_pdu_in_netbox())
+    result = TOOL.run(_Ctx(nb), _args(folder))
+
+    assert result.status is Status.DRIFT
+    files = result.data["files"]
+    assert files["pdu.yaml"]["status"] == "ok"
+    assert files["ap-655.yaml"]["status"] == "drift"
+    assert files["6300m.yaml"]["status"] == "drift"
+    assert "1 already in NetBox" in result.summary
+    assert "2 to create" in result.summary
+    assert "run with --apply" in result.summary
+    # Both HPE files need the manufacturer; the plan lists it once.
+    assert sum("would create manufacturer 'HPE'" in c for c in result.changes) == 1
+    assert "ap-655.yaml: interfaces: would create 'E0'" in result.changes
+    assert "6300m.yaml: interfaces: would create '1/1/1'" in result.changes
+    assert nb.dcim.manufacturers.created == []
+    assert nb.dcim.device_types.created == []
+
+
+def test_folder_all_in_netbox_is_ok(tmp_path):
+    folder = _folder(tmp_path, {"pdu.yaml": PDU_YAML})
+    result = TOOL.run(_Ctx(_NB(**_pdu_in_netbox())), _args(folder))
+    assert result.status is Status.OK
+    assert result.changes == []
+    assert "1 already in NetBox" in result.summary
+
+
+def test_folder_apply_creates_each_file_and_the_manufacturer_once(tmp_path):
+    folder = _folder(tmp_path, {"ap-655.yaml": AP_YAML, "6300m.yaml": SWITCH_YAML})
+    nb = _NB()
+    result = TOOL.run(_Ctx(nb, apply=True), _args(folder))
+
+    assert result.status is Status.CHANGED
+    assert nb.dcim.manufacturers.created == [{"name": "HPE", "slug": "hpe"}]
+    assert {b["slug"] for b in nb.dcim.device_types.created} == {
+        "hpe-aruba-ap-655",
+        "hpe-aruba-6300m",
+    }
+    assert "2 created" in result.summary
+
+
+def test_folder_bad_file_is_reported_and_the_rest_still_run(tmp_path):
+    folder = _folder(tmp_path, {"ap-655.yaml": AP_YAML, "broken.yaml": "model: Foo\nslug: foo\n"})
+    nb = _NB()
+    result = TOOL.run(_Ctx(nb, apply=True), _args(folder))
+
+    assert result.status is Status.PARTIAL
+    assert result.exit_code == 2
+    assert result.data["files"]["broken.yaml"]["status"] == "error"
+    assert result.data["files"]["broken.yaml"]["reason"] == (
+        "broken.yaml is missing required field 'manufacturer'"
+    )
+    assert result.data["files"]["ap-655.yaml"]["status"] == "changed"
+    assert "1 failed" in result.summary
+
+
+def test_folder_every_file_failing_is_error(tmp_path):
+    folder = _folder(tmp_path, {"a.yaml": "- a list\n", "b.yaml": "model: Foo\n"})
+    result = TOOL.run(_Ctx(_NB()), _args(folder))
+    assert result.status is Status.ERROR
+    assert "2 failed" in result.summary
+
+
+def test_folder_create_failure_fails_that_file_only(tmp_path):
+    folder = _folder(tmp_path, {"ap-655.yaml": AP_YAML, "pdu.yaml": PDU_YAML})
+    nb = _NB()
+    real_create = nb.dcim.manufacturers.create
+
+    def refuse_hpe(body):
+        if body["slug"] == "hpe":
+            raise RuntimeError("nope")
+        return real_create(body)
+
+    nb.dcim.manufacturers.create = refuse_hpe
+    result = TOOL.run(_Ctx(nb, apply=True), _args(folder))
+
+    assert result.status is Status.PARTIAL
+    assert result.data["files"]["ap-655.yaml"]["reason"].startswith(
+        "ap-655.yaml: could not create manufacturer 'HPE'"
+    )
+    assert result.data["files"]["pdu.yaml"]["status"] == "changed"
+    assert [b["slug"] for b in nb.dcim.device_types.created] == ["acme-pdu"]
+
+
+def test_folder_duplicate_slug_is_skipped_not_merged(tmp_path):
+    folder = _folder(
+        tmp_path,
+        {"ap-655 (1).yaml": AP_YAML.replace("E1", "E9"), "ap-655.yaml": AP_YAML},
+    )
+    nb = _NB()
+    result = TOOL.run(_Ctx(nb, apply=True), _args(folder))
+
+    assert result.status is Status.CHANGED  # a duplicate is a warning, not a failure
+    skipped = result.data["files"]["ap-655.yaml"]
+    assert skipped["status"] == "skipped"
+    assert "ap-655 (1).yaml" in skipped["reason"]
+    assert len(nb.dcim.device_types.created) == 1
+    assert {b["name"] for b in nb.dcim.interface_templates.created} == {"E0", "E9"}
+    assert "1 skipped (duplicate slug)" in result.summary
+
+
+def test_path_argument_expands_home(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    parser = argparse.ArgumentParser()
+    TOOL.add_arguments(parser)
+    assert parser.parse_args(["~/ndx"]).path == tmp_path / "ndx"
 
 
 def test_tool_is_registered():

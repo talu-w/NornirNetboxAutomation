@@ -1,7 +1,7 @@
-"""``netbox import-device-type`` — create a NetBox device type from a Device Type Library YAML file.
+"""``netbox import-device-type`` — create NetBox device types from Device Type Library YAML files.
 
-Reads one YAML file in the NetBox Device Type Library format — the format used
-by both the community `devicetype-library
+Takes one YAML file, or a folder of them (see below). Each file is in the NetBox
+Device Type Library format — the format used by both the community `devicetype-library
 <https://github.com/netbox-community/devicetype-library>`_ and NetBox Labs'
 NDX (https://netboxlabs.com/ndx/). Same schema either way: top-level scalar
 fields (``manufacturer``, ``model``, ``slug``, ``part_number``, ``u_height``,
@@ -29,6 +29,14 @@ fields (``manufacturer``, ``model``, ``slug``, ``part_number``, ``u_height``,
 Front/rear image files referenced by the schema (``front_image``/
 ``rear_image``) are not part of the YAML's data and are never uploaded —
 noted, not applied.
+
+**A folder** imports every ``.yaml`` / ``.yml`` file directly in it (not its
+subfolders), by name, each exactly as above. One file that can't be read or
+created is reported and the rest still run; a second file with the same
+device-type slug as an earlier one is skipped with a warning. The result
+counts files: already in NetBox / to create (plan) / created / incomplete /
+failed. ``--json``: ``data["files"][<file name>]`` = that file's own result data
+plus ``status``, or ``status`` + ``reason`` for a failed or skipped file.
 
 Plans by default; ``--apply`` writes. Touches only NetBox, so
 ``needs_devices = False``.
@@ -115,7 +123,8 @@ def load_device_type_yaml(path: Path) -> dict[str, Any]:
 class ImportDeviceType:
     name: str = "import-device-type"
     summary: str = (
-        "Create a NetBox device type (and its templates) from a Device Type Library YAML file"
+        "Create NetBox device types (and their templates) from Device Type Library YAML "
+        "files — one file or a folder"
     )
     writes: bool = True
     category: str = "netbox"
@@ -123,159 +132,181 @@ class ImportDeviceType:
 
     def add_arguments(self, parser: argparse.ArgumentParser) -> None:
         parser.add_argument(
-            "file",
-            type=Path,
-            help="path to the device-type YAML file (NetBox Device Type Library / NDX format)",
+            "path",
+            type=_user_path,
+            help=(
+                "path to a device-type YAML file, or a folder of them "
+                "(NetBox Device Type Library / NDX format)"
+            ),
         )
 
     def run(self, ctx: Context, args: argparse.Namespace) -> ToolResult:
-        path: Path = args.file
+        path: Path = args.path
+        if path.is_dir():
+            return _import_folder(ctx, path)
         data = load_device_type_yaml(path)
-        nb = ctx.netbox()
-        apply = ctx.settings.apply
+        return _import_file(ctx, ctx.netbox(), path, data, planned_manufacturers=set())
 
-        manufacturer_name = data["manufacturer"].strip()
-        mfr_slug = slugify(manufacturer_name)
-        model = data["model"].strip()
-        dt_slug = data["slug"].strip()
 
-        changes: list[str] = []
-        blocked_total: list[str] = []
-        failures: list[str] = []
-        created_counts: dict[str, int] = {}
+def _import_file(
+    ctx: Context,
+    nb: Any,
+    path: Path,
+    data: dict[str, Any],
+    *,
+    planned_manufacturers: set[str],
+) -> ToolResult:
+    """Create what one file's device type is missing in NetBox.
 
-        manufacturer = nb.dcim.manufacturers.get(slug=mfr_slug)
-        manufacturer_id: int | None = int(manufacturer.id) if manufacturer is not None else None
-        if manufacturer is None:
-            verb = "create" if apply else "would create"
+    Raises ``ToolError`` if its manufacturer or device type can't be created.
+    ``planned_manufacturers`` is shared by a folder run, so plan mode lists a new
+    manufacturer once rather than once per file that names it.
+    """
+    apply = ctx.settings.apply
+
+    manufacturer_name = data["manufacturer"].strip()
+    mfr_slug = slugify(manufacturer_name)
+    model = data["model"].strip()
+    dt_slug = data["slug"].strip()
+
+    changes: list[str] = []
+    blocked_total: list[str] = []
+    failures: list[str] = []
+    created_counts: dict[str, int] = {}
+
+    manufacturer = nb.dcim.manufacturers.get(slug=mfr_slug)
+    manufacturer_id: int | None = int(manufacturer.id) if manufacturer is not None else None
+    if manufacturer is None:
+        verb = "create" if apply else "would create"
+        if apply or mfr_slug not in planned_manufacturers:
             changes.append(f"{verb} manufacturer {manufacturer_name!r} (slug {mfr_slug!r})")
-            if apply:
-                try:
-                    manufacturer = nb.dcim.manufacturers.create(
-                        {"name": manufacturer_name, "slug": mfr_slug}
-                    )
-                    manufacturer_id = int(manufacturer.id)
-                    ctx.reporter.success(f"created manufacturer {manufacturer_name!r}")
-                except Exception as exc:  # pynetbox RequestError etc.
-                    raise ToolError(
-                        f"could not create manufacturer {manufacturer_name!r}: {exc}"
-                    ) from exc
-
-        device_type = nb.dcim.device_types.get(slug=dt_slug)
-        device_type_existed = device_type is not None
-        device_type_id: int | None = int(device_type.id) if device_type is not None else None
-
-        if device_type is None:
-            verb = "create" if apply else "would create"
-            changes.append(
-                f"{verb} device type {model!r} (slug {dt_slug!r}, "
-                f"manufacturer {manufacturer_name!r})"
-            )
-            if apply:
-                body: dict[str, Any] = {
-                    "manufacturer": manufacturer_id,
-                    "model": model,
-                    "slug": dt_slug,
-                }
-                for key in _DEVICE_TYPE_SCALAR_FIELDS:
-                    if key in data:
-                        body[key] = data[key]
-                try:
-                    device_type = nb.dcim.device_types.create(body)
-                    device_type_id = int(device_type.id)
-                    ctx.reporter.success(f"created device type {model!r}")
-                except Exception as exc:
-                    raise ToolError(f"could not create device type {model!r}: {exc}") from exc
-        else:
-            ctx.reporter.info(
-                f"device type {model!r} already exists in NetBox — leaving its fields as-is"
-            )
-
-        for image_field in ("front_image", "rear_image"):
-            if data.get(image_field):
-                ctx.reporter.info(
-                    f"note: {path.name} references {image_field.replace('_', ' ')} — "
-                    "image files are not part of this YAML and must be uploaded to NetBox manually"
+        planned_manufacturers.add(mfr_slug)
+        if apply:
+            try:
+                manufacturer = nb.dcim.manufacturers.create(
+                    {"name": manufacturer_name, "slug": mfr_slug}
                 )
+                manufacturer_id = int(manufacturer.id)
+                ctx.reporter.success(f"created manufacturer {manufacturer_name!r}")
+            except Exception as exc:  # pynetbox RequestError etc.
+                raise ToolError(
+                    f"could not create manufacturer {manufacturer_name!r}: {exc}"
+                ) from exc
 
-        # -- child templates -------------------------------------------
-        name_maps: dict[str, dict[str, int]] = {}
-        for category, endpoint_attr, _cross_ref in _CATEGORIES:
-            endpoint = getattr(nb.dcim, endpoint_attr)
-            existing_by_name: dict[str, int] = {}
-            if device_type_existed and device_type_id is not None:
-                for template in endpoint.filter(device_type_id=device_type_id):
-                    existing_by_name[str(template.name).casefold()] = int(template.id)
-            name_maps[category] = existing_by_name
+    device_type = nb.dcim.device_types.get(slug=dt_slug)
+    device_type_existed = device_type is not None
+    device_type_id: int | None = int(device_type.id) if device_type is not None else None
 
-        for category, endpoint_attr, cross_ref in _CATEGORIES:
-            items = data.get(category) or []
-            if not items:
-                continue
-            endpoint = getattr(nb.dcim, endpoint_attr)
-            existing_by_name = name_maps[category]
-
-            for item in items:
-                item_name = str(item["name"])
-                if item_name.casefold() in existing_by_name:
-                    continue  # already in NetBox
-
-                if cross_ref is not None:
-                    ref_field, ref_category = cross_ref
-                    ref_name = item.get(ref_field)
-                    if ref_name:
-                        ref_known = set(name_maps[ref_category]) | {
-                            str(i["name"]).casefold() for i in (data.get(ref_category) or [])
-                        }
-                        if str(ref_name).casefold() not in ref_known:
-                            reason = (
-                                f"references unknown {ref_category[:-1]} {ref_name!r} — not "
-                                f"found in this YAML file or NetBox"
-                            )
-                            blocked_total.append(f"{category}: {item_name!r} {reason}")
-                            ctx.reporter.warn(f"{category}: {item_name!r} {reason}")
-                            continue
-
-                verb = "create" if apply else "would create"
-                changes.append(f"{category}: {verb} {item_name!r}")
-
-                if not apply:
-                    continue
-
-                body = {k: v for k, v in item.items()}
-                body["device_type"] = device_type_id
-                if cross_ref is not None:
-                    ref_field, ref_category = cross_ref
-                    ref_name = item.get(ref_field)
-                    if ref_name:
-                        ref_id = name_maps[ref_category].get(str(ref_name).casefold())
-                        if ref_id is None:
-                            reason = (
-                                f"its referenced {ref_category[:-1]} {ref_name!r} was not "
-                                f"created — skipping"
-                            )
-                            blocked_total.append(f"{category}: {item_name!r} {reason}")
-                            ctx.reporter.error(f"{category}: {item_name!r} {reason}")
-                            continue
-                        body[ref_field] = ref_id
-
-                try:
-                    created = endpoint.create(body)
-                    name_maps[category][item_name.casefold()] = int(created.id)
-                    created_counts[category] = created_counts.get(category, 0) + 1
-                    ctx.reporter.success(f"{category}: created {item_name!r}")
-                except Exception as exc:
-                    failures.append(f"{category}:{item_name}")
-                    ctx.reporter.error(f"{category}: create {item_name!r} failed — {exc}")
-
-        return _result(
-            path=path,
-            apply=apply,
-            changes=changes,
-            blocked=blocked_total,
-            failures=failures,
-            created_counts=created_counts,
+    if device_type is None:
+        verb = "create" if apply else "would create"
+        changes.append(
+            f"{verb} device type {model!r} (slug {dt_slug!r}, manufacturer {manufacturer_name!r})"
         )
+        if apply:
+            body: dict[str, Any] = {
+                "manufacturer": manufacturer_id,
+                "model": model,
+                "slug": dt_slug,
+            }
+            for key in _DEVICE_TYPE_SCALAR_FIELDS:
+                if key in data:
+                    body[key] = data[key]
+            try:
+                device_type = nb.dcim.device_types.create(body)
+                device_type_id = int(device_type.id)
+                ctx.reporter.success(f"created device type {model!r}")
+            except Exception as exc:
+                raise ToolError(f"could not create device type {model!r}: {exc}") from exc
+    else:
+        ctx.reporter.info(
+            f"device type {model!r} already exists in NetBox — leaving its fields as-is"
+        )
+
+    for image_field in ("front_image", "rear_image"):
+        if data.get(image_field):
+            ctx.reporter.info(
+                f"note: {path.name} references {image_field.replace('_', ' ')} — "
+                "image files are not part of this YAML and must be uploaded to NetBox manually"
+            )
+
+    # -- child templates -------------------------------------------
+    name_maps: dict[str, dict[str, int]] = {}
+    for category, endpoint_attr, _cross_ref in _CATEGORIES:
+        endpoint = getattr(nb.dcim, endpoint_attr)
+        existing_by_name: dict[str, int] = {}
+        if device_type_existed and device_type_id is not None:
+            for template in endpoint.filter(device_type_id=device_type_id):
+                existing_by_name[str(template.name).casefold()] = int(template.id)
+        name_maps[category] = existing_by_name
+
+    for category, endpoint_attr, cross_ref in _CATEGORIES:
+        items = data.get(category) or []
+        if not items:
+            continue
+        endpoint = getattr(nb.dcim, endpoint_attr)
+        existing_by_name = name_maps[category]
+
+        for item in items:
+            item_name = str(item["name"])
+            if item_name.casefold() in existing_by_name:
+                continue  # already in NetBox
+
+            if cross_ref is not None:
+                ref_field, ref_category = cross_ref
+                ref_name = item.get(ref_field)
+                if ref_name:
+                    ref_known = set(name_maps[ref_category]) | {
+                        str(i["name"]).casefold() for i in (data.get(ref_category) or [])
+                    }
+                    if str(ref_name).casefold() not in ref_known:
+                        reason = (
+                            f"references unknown {ref_category[:-1]} {ref_name!r} — not "
+                            f"found in this YAML file or NetBox"
+                        )
+                        blocked_total.append(f"{category}: {item_name!r} {reason}")
+                        ctx.reporter.warn(f"{category}: {item_name!r} {reason}")
+                        continue
+
+            verb = "create" if apply else "would create"
+            changes.append(f"{category}: {verb} {item_name!r}")
+
+            if not apply:
+                continue
+
+            body = {k: v for k, v in item.items()}
+            body["device_type"] = device_type_id
+            if cross_ref is not None:
+                ref_field, ref_category = cross_ref
+                ref_name = item.get(ref_field)
+                if ref_name:
+                    ref_id = name_maps[ref_category].get(str(ref_name).casefold())
+                    if ref_id is None:
+                        reason = (
+                            f"its referenced {ref_category[:-1]} {ref_name!r} was not "
+                            f"created — skipping"
+                        )
+                        blocked_total.append(f"{category}: {item_name!r} {reason}")
+                        ctx.reporter.error(f"{category}: {item_name!r} {reason}")
+                        continue
+                    body[ref_field] = ref_id
+
+            try:
+                created = endpoint.create(body)
+                name_maps[category][item_name.casefold()] = int(created.id)
+                created_counts[category] = created_counts.get(category, 0) + 1
+                ctx.reporter.success(f"{category}: created {item_name!r}")
+            except Exception as exc:
+                failures.append(f"{category}:{item_name}")
+                ctx.reporter.error(f"{category}: create {item_name!r} failed — {exc}")
+
+    return _result(
+        path=path,
+        apply=apply,
+        changes=changes,
+        blocked=blocked_total,
+        failures=failures,
+        created_counts=created_counts,
+    )
 
 
 def _result(
@@ -318,6 +349,156 @@ def _result(
         summary += f" ({len(failures)} failed)"
 
     return ToolResult(status=status, summary=summary, changes=changes, data=data)
+
+
+# -- a folder of files ----------------------------------------------------
+
+_YAML_SUFFIXES = (".yaml", ".yml")
+
+# A file's status -> how its one-line outcome is printed in a folder run.
+_FILE_LINE = {
+    Status.OK: "info",
+    Status.DRIFT: "info",
+    Status.CHANGED: "success",
+    Status.PARTIAL: "warn",
+    Status.ERROR: "error",
+}
+
+
+def _user_path(text: str) -> Path:
+    """``~`` isn't expanded by the hub's prompt the way a shell would."""
+    return Path(text).expanduser()
+
+
+def yaml_files(folder: Path) -> list[Path]:
+    """The ``.yaml`` / ``.yml`` files directly in ``folder``, by name.
+
+    Subfolders aren't searched. Dotfiles are skipped (macOS leaves ``._name.yaml``
+    copies on external drives).
+    """
+    try:
+        entries = list(folder.iterdir())
+    except OSError as exc:
+        raise ToolError(f"could not read folder {folder}: {exc}") from exc
+    files = [
+        entry
+        for entry in entries
+        if entry.is_file()
+        and entry.suffix.casefold() in _YAML_SUFFIXES
+        and not entry.name.startswith(".")
+    ]
+    return sorted(files, key=lambda entry: entry.name.casefold())
+
+
+def _import_folder(ctx: Context, folder: Path) -> ToolResult:
+    """Import every YAML file in ``folder``; one bad file doesn't stop the rest."""
+    files = yaml_files(folder)
+    if not files:
+        raise ToolError(f"{folder} has no .yaml or .yml files")
+    nb = ctx.netbox()
+    apply = ctx.settings.apply
+
+    planned_manufacturers: set[str] = set()
+    slug_owner: dict[str, str] = {}  # device-type slug -> the file that claimed it
+    results: dict[str, ToolResult] = {}
+    failed: dict[str, str] = {}
+    skipped: dict[str, str] = {}
+
+    for path in files:
+        ctx.reporter.step(path.name)
+        try:
+            data = load_device_type_yaml(path)
+        except ToolError as exc:
+            failed[path.name] = _file_error(path, exc)
+            ctx.reporter.error(failed[path.name])
+            continue
+
+        slug = data["slug"].strip()
+        if slug in slug_owner:
+            # Importing it twice would merge two files' templates into one type.
+            reason = f"same device-type slug {slug!r} as {slug_owner[slug]} — skipped"
+            skipped[path.name] = reason
+            ctx.reporter.warn(f"{path.name}: {reason}")
+            continue
+        slug_owner[slug] = path.name
+
+        try:
+            result = _import_file(ctx, nb, path, data, planned_manufacturers=planned_manufacturers)
+        except ToolError as exc:
+            failed[path.name] = _file_error(path, exc)
+            ctx.reporter.error(failed[path.name])
+            continue
+        results[path.name] = result
+        getattr(ctx.reporter, _FILE_LINE[result.status])(result.summary)
+
+    return _folder_result(
+        folder=folder,
+        apply=apply,
+        count=len(files),
+        results=results,
+        failed=failed,
+        skipped=skipped,
+    )
+
+
+def _file_error(path: Path, exc: ToolError) -> str:
+    """The error, naming the file once and by name (the loader's messages carry the full path)."""
+    text = str(exc)
+    if str(path) in text:
+        return text.replace(str(path), path.name)
+    return f"{path.name}: {text}"
+
+
+def _folder_result(
+    *,
+    folder: Path,
+    apply: bool,
+    count: int,
+    results: dict[str, ToolResult],
+    failed: dict[str, str],
+    skipped: dict[str, str],
+) -> ToolResult:
+    files: dict[str, dict[str, Any]] = {}
+    changes: list[str] = []
+    for name, result in results.items():
+        files[name] = {"status": result.status.value, "summary": result.summary, **result.data}
+        changes.extend(f"{name}: {change}" for change in result.changes)
+    for name, reason in failed.items():
+        files[name] = {"status": Status.ERROR.value, "reason": reason}
+    for name, reason in skipped.items():
+        files[name] = {"status": "skipped", "reason": reason}
+
+    def tally(status: Status) -> int:
+        return sum(1 for result in results.values() if result.status is status)
+
+    errored = len(failed) + tally(Status.ERROR)
+    if errored or tally(Status.PARTIAL):
+        status = Status.ERROR if errored == count - len(skipped) else Status.PARTIAL
+    elif tally(Status.CHANGED):
+        status = Status.CHANGED
+    elif tally(Status.DRIFT):
+        status = Status.DRIFT
+    else:
+        status = Status.OK
+
+    parts = [
+        f"{tally(Status.OK)} already in NetBox" if tally(Status.OK) else "",
+        f"{tally(Status.DRIFT)} to create" if tally(Status.DRIFT) else "",
+        f"{tally(Status.CHANGED)} created" if tally(Status.CHANGED) else "",
+        f"{tally(Status.PARTIAL)} incomplete" if tally(Status.PARTIAL) else "",
+        f"{errored} failed" if errored else "",
+        f"{len(skipped)} skipped (duplicate slug)" if skipped else "",
+    ]
+    summary = f"{folder.name}: {count} file(s) — " + ", ".join(part for part in parts if part)
+    if tally(Status.DRIFT) and not apply:
+        summary += " — run with --apply"
+
+    return ToolResult(
+        status=status,
+        summary=summary,
+        changes=changes,
+        data={"folder": str(folder), "files": files},
+    )
 
 
 TOOL = ImportDeviceType()

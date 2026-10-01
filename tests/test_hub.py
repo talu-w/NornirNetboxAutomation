@@ -123,12 +123,12 @@ def test_prompt_for_args_config_mode_yes():
 
 
 def test_prompt_for_args_applies_positional_type_conversion():
-    # import-device-type's `file` positional is declared type=Path; the hub must
-    # apply that converter itself since it builds the Namespace by hand rather
-    # than going through argparse.parse_args().
+    # import-device-type's `path` positional is declared with a Path converter; the
+    # hub must apply that converter itself since it builds the Namespace by hand
+    # rather than going through argparse.parse_args().
     args = hub.prompt_for_args(IMPORT_DEVICE_TYPE, input_fn=_Script("devicetype.yaml", "n"))
-    assert args.file == Path("devicetype.yaml")
-    assert isinstance(args.file, Path)
+    assert args.path == Path("devicetype.yaml")
+    assert isinstance(args.path, Path)
 
 
 def test_prompt_for_args_invalid_positional_type_raises_friendly_error():
