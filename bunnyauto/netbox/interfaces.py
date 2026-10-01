@@ -93,6 +93,10 @@ FAMILY_ALIASES: dict[str, str] = {
     "portchannel": "po",
     "lo": "lo",
     "loopback": "lo",
+    # VLAN SVIs: ``show interfaces`` says "Vlan100" (what create-interfaces
+    # writes), ``show interfaces description`` says "Vl100".
+    "vl": "vlan",
+    "vlan": "vlan",
     "ap": "ap",
     "appgigabitethernet": "ap",
 }

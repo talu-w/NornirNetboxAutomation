@@ -681,3 +681,32 @@ def test_port_channel_on_two_other_members_is_an_error_not_a_guess(stack_run):
     assert nb.dcim.interfaces.on(3, "Po1").updates == []
     (error,) = result.data[A1]["errors"]
     assert error == f"Po1: more than one stack member has this interface: {A2}/Po1, {A3}/Po1"
+
+
+def test_svi_reported_abbreviated_is_synced_onto_the_vlan_interface_create_interfaces_made(
+    stack_run,
+):
+    # show interfaces description says "Vl100"; create-interfaces named it "Vlan100".
+    result, nb = stack_run(
+        devices=[_Device(1, "sw1", ip="10.0.0.1/24")],
+        existing={1: ["Gi1/0/1", "Vlan100"]},
+        reported={"sw1": ["Gi1/0/1", "Vl100"]},
+        apply=True,
+    )
+
+    assert result.status is Status.CHANGED
+    assert nb.dcim.interfaces.on(1, "Vlan100").updates == [
+        {"enabled": True, "description": "seen Vl100"}
+    ]
+    assert _targets(result) == ["sw1/Gi1/0/1", "sw1/Vlan100"]  # no "reported as" note
+    assert result.data["sw1"]["errors"] == []
+
+
+def test_svi_reported_abbreviated_is_found_on_another_stack_member(stack_run):
+    result, _nb = stack_run(
+        devices=_stack(members=2),
+        existing={1: ["Gi1/0/1"], 2: ["Gi2/0/1", "Vlan100"]},
+        reported={A1: ["Gi1/0/1", "Gi2/0/1", "Vl100"]},
+    )
+
+    assert f"{A2}/Vlan100 [stack member 2]" in _targets(result)

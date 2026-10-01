@@ -234,6 +234,7 @@ def test_member_number_of_each_stack_device():
 def test_stack_wide_interfaces_are_port_channels_and_virtual_ones():
     assert is_stack_wide("Port-channel1")
     assert is_stack_wide("Vlan10")
+    assert is_stack_wide("Vl10")
     assert is_stack_wide("Loopback0")
     assert not is_stack_wide("GigabitEthernet2/0/1")
 
