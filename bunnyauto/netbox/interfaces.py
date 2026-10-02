@@ -16,7 +16,8 @@ canonical one, and returning nothing if the match is ambiguous.
 :func:`stack_member` reads the member number out of a
 ``<member>/<module>/<port>`` name. A stack's members share one chassis identity
 but each is its own NetBox device. :func:`member_local_names` gives the
-member-1 names a device-type template puts on every member device.
+member-1 names a device-type template puts on every member device, and
+:func:`with_stack_member` renumbers one to the member it's really on.
 
 **Types.** :func:`port_media` reads a port's NetBox type from what the device
 itself reports (the ``media type is ...`` line of ``show interfaces``):
@@ -193,6 +194,10 @@ _STACK_MEMBER = re.compile(r"^(?:[a-z][a-z-]*)?(\d+)/\d+/\d+(?:\.\d+)?$")
 _MEMBER_LOCAL = re.compile(
     r"^(?P<prefix>[A-Za-z-]+)(?P<member>\d+)/(?P<remainder>\d+/\d+(?:\.\d+)?)$"
 )
+#: A stack port split for :func:`with_stack_member` (spelling kept exactly).
+_MEMBER_SEGMENT = re.compile(
+    r"^(?P<prefix>[A-Za-z -]*)(?P<member>\d+)(?P<rest>/\d+/\d+(?:\.\d+)?)$"
+)
 
 
 def _compact(name: str) -> str:
@@ -287,6 +292,20 @@ def member_local_names(name: str) -> list[str]:
         return []
     prefix, remainder = match.group("prefix"), match.group("remainder")
     return [f"{prefix}1/{remainder}", f"{prefix}{remainder}"]
+
+
+def with_stack_member(name: str, member: int) -> str | None:
+    """``name`` with its stack-member number set to ``member``: ``"Gi1/0/39"``, 2 ->
+    ``"Gi2/0/39"``.
+
+    Only the member number changes. The rest of the name stays exactly as
+    written. ``None`` for a name without the ``<member>/<module>/<port>``
+    shape (``"Gi0/39"``, ``"Vlan10"``), which has no member number to change.
+    """
+    match = _MEMBER_SEGMENT.match(str(name).strip())
+    if not match:
+        return None
+    return f"{match.group('prefix')}{int(member)}{match.group('rest')}"
 
 
 # ---------------------------------------------------------------------------
