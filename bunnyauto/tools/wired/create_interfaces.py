@@ -1,10 +1,11 @@
 """``wired create-interfaces`` — create missing interfaces, correct their types, record optics.
 
 Ported from ``create_interfaces_netbox.py``. Plans by default; ``--apply`` writes.
-It creates interfaces NetBox is missing and corrects the **type** of ones it has;
-it never changes anything else on an interface, and never deletes one. Name
-matching and interface types both come from :mod:`bunnyauto.netbox.interfaces`,
-shared with every other tool.
+It creates interfaces NetBox is missing and corrects the **type** of ones it
+has, and the **stack member number** in the name of a stack member's port (see
+below). It never changes anything else on an interface, and never deletes one.
+Name matching and interface types both come from
+:mod:`bunnyauto.netbox.interfaces`, shared with every other tool.
 
 **Types come from the device.** ``show interfaces`` (already run to list the
 ports) reports each port's media type: ``10/100/1000BaseTX``, ``SFP-10GBase-SR``,
@@ -46,7 +47,16 @@ leftover and the ports are reported.
 name or spelling (``Gi1/0/1`` is ``GigabitEthernet1/0/1``). On a stack member it
 also covers the device-type template's member-1 name (``GigabitEthernet1/0/1``
 on ``SwitchA-2`` is its ``Gi2/0/1``), and a Port-Channel or VLAN on any member
-of the stack counts too. These are skipped with a note, never re-created. A
+of the stack counts too. These are never re-created.
+
+**Wrong stack member number.** A device type's template gives every member
+device member-1 names, so ``SwitchA-2`` holds its ``Gi2/0/39`` as
+``GigabitEthernet1/0/39``. That interface is **renamed** to
+``GigabitEthernet2/0/39``. Only the member number changes. The rest of the name
+is kept as NetBox has it, and so is the interface itself (same id, so its
+cables, IPs and VLANs stay attached). Only a member's own port is renamed, and
+only when it isn't already in NetBox under the right number. A template name
+with no member number (``GigabitEthernet0/39``) is left alone and noted. A
 member's port found on the wrong member (left by runs before stacks were
 handled) is reported for removal by hand, since this tool never deletes.
 """
@@ -79,6 +89,7 @@ from bunnyauto.netbox.interfaces import (
     stack_member,
     supported_type,
     type_fits,
+    with_stack_member,
 )
 from bunnyauto.netbox.records import choice_value
 from bunnyauto.netbox.stacks import Stack, is_stack_wide, own_interfaces, resolve_stack
@@ -140,6 +151,17 @@ class _Retype:
     media: str
 
 
+@dataclass(frozen=True, slots=True)
+class _Rename:
+    """A stack member's NetBox interface named with another member's number."""
+
+    id: int
+    current: str
+    wanted: str
+    #: The port as the switch reports it (``GigabitEthernet2/0/39``).
+    port: str
+
+
 @dataclass(slots=True)
 class _Optic:
     """One optic and the inventory item it needs on its interface."""
@@ -169,7 +191,10 @@ class _DevicePlan:
     retype: list[_Retype] = field(default_factory=list)
     #: A media type bunnyauto can't map -> the ports that reported it.
     unmapped: dict[str, list[str]] = field(default_factory=dict)
-    #: Reported port -> the device-type template's member-1 name for it here.
+    #: Interfaces here named with the wrong stack member number.
+    rename: list[_Rename] = field(default_factory=list)
+    #: Reported port -> the device-type template's name for it here, where that
+    #: name has no member number to correct (``GigabitEthernet0/39``).
     template_named: dict[str, str] = field(default_factory=dict)
     #: Reported Port-Channel/VLAN -> the other stack members that already have it.
     elsewhere: dict[str, list[str]] = field(default_factory=dict)
@@ -179,6 +204,7 @@ class _DevicePlan:
     optics: list[_Optic] = field(default_factory=list)
     created: int = 0
     retyped: int = 0
+    renamed: int = 0
     optics_created: int = 0
     error: str = ""
 
@@ -298,7 +324,9 @@ def _show_inventory(task: Task) -> tuple[Any, str]:
 @dataclass(slots=True)
 class CreateInterfaces:
     name: str = "create-interfaces"
-    summary: str = "Create the interfaces NetBox is missing and correct wrong interface types"
+    summary: str = (
+        "Create the interfaces NetBox is missing and correct wrong types and stack member numbers"
+    )
     writes: bool = True
     category: str = "wired"
 
@@ -427,7 +455,8 @@ class CreateInterfaces:
 
 
 def _apply(ctx: Context, nb: Any, plan: _DevicePlan, failures: dict[str, str]) -> None:
-    """Create ``plan``'s missing interfaces, correct its wrong types, record its optics."""
+    """Create ``plan``'s missing interfaces, correct its wrong types and member numbers,
+    record its optics."""
     name = str(plan.device.name)
     errors: list[str] = []
     new_ids: dict[str, int] = {}
@@ -444,12 +473,23 @@ def _apply(ctx: Context, nb: Any, plan: _DevicePlan, failures: dict[str, str]) -
             ctx.reporter.success(f"{name}: corrected the type of {plan.retyped} interface(s)")
         except Exception as exc:  # pynetbox RequestError etc.
             errors.append(f"type update failed: {exc}")
+    # An optic's item takes its interface's name: the old one if the rename failed.
+    unrenamed: dict[str, str] = {}
+    if plan.rename:
+        try:
+            plan.renamed = _rename(nb, plan.rename)
+            ctx.reporter.success(
+                f"{name}: corrected the stack member number of {plan.renamed} interface(s)"
+            )
+        except Exception as exc:  # pynetbox RequestError etc.
+            errors.append(f"rename failed: {exc}")
+            unrenamed = {r.wanted: r.current for r in plan.rename}
     payload = [
         inventory_item_payload(
             item.optic,
             device_id=int(plan.device.id),
             interface_id=interface_id,
-            name=item.interface,
+            name=unrenamed.get(item.interface, item.interface),
         )
         for item in plan.optics
         if item.plan.action == "create"
@@ -571,9 +611,11 @@ def _classify(
             _check_type(plan, found, iface, supported)
             homes[wanted] = _Home(plan, found, found.name)
         elif member is not None and (template := _template_interface(iface.name, names)):
-            plan.template_named[iface.name] = template.name
             _check_type(plan, template, iface, supported)
-            homes[wanted] = _Home(plan, template, template.name)
+            renamed = _plan_rename(plan, template, iface.name, member)
+            if renamed is None:
+                plan.template_named[iface.name] = template.name
+            homes[wanted] = _Home(plan, template, renamed or template.name)
         elif holders := _stack_wide_holders(iface.name, stack, index, owner_id):
             plan.elsewhere[iface.name] = holders
         elif all(canonical_name(i.name) != wanted for i in plan.missing):
@@ -644,6 +686,27 @@ def _template_interface(name: str, names: dict[str, _Existing]) -> _Existing | N
     return None
 
 
+def _plan_rename(plan: _DevicePlan, template: _Existing, port: str, member: int) -> str | None:
+    """Plan renaming ``template`` to member ``member``'s number; return the new name.
+
+    ``template`` is this member's own interface for ``port`` under another
+    member's number (``GigabitEthernet1/0/39`` for ``Gi2/0/39``). Only the
+    number changes. ``None`` when its name carries no member number
+    (``GigabitEthernet0/39``), renumbering it wouldn't give ``port``, or
+    another port already claimed it.
+    """
+    current = stack_member(template.name)
+    wanted = with_stack_member(template.name, member)
+    if current in (None, member) or wanted is None:
+        return None
+    if canonical_name(wanted) != canonical_name(port):
+        return None
+    if any(r.id == template.id for r in plan.rename):
+        return None
+    plan.rename.append(_Rename(template.id, template.name, wanted, port))
+    return wanted
+
+
 def _reported_type(
     plan: _DevicePlan, iface: DiscoveredInterface, supported: frozenset[str] | None
 ) -> tuple[PortMedia, str] | None:
@@ -692,8 +755,10 @@ def _stack_wide_holders(
 
 def _report(ctx: Context, plans: list[_DevicePlan], blocked: list[_Blocked]) -> list[str]:
     """Emit each device's notes; return the planned-change lines."""
-    create, change = (
-        ("create", "change") if ctx.settings.apply else ("would create", "would change")
+    create, change, rename = (
+        ("create", "change", "rename")
+        if ctx.settings.apply
+        else ("would create", "would change", "would rename")
     )
     changes: list[str] = []
     for plan in plans:
@@ -705,6 +770,11 @@ def _report(ctx: Context, plans: list[_DevicePlan], blocked: list[_Blocked]) -> 
             changes.append(
                 f"{name}: {change} {item.name} from {item.current or 'no type'} to {item.wanted} "
                 f"(device reports {item.media!r}){where}"
+            )
+        for item in plan.rename:
+            changes.append(
+                f"{name}: {rename} {item.current} to {item.wanted} "
+                f"(wrong stack member number){where}"
             )
         for item in plan.optics:
             if item.plan.action == "create":
@@ -727,7 +797,8 @@ def _report(ctx: Context, plans: list[_DevicePlan], blocked: list[_Blocked]) -> 
             reported, template = next(iter(plan.template_named.items()))
             ctx.reporter.info(
                 f"{name}: {len(plan.template_named)} interface(s) already in NetBox under the "
-                f"device type's member-1 names (e.g. {reported} is {template}) — not created"
+                f"device type's names (e.g. {reported} is {template}) — not created; a name "
+                "without a stack member number is left as it is"
             )
         for port, holders in plan.elsewhere.items():
             ctx.reporter.info(
@@ -769,11 +840,16 @@ def _result(
             "missing": [i.name for i in plan.missing],
             "created": plan.created,
             "retyped": plan.retyped,
+            "renamed": plan.renamed,
         }
         if plan.retype:
             entry["retype"] = [
                 {"name": r.name, "from": r.current, "to": r.wanted, "media": r.media}
                 for r in plan.retype
+            ]
+        if plan.rename:
+            entry["rename"] = [
+                {"from": r.current, "to": r.wanted, "port": r.port} for r in plan.rename
             ]
         if plan.unmapped:
             entry["unmapped_media"] = {k: list(v) for k, v in plan.unmapped.items()}
@@ -801,13 +877,15 @@ def _result(
     blocked_ports = sum(len(item.ports) for item in blocked)
     missing = sum(len(plan.missing) for plan in plans)
     retypes = sum(len(plan.retype) for plan in plans)
+    renames = sum(len(plan.rename) for plan in plans)
     optics = sum(1 for plan in plans for o in plan.optics if o.plan.action == "create")
     created = sum(plan.created for plan in plans)
     retyped = sum(plan.retyped for plan in plans)
+    renamed = sum(plan.renamed for plan in plans)
     recorded = sum(plan.optics_created for plan in plans)
     if failures or blocked_ports:
         status = Status.PARTIAL if progressed else Status.ERROR
-    elif apply and (created or retyped or recorded):
+    elif apply and (created or retyped or renamed or recorded):
         status = Status.CHANGED
     elif changes:
         status = Status.DRIFT
@@ -818,12 +896,16 @@ def _result(
         summary = f"created {created} interface(s)"
         if retypes:
             summary += f", corrected the type of {retyped}"
+        if renames:
+            summary += f", corrected the stack member number of {renamed}"
         if optics:
             summary += f", recorded {recorded} transceiver(s)"
     elif changes:
         found = [f"{missing} interface(s) missing from NetBox"] if missing else []
         if retypes:
             found.append(f"{retypes} interface(s) with the wrong type")
+        if renames:
+            found.append(f"{renames} interface(s) with the wrong stack member number")
         if optics:
             found.append(f"{optics} transceiver(s) not yet in NetBox")
         summary = f"{', '.join(found)} — run with --apply to update NetBox"
@@ -878,6 +960,12 @@ def _retype(nb: Any, retypes: list[_Retype]) -> int:
     """Set each interface's type; nothing else on it is touched."""
     updated = nb.dcim.interfaces.update([{"id": r.id, "type": r.wanted} for r in retypes])
     return len(updated) if isinstance(updated, list) else len(retypes)
+
+
+def _rename(nb: Any, renames: list[_Rename]) -> int:
+    """Set each interface's name; nothing else on it is touched (its id, so its links, stay)."""
+    updated = nb.dcim.interfaces.update([{"id": r.id, "name": r.wanted} for r in renames])
+    return len(updated) if isinstance(updated, list) else len(renames)
 
 
 def _discovered(multi) -> Discovery | None:

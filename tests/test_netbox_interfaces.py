@@ -26,6 +26,7 @@ from bunnyauto.netbox.interfaces import (
     stack_member,
     supported_type,
     type_fits,
+    with_stack_member,
 )
 
 # Real interface set for the Aruba AP-655 device type (NetBox Data Exchange).
@@ -272,6 +273,20 @@ def test_member_local_names_keep_a_subinterface():
 def test_member_local_names_need_the_three_segment_stack_shape():
     assert member_local_names("Gi0/1") == []
     assert member_local_names("Port-channel1") == []
+
+
+def test_with_stack_member_changes_only_the_member_number():
+    assert with_stack_member("GigabitEthernet1/0/39", 2) == "GigabitEthernet2/0/39"
+    assert with_stack_member("Gi1/0/39", 2) == "Gi2/0/39"
+    assert with_stack_member("GigabitEthernet 1/0/39", 2) == "GigabitEthernet 2/0/39"
+    assert with_stack_member("Te1/1/1.100", 3) == "Te3/1/1.100"
+    assert with_stack_member("TwoGigabitEthernet10/0/1", 2) == "TwoGigabitEthernet2/0/1"
+
+
+def test_with_stack_member_needs_the_three_segment_stack_shape():
+    assert with_stack_member("GigabitEthernet0/39", 2) is None
+    assert with_stack_member("Port-channel1", 2) is None
+    assert with_stack_member("Vlan10", 2) is None
 
 
 # ---------------------------------------------------------------------------

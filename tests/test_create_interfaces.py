@@ -450,20 +450,125 @@ def test_member_port_already_on_its_member_is_not_recreated(wired):
     assert result.data[A2]["missing"] == []
 
 
-def test_template_numbered_member_port_is_skipped_with_a_note(wired):
-    # NetBox built SwitchA-2 from the device type's template: member-1 numbering.
+BRAVO1 = "Switch-Bravo-sw1-1"
+BRAVO2 = "Switch-Bravo-sw1-2"
+
+
+def _bravo():
+    return [_Device(1, BRAVO1, ip="10.0.0.21/24"), _Device(2, BRAVO2)]
+
+
+def test_member_port_under_member_ones_number_is_renamed(wired):
+    # Owner-reported: Switch-Bravo-sw1-2 had GigabitEthernet1/0/39 (member 1's
+    # number, from the device type's template) for its own Gi2/0/39.
     nb = wired(
-        existing={2: ["GigabitEthernet1/0/1"]},
-        discovered={A1: STACK_PORTS},
-        devices=_stack(),
+        existing={1: ["GigabitEthernet1/0/39"], 2: ["GigabitEthernet1/0/39"]},
+        discovered={BRAVO1: ["GigabitEthernet1/0/39", "GigabitEthernet2/0/39"]},
+        devices=_bravo(),
+    )
+
+    plan = TOOL.run(_ctx(nb=nb), _args())
+
+    assert plan.status is Status.DRIFT
+    assert plan.changes == [
+        f"{BRAVO2}: would rename GigabitEthernet1/0/39 to GigabitEthernet2/0/39 "
+        f"(wrong stack member number) [stack member 2, seen on {BRAVO1}]"
+    ]
+    assert plan.data[BRAVO2]["rename"] == [
+        {
+            "from": "GigabitEthernet1/0/39",
+            "to": "GigabitEthernet2/0/39",
+            "port": "GigabitEthernet2/0/39",
+        }
+    ]
+    assert "template_named" not in plan.data[BRAVO2]
+    assert "1 interface(s) with the wrong stack member number" in plan.summary
+    assert nb.dcim.interfaces.updated == []
+
+    applied = TOOL.run(_ctx(apply=True, nb=nb), _args())
+
+    assert applied.status is Status.CHANGED
+    # Same interface (its id, so its cables and IPs, kept), new name; member 1's untouched.
+    assert nb.dcim.interfaces.updated == [{"id": 2000, "name": "GigabitEthernet2/0/39"}]
+    assert nb.dcim.interfaces.created == []
+    assert applied.data[BRAVO2]["renamed"] == 1
+    assert "corrected the stack member number of 1" in applied.summary
+
+
+def test_rename_changes_only_the_member_number(wired):
+    # NetBox's spelling is kept; the switch's long name isn't copied over it.
+    nb = wired(
+        existing={1: ["Gi1/0/39"], 2: ["Gi1/0/39"]},
+        discovered={BRAVO1: ["GigabitEthernet1/0/39", "GigabitEthernet2/0/39"]},
+        devices=_bravo(),
+    )
+
+    TOOL.run(_ctx(apply=True, nb=nb), _args())
+
+    assert nb.dcim.interfaces.updated == [{"id": 2000, "name": "Gi2/0/39"}]
+
+
+def test_no_rename_when_the_member_already_has_the_right_name(wired):
+    # Renaming GigabitEthernet1/0/39 would duplicate GigabitEthernet2/0/39.
+    nb = wired(
+        existing={1: ["GigabitEthernet1/0/39"], 2: ["GigabitEthernet1/0/39", "Gi2/0/39"]},
+        discovered={BRAVO1: ["GigabitEthernet1/0/39", "GigabitEthernet2/0/39"]},
+        devices=_bravo(),
+    )
+
+    result = TOOL.run(_ctx(apply=True, nb=nb), _args())
+
+    assert result.status is Status.OK
+    assert nb.dcim.interfaces.updated == []
+
+
+def test_template_name_without_a_member_number_is_left_alone(wired):
+    nb = wired(
+        existing={1: ["GigabitEthernet1/0/1"], 2: ["GigabitEthernet0/1"]},
+        discovered={BRAVO1: ["GigabitEthernet1/0/1", "GigabitEthernet2/0/1"]},
+        devices=_bravo(),
     )
     notes = io.StringIO()
 
     result = TOOL.run(_ctx(apply=True, stream=notes, nb=nb), _args())
 
-    assert (2, "GigabitEthernet2/0/1") not in _created(nb)
-    assert result.data[A2]["template_named"] == {"GigabitEthernet2/0/1": "GigabitEthernet1/0/1"}
-    assert "GigabitEthernet2/0/1 is GigabitEthernet1/0/1" in notes.getvalue()
+    assert result.status is Status.OK
+    assert nb.dcim.interfaces.updated == nb.dcim.interfaces.created == []
+    assert result.data[BRAVO2]["template_named"] == {"GigabitEthernet2/0/1": "GigabitEthernet0/1"}
+    assert "GigabitEthernet2/0/1 is GigabitEthernet0/1" in notes.getvalue()
+
+
+def test_standalone_switch_ports_are_never_renumbered(wired):
+    # Not a stack (no <host>-<member> name, no Virtual Chassis): Gi2/0/1 is just a port.
+    nb = wired(
+        existing={1: ["GigabitEthernet1/0/1"]},
+        discovered={"bldg-sw": ["GigabitEthernet1/0/1", "GigabitEthernet2/0/1"]},
+        devices=[_Device(1, "bldg-sw", ip="10.0.0.9/24")],
+    )
+
+    TOOL.run(_ctx(apply=True, nb=nb), _args())
+
+    assert nb.dcim.interfaces.updated == []
+    assert _created(nb) == {(1, "GigabitEthernet2/0/1")}
+
+
+def test_rename_failure_is_reported(wired):
+    nb = wired(
+        existing={1: ["GigabitEthernet1/0/39"], 2: ["GigabitEthernet1/0/39"]},
+        discovered={BRAVO1: ["GigabitEthernet1/0/39", "GigabitEthernet2/0/39"]},
+        devices=_bravo(),
+    )
+
+    def refuse(payload):
+        raise RuntimeError("400 Bad Request")
+
+    nb.dcim.interfaces.update = refuse
+
+    result = TOOL.run(_ctx(apply=True, nb=nb), _args())
+
+    assert result.status is Status.PARTIAL  # member 1 was fine
+    assert result.data[BRAVO2]["error"] == "rename failed: 400 Bad Request"
+    assert result.data[BRAVO2]["renamed"] == 0
 
 
 def test_copy_on_the_wrong_member_is_reported_and_never_deleted(wired):
@@ -695,7 +800,10 @@ def test_connected_member_two_does_not_lend_its_template_names_to_member_one(wir
 
     result = TOOL.run(_ctx(nb=nb), _args())
 
-    assert result.data[A2]["template_named"] == {"GigabitEthernet2/0/1": "GigabitEthernet1/0/1"}
+    assert result.changes == [
+        f"{A2}: would rename GigabitEthernet1/0/1 to GigabitEthernet2/0/1 "
+        "(wrong stack member number)"
+    ]
     (blocked,) = result.data[A2]["blocked"]
     assert blocked["member"] == 1
     assert blocked["ports"] == ["GigabitEthernet1/0/1"]
@@ -726,7 +834,7 @@ def test_untagged_virtual_chassis_members_get_their_own_ports(wired):
         (2, "GigabitEthernet2/0/1"),
         (3, "GigabitEthernet3/0/1"),
     }
-    assert result.data[A2]["template_named"] == {"GigabitEthernet2/0/2": "GigabitEthernet1/0/2"}
+    assert nb.dcim.interfaces.updated == [{"id": 2000, "name": "GigabitEthernet2/0/2"}]
     assert f"including {A2}, {A3} as part of its Virtual Chassis" in notes.getvalue()
 
 
@@ -902,7 +1010,16 @@ def test_stack_members_template_named_port_gets_its_type_corrected(wired):
 
     assert result.changes == [
         f"{A2}: would change GigabitEthernet1/0/1 from 1000base-t to 1000base-tx "
-        f"(device reports '10/100/1000BaseTX') [stack member 2, seen on {A1}]"
+        f"(device reports '10/100/1000BaseTX') [stack member 2, seen on {A1}]",
+        f"{A2}: would rename GigabitEthernet1/0/1 to GigabitEthernet2/0/1 "
+        f"(wrong stack member number) [stack member 2, seen on {A1}]",
+    ]
+
+    TOOL.run(_ctx(apply=True, nb=nb), _args())
+
+    assert nb.dcim.interfaces.updated == [
+        {"id": 2000, "type": "1000base-tx"},
+        {"id": 2000, "name": "GigabitEthernet2/0/1"},
     ]
 
 
@@ -1080,12 +1197,33 @@ def test_stack_members_optic_goes_on_the_member_device(wired):
 
     TOOL.run(_ctx(apply=True, nb=nb), _args())
 
+    # Named after the interface as renamed this run: Te1/1/1 -> Te2/1/1.
     (item,) = nb.dcim.inventory_items.created
     assert (item["device"], item["component_id"], item["name"]) == (
         2,
         2000,
-        "TenGigabitEthernet1/1/1",
+        "TenGigabitEthernet2/1/1",
     )
+
+
+def test_optic_keeps_the_old_interface_name_when_the_rename_fails(wired):
+    optic = Transceiver("TenGigabitEthernet2/1/1", "SFP-10GBase-LR", "SFP-10G-LR", "V01", "LR1")
+    nb = wired(
+        existing={1: ["TenGigabitEthernet1/1/1"], 2: ["TenGigabitEthernet1/1/1"]},
+        discovered={A1: ["TenGigabitEthernet1/1/1", "TenGigabitEthernet2/1/1"]},
+        devices=_stack(members=2),
+        optics={A1: [optic]},
+    )
+
+    def refuse(payload):
+        raise RuntimeError("400 Bad Request")
+
+    nb.dcim.interfaces.update = refuse
+
+    TOOL.run(_ctx(apply=True, nb=nb), _args())
+
+    (item,) = nb.dcim.inventory_items.created
+    assert (item["component_id"], item["name"]) == (2000, "TenGigabitEthernet1/1/1")
 
 
 def test_unreadable_inventory_still_checks_interfaces(wired):
