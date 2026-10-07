@@ -1,18 +1,5 @@
 #!/usr/bin/env python3
-"""Pull "show ap lldp neighbors" from an Aruba controller and print it as JSON.
-
-Standalone test script - NOT part of bunnyauto. Only needs `requests`.
-
-    python BasicScripts/aruba_lldp_neighbors.py
-    python BasicScripts/aruba_lldp_neighbors.py > lldp.json
-
-Set CONTROLLER_URL below. Credentials come from ARUBA_USERNAME / ARUBA_PASSWORD
-if set, otherwise you are prompted.
-
-Some controllers (seen on a 9240, AOS 8) answer this command in XML wrapped in
-<my_xml_tag3xxx> instead of JSON, whatever the Accept header says. That reply
-is converted to the same shape: one list of row dicts per table, keyed by the
-column names. Only the JSON goes to stdout; status lines go to stderr.
+"""Pull "show ap lldp neighbors" from an Aruba controller and print it.
 """
 
 import getpass
