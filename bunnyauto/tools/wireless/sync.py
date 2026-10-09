@@ -18,7 +18,10 @@ live data.
   width, EIRP and SSIDs. A WLC is reached at its NetBox
   primary IPv4, or, if NetBox doesn't have one yet, at the IP the Conductor
   reports for it. Every WLC runs the same REST service as the Conductor
-  (``--wlc-port``, default 4343).
+  (``--wlc-port``, default 4343). A WLC whose LLDP table can't be read (an
+  Aruba bug on a 9240 running AOS 8.13.3.0 returns it as broken XML) is asked
+  about each AP in its ``show ap bss-table`` instead, one at a time
+  (``show ap lldp neighbors ap-name <ap>``).
 
 **Per device**
 
@@ -87,7 +90,8 @@ live data.
 * yellow, ``PARTIAL`` (exit 2): the device exists or was created, but something
   else couldn't be done: an IP (including "no containing Prefix"), a
   platform, a cable (including one NetBox has wired differently that can't be
-  re-pointed), a tag or serial update, or a WLC that couldn't be queried;
+  re-pointed), a tag or serial update, a WLC that couldn't be queried, or an AP
+  whose LLDP neighbors its WLC couldn't report when asked about it alone;
 * green: everything the network reported is in NetBox: ``CHANGED`` (20) after
   ``--apply``, ``DRIFT`` (10) for a plan with changes, ``OK`` (0) when in sync.
 
@@ -184,8 +188,20 @@ class _Live:
     radios: dict[str, list[Bss]] = field(default_factory=dict)
     #: WLC name -> why its AP data couldn't be read.
     failed: dict[str, str] = field(default_factory=dict)
+    #: AP -> why its LLDP neighbors couldn't be read when its WLC was asked
+    #: about it on its own (see :func:`_read_lldp`).
+    lldp_unread: dict[str, str] = field(default_factory=dict)
     #: WLC name -> what querying it returned (the ``--json`` view).
     wlcs: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class _PerAp:
+    """A WLC whose LLDP neighbors were read one AP at a time, and why."""
+
+    reason: str  # why its full table couldn't be read
+    asked: int
+    failed: dict[str, str] = field(default_factory=dict)  # AP name -> error
 
 
 @dataclass(slots=True)
@@ -493,8 +509,8 @@ def _query_wlcs(
                 ) as client,
             ):
                 wlc_aps = parse_ap_database(client.ap_database())
-                rows = parse_lldp_neighbors(client.ap_lldp_neighbors())
                 bss = parse_bss_table(client.ap_bss_table())
+                rows, per_ap = _read_lldp(client, bss)
         except ArubaError as exc:
             live.failed[wlc.name] = str(exc)
             live.wlcs[wlc.name] = {"url": url, "error": str(exc)}
@@ -506,6 +522,19 @@ def _query_wlcs(
             "lldp_neighbors": len(rows),
             "bss": len(bss),
         }
+        if per_ap is not None:
+            live.wlcs[wlc.name]["lldp_per_ap"] = {
+                "reason": per_ap.reason,
+                "asked": per_ap.asked,
+                "failed": per_ap.failed,
+            }
+            for ap_name, error in per_ap.failed.items():
+                live.lldp_unread[ap_name.casefold()] = f"{wlc.name}: {error}"
+            failed = f", {len(per_ap.failed)} of them failed" if per_ap.failed else ""
+            ctx.reporter.info(
+                f"{wlc.name}: its LLDP table couldn't be read ({per_ap.reason}); "
+                f"asked its {per_ap.asked} AP(s) one at a time{failed}"
+            )
         for ap in wlc_aps:
             if ap.os_version:
                 live.versions.setdefault(ap.name.casefold(), ap.os_version)
@@ -518,6 +547,35 @@ def _query_wlcs(
             if entry not in known:
                 known.append(entry)
     return live
+
+
+def _read_lldp(
+    client: ArubaConductorClient, bss: list[Bss]
+) -> tuple[list[LldpNeighbor], _PerAp | None]:
+    """A WLC's LLDP neighbors: its full table, or, if that can't be read, each AP's.
+
+    Workaround for an Aruba bug (owner-found 2026-10-09, a 9240 on AOS
+    8.13.3.0): the full ``show ap lldp neighbors`` comes back as broken XML,
+    with some rows cut off after ``Chassis Name/ID``, or times out, while
+    ``show ap lldp neighbors ap-name <ap>`` answers with complete JSON. So when
+    the table can't be read, every AP the WLC's ``show ap bss-table`` lists is
+    asked on its own. A WLC whose table reads fine never takes this path. With
+    no AP to ask, the table's error stands (the WLC is unread, as before).
+    """
+    try:
+        return parse_lldp_neighbors(client.ap_lldp_neighbors()), None
+    except ArubaError as exc:
+        names = list(dict.fromkeys(entry.ap_name for entry in bss))  # one per AP, in order
+        if not names:
+            raise
+        per_ap = _PerAp(reason=str(exc), asked=len(names))
+    rows: list[LldpNeighbor] = []
+    for name in names:
+        try:
+            rows += parse_lldp_neighbors(client.ap_lldp_neighbors(name))
+        except ArubaError as exc:
+            per_ap.failed[name] = str(exc)
+    return rows, per_ap
 
 
 def _existing(d: WirelessDevice, by_serial: dict[str, Any], by_name: dict[str, Any]) -> Any:
@@ -586,7 +644,8 @@ def _sync_device(run: _Run, match: _Match) -> _Report:
             report.issues.append(f"IP {d.ip}: not placed, because its bridge couldn't be created")
         elif d.ip:
             interfaces = _sync_ip(run, match, device, interfaces, report, target=bridge)
-        _sync_cables(run, device, interfaces, uplinks, report)
+        lldp_error = run.live.lldp_unread.get(d.name.casefold())
+        _sync_cables(run, device, interfaces, uplinks, report, lldp_error=lldp_error)
         _sync_radios(run, d, interfaces, report)
     elif d.ip and match.action == "create":  # a new WLC; an existing one's IP is never touched
         _sync_ip(run, match, device, _interfaces(run, match, device), report)
@@ -791,7 +850,12 @@ def _sync_cables(
     interfaces: list[Any],
     uplinks: list[LldpNeighbor],
     report: _Report,
+    *,
+    lldp_error: str | None = None,
 ) -> None:
+    if not uplinks and lldp_error:
+        report.issues.append(f"could not read its LLDP neighbors — {lldp_error}")
+        return
     if not uplinks:
         note = "no LLDP neighbor reported for this AP"
         if run.live.failed:

@@ -30,6 +30,7 @@ class _FakeSession:
         self.verify = None
         self.headers: dict[str, str] = {}
         self.calls: list[tuple[str, str]] = []
+        self.params: list[dict[str, str]] = []
         self.closed = False
 
     def post(self, url, **kw):
@@ -43,6 +44,7 @@ class _FakeSession:
 
     def get(self, url, **kw):
         self.calls.append(("GET", url))
+        self.params.append(kw.get("params") or {})
         result = _FakeSession.script.get("get")
         if isinstance(result, Exception):
             raise result
@@ -123,3 +125,19 @@ def test_ap_lldp_neighbors_returns_rows():
     rows = client.ap_lldp_neighbors()
     assert rows == [{"AP Name": "ap1", "Neighbor System Name": "sw1"}]
     assert ("GET", "https://c:4343/v1/configuration/showcommand") in client._session.calls
+    assert client._session.params[-1]["command"] == "show ap lldp neighbors"
+
+
+@pytest.mark.parametrize(
+    ("ap_name", "command"),
+    [
+        ("hq-idf1-ap01", "show ap lldp neighbors ap-name hq-idf1-ap01"),
+        ("lobby ap 1", 'show ap lldp neighbors ap-name "lobby ap 1"'),
+    ],
+)
+def test_ap_lldp_neighbors_for_one_ap(ap_name, command):
+    _FakeSession.script["login"] = _ok_login()
+    _FakeSession.script["get"] = _Resp(200, {"AP LLDP Neighbors": [{"AP": ap_name}]})
+    client = ArubaConductorClient("https://c:4343", "u", "p")
+    assert client.ap_lldp_neighbors(ap_name) == [{"AP": ap_name}]
+    assert client._session.params[-1]["command"] == command

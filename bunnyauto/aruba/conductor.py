@@ -128,10 +128,18 @@ class ArubaConductorClient:
         """Rows from ``show switches`` (the controllers the Conductor manages)."""
         return _rows(self.showcommand("show switches"))
 
-    def ap_lldp_neighbors(self) -> list[dict[str, Any]]:
+    def ap_lldp_neighbors(self, ap_name: str | None = None) -> list[dict[str, Any]]:
         """Rows from ``show ap lldp neighbors`` (confirmed against real AOS 8
-        hardware 2026-09-22) — each AP's wired LLDP neighbor, if any."""
-        return _rows(self.showcommand("show ap lldp neighbors"))
+        hardware 2026-09-22) — each AP's wired LLDP neighbor, if any.
+
+        With ``ap_name``, only that AP's rows (``... ap-name <ap>``). The owner
+        confirmed 2026-10-09 that this returns complete JSON on a 9240 (AOS
+        8.13.3.0) whose full table comes back as broken XML.
+        """
+        command = "show ap lldp neighbors"
+        if ap_name:
+            command += f" ap-name {_cli_arg(ap_name)}"
+        return _rows(self.showcommand(command))
 
     def ap_bss_table(self) -> list[dict[str, Any]]:
         """Rows from ``show ap bss-table``: one per SSID per radio, per AP."""
@@ -186,6 +194,11 @@ def _global_result(resp: Any, what: str) -> dict[str, Any]:
     if not isinstance(result, dict):
         raise ArubaError(f"the Conductor {what} response was not in the expected shape")
     return result
+
+
+def _cli_arg(value: str) -> str:
+    """A CLI argument as AOS reads it: double-quoted only if it contains whitespace."""
+    return f'"{value}"' if any(ch.isspace() for ch in value) else value
 
 
 def _rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
