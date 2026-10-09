@@ -300,18 +300,32 @@ class _Ctx:
 # --- fake Conductor / WLC client --------------------------------------
 
 
-def _aruba(monkeypatch, *, switches=(), aps=(), wlc_aps=None, lldp=(), bss=(), errors=None):
+def _aruba(
+    monkeypatch,
+    *,
+    switches=(),
+    aps=(),
+    wlc_aps=None,
+    lldp=(),
+    bss=(),
+    errors=None,
+    lldp_by_ap=None,
+):
     """The Conductor answers at CONDUCTOR; any other URL is a WLC.
 
     A WLC's ``show ap database long`` returns ``wlc_aps`` (default: the same
     rows as the Conductor's); ``errors`` maps a URL to what logging in raises.
+    ``lldp_by_ap`` makes every WLC's full LLDP table unreadable (the 9240's
+    broken XML) and maps an AP name to what ``... ap-name <ap>`` returns: rows,
+    or an exception to raise. Each call's ``asked`` lists the APs asked about.
     """
     calls: list[SimpleNamespace] = []
 
     class FakeClient:
         def __init__(self, url, user, pw, *, verify=True, timeout=30.0):
             self.url = url
-            calls.append(SimpleNamespace(url=url, user=user, password=pw, verify=verify))
+            self.record = SimpleNamespace(url=url, user=user, password=pw, verify=verify, asked=[])
+            calls.append(self.record)
 
         def __enter__(self):
             error = (errors or {}).get(self.url)
@@ -330,8 +344,16 @@ def _aruba(monkeypatch, *, switches=(), aps=(), wlc_aps=None, lldp=(), bss=(), e
                 return list(aps)
             return list(wlc_aps)
 
-        def ap_lldp_neighbors(self):
-            return list(lldp)
+        def ap_lldp_neighbors(self, ap_name=None):
+            if lldp_by_ap is None:
+                return list(lldp)
+            if ap_name is None:
+                raise ArubaError("the Conductor response for 'show ap lldp neighbors' was not JSON")
+            self.record.asked.append(ap_name)
+            answer = lldp_by_ap.get(ap_name, [])
+            if isinstance(answer, Exception):
+                raise answer
+            return list(answer)
 
         def ap_bss_table(self):
             return list(bss)
@@ -1280,6 +1302,65 @@ def test_wlc_with_no_ap_data_is_informational(monkeypatch):
         "lldp_neighbors": 0,
         "bss": 0,
     }
+
+
+# --- LLDP read one AP at a time (Aruba 9240 bug workaround) ---------------
+
+_NOT_JSON = "the Conductor response for 'show ap lldp neighbors' was not JSON"
+
+
+def _per_ap_run(monkeypatch, lldp_by_ap, *, bss=None):
+    if bss is None:  # air-monitor rows: they name the AP without bringing in radio updates
+        bss = [_bss("Corp", kind="am"), _bss("Corp", band="2.4", channel="6", width=20, kind="am")]
+    calls = _aruba(
+        monkeypatch,
+        switches=[WLC],
+        aps=[{**AP, "IP Address": ""}],
+        bss=bss,
+        lldp_by_ap=lldp_by_ap,
+    )
+    ctx = _Ctx(_cabling_nb())
+    result = TOOL.run(ctx, _args(only="aps"))
+    (wlc_call,) = [c for c in calls if c.url == WLC_URL]
+    return wlc_call.asked, ctx, result
+
+
+def test_unreadable_lldp_table_is_read_one_ap_at_a_time(monkeypatch):
+    asked, ctx, result = _per_ap_run(monkeypatch, {"hq-idf1-ap01": [LLDP]})
+    assert asked == ["hq-idf1-ap01"]  # once, though the bss-table lists it twice
+    assert result.status is Status.DRIFT
+    assert "hq-idf1-ap01: would create cable E1 <-> hq-idf1-sw01:GigabitEthernet1/0/24" in (
+        result.changes
+    )
+    assert _device(result)["status"] == "ok"
+    wlc = result.data["wlcs"]["hq-wlc01"]
+    assert wlc["lldp_neighbors"] == 1
+    assert wlc["bss"] == 2  # the bss-table isn't lost with the LLDP table
+    assert wlc["lldp_per_ap"] == {"reason": _NOT_JSON, "asked": 1, "failed": {}}
+    assert (
+        "info",
+        f"hq-wlc01: its LLDP table couldn't be read ({_NOT_JSON}); asked its 1 AP(s) one at a time",
+    ) in ctx.reporter.lines
+
+
+def test_ap_its_wlc_cannot_report_on_its_own_is_yellow(monkeypatch):
+    asked, ctx, result = _per_ap_run(monkeypatch, {"hq-idf1-ap01": ArubaError("timed out")})
+    assert asked == ["hq-idf1-ap01"]
+    assert result.status is Status.PARTIAL
+    assert _device(result)["status"] == "partial"
+    assert "could not read its LLDP neighbors — hq-wlc01: timed out" in _device(result)["issues"]
+    assert result.data["wlcs"]["hq-wlc01"]["lldp_per_ap"]["failed"] == {"hq-idf1-ap01": "timed out"}
+    assert any(
+        m.endswith("asked its 1 AP(s) one at a time, 1 of them failed")
+        for _level, m in ctx.reporter.lines
+    )
+
+
+def test_unreadable_lldp_table_with_no_ap_to_ask_leaves_the_wlc_unread(monkeypatch):
+    asked, _ctx, result = _per_ap_run(monkeypatch, {}, bss=[])
+    assert asked == []
+    assert result.status is Status.PARTIAL
+    assert result.data["wlcs"]["hq-wlc01"] == {"url": WLC_URL, "error": _NOT_JSON}
 
 
 # --- cables ---------------------------------------------------------------
