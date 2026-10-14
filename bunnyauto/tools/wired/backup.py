@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 
 from bunnyauto.backup.collect import HostBackup, collect_device_backup
 from bunnyauto.common import first_error
+from bunnyauto.retry import run_with_retries
 from bunnyauto.tools.base import Status, ToolResult, add_common_arguments
 
 if TYPE_CHECKING:
@@ -68,14 +69,16 @@ class Backup:
         note = "" if sanitize else "  [RAW — secrets are NOT redacted]"
         ctx.reporter.step(f"backing up {len(hosts)} device(s) to {dated_dir}{note}")
 
-        with ctx.reporter.track(targets, description="backup") as tracked:
-            run_result = tracked.run(
-                name="bunnyauto backup",
-                task=collect_device_backup,
-                output_dir=dated_dir,
-                sanitize=sanitize,
-                read_timeout=ctx.settings.read_timeout,
-            )
+        run_result = run_with_retries(
+            ctx,
+            targets,
+            description="backup",
+            name="bunnyauto backup",
+            task=collect_device_backup,
+            output_dir=dated_dir,
+            sanitize=sanitize,
+            read_timeout=ctx.settings.read_timeout,
+        )
 
         devices: dict[str, dict[str, object]] = {}
         artifacts: list[Path] = []

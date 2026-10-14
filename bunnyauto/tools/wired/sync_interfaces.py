@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Any
 from bunnyauto.common import first_error
 from bunnyauto.errors import ToolError
 from bunnyauto.netbox.devices import inventory_device_id, select_tagged_inventory
+from bunnyauto.retry import run_with_retries
 from bunnyauto.sync import engine
 from bunnyauto.tools.base import Status, ToolResult, add_common_arguments
 
@@ -123,14 +124,16 @@ class SyncInterfaces:
         ctx.reporter.step(
             f"collecting interface state from {len(selected.inventory.hosts)} device(s)"
         )
-        with ctx.reporter.track(selected, description="sync-interfaces: collect") as tracked:
-            results = tracked.run(
-                task=engine.collect_device_state,
-                name="sync-interfaces: collect",
-                ambiguous_vlan_ids=ambiguous_vlan_ids,
-                voice_vlan_model=args.voice_vlan_model,
-                access_vlan_placement=args.access_vlan_placement,
-            )
+        results = run_with_retries(
+            ctx,
+            selected,
+            description="sync-interfaces: collect",
+            name="sync-interfaces: collect",
+            task=engine.collect_device_state,
+            ambiguous_vlan_ids=ambiguous_vlan_ids,
+            voice_vlan_model=args.voice_vlan_model,
+            access_vlan_placement=args.access_vlan_placement,
+        )
 
         collected_devices: list[Any] = []
         unreachable: dict[str, str] = {}  # host -> why its collection failed

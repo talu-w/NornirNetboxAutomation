@@ -21,7 +21,8 @@ processor to it, and decides whether any of this runs at all (never in
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from nornir.core.inventory import Host
@@ -33,10 +34,19 @@ if TYPE_CHECKING:
 class HostProgressProcessor:
     """One pinned overall bar + one bar per in-flight host."""
 
-    def __init__(self, progress: Progress, console: Console, overall_id: int) -> None:
+    def __init__(
+        self,
+        progress: Progress,
+        console: Console,
+        overall_id: int,
+        retry_check: Callable[[Host, MultiResult], bool] | None = None,
+    ) -> None:
         self._progress = progress
         self._console = console
         self._overall_id = overall_id
+        #: Says whether a failed host will be run again (see :mod:`bunnyauto.retry`),
+        #: so its line reads "will retry" rather than reporting a failure.
+        self._retry_check = retry_check
         self._host_tasks: dict[str, int] = {}
 
     def task_started(self, task: Task) -> None:  # noqa: D102 - Processor protocol
@@ -53,6 +63,8 @@ class HostProgressProcessor:
         failed = bool(getattr(result, "failed", False))
         style = "red" if failed else "green"
         label = "failed" if failed else "done"
+        if failed and self._retry_check is not None and self._retry_check(host, result):
+            style, label = "yellow", "failed to connect — will retry"
         self._console.print(f"  [{style}]{host.name}: {label}[/{style}]")
         if task_id is not None:
             self._progress.remove_task(task_id)
@@ -68,8 +80,12 @@ class HostProgressProcessor:
 
 
 def build_host_progress(
-    progress: Progress, console: Console, total: int, description: str
+    progress: Progress,
+    console: Console,
+    total: int,
+    description: str,
+    retry_check: Callable[[Any, Any], bool] | None = None,
 ) -> HostProgressProcessor:
     """Add the pinned overall task to ``progress`` and return its processor."""
     overall_id = progress.add_task(description, total=total)
-    return HostProgressProcessor(progress, console, overall_id)
+    return HostProgressProcessor(progress, console, overall_id, retry_check)

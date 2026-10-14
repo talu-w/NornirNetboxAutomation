@@ -100,6 +100,7 @@ from bunnyauto.netbox.transceivers import (
     load_inventory_items,
     plan_inventory_item,
 )
+from bunnyauto.retry import run_with_retries
 from bunnyauto.tools.base import Status, ToolResult, add_common_arguments
 
 if TYPE_CHECKING:
@@ -369,12 +370,14 @@ class CreateInterfaces:
             raise ToolError("no tagged NetBox devices matched the Nornir inventory")
 
         ctx.reporter.step(f"discovering interfaces on {len(selected.inventory.hosts)} device(s)")
-        with ctx.reporter.track(selected, description="create-interfaces: discover") as tracked:
-            run_result = tracked.run(
-                task=_collect,
-                name="create-interfaces: discover",
-                include_virtual=args.include_virtual,
-            )
+        run_result = run_with_retries(
+            ctx,
+            selected,
+            description="create-interfaces: discover",
+            name="create-interfaces: discover",
+            task=_collect,
+            include_virtual=args.include_virtual,
+        )
 
         plans: dict[int, _DevicePlan] = {}
         blocked: dict[tuple[str, int], _Blocked] = {}

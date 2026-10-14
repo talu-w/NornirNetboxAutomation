@@ -31,6 +31,7 @@ from bunnyauto.health import collect as _simple_collect
 from bunnyauto.health import elaborate_collect as _elaborate_collect
 from bunnyauto.health.elaborate_workbook import create_elaborate_health_workbook
 from bunnyauto.health.simple_workbook import create_health_workbook
+from bunnyauto.retry import run_with_retries
 from bunnyauto.tools.base import Status, ToolResult, add_common_arguments
 
 if TYPE_CHECKING:
@@ -141,12 +142,14 @@ class Health:
 
         ctx.reporter.step(f"collecting {report.label} from {len(hosts)} device(s)")
         description = f"health-{args.report}: collect"
-        with ctx.reporter.track(targets, description=description) as tracked:
-            results = tracked.run(
-                name=description,
-                task=report.collect_mod.collect_device_health,
-                read_timeout=ctx.settings.read_timeout,
-            )
+        results = run_with_retries(
+            ctx,
+            targets,
+            description=description,
+            name=description,
+            task=report.collect_mod.collect_device_health,
+            read_timeout=ctx.settings.read_timeout,
+        )
         records = report.collect_mod.extract_records(results, hosts)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         report.workbook(records, ctx.settings.target_tag, output_path)

@@ -62,10 +62,10 @@ class _FakeMultiResult:
         self.failed = failed
 
 
-def _processor(progress, console=None, overall_id=None):
+def _processor(progress, console=None, overall_id=None, retry_check=None):
     if overall_id is None:
         overall_id = progress.add_task("overall", total=1)
-    return HostProgressProcessor(progress, console or _FakeConsole(), overall_id)
+    return HostProgressProcessor(progress, console or _FakeConsole(), overall_id, retry_check)
 
 
 def test_task_instance_started_adds_one_bar_for_that_host():
@@ -129,6 +129,51 @@ def test_task_instance_completed_marks_failed_hosts_in_the_scrolling_line():
     )
 
     assert any("sw1" in line and "failed" in line for line in console.lines)
+
+
+def test_a_host_that_will_be_retried_is_not_reported_as_failed():
+    console = _FakeConsole()
+    seen = []
+
+    def retry_check(host, result):
+        seen.append(host.name)
+        return True
+
+    processor = _processor(_FakeProgress(), console=console, retry_check=retry_check)
+    processor.task_instance_started(_FakeTask("x"), _FakeHost("sw1"))
+
+    processor.task_instance_completed(
+        _FakeTask("x"), _FakeHost("sw1"), _FakeMultiResult(failed=True)
+    )
+
+    assert seen == ["sw1"]
+    (line,) = console.lines
+    assert "sw1" in line and "will retry" in line and "[yellow]" in line
+
+
+def test_a_failure_that_will_not_be_retried_is_still_reported_as_failed():
+    console = _FakeConsole()
+    processor = _processor(_FakeProgress(), console=console, retry_check=lambda host, result: False)
+    processor.task_instance_started(_FakeTask("x"), _FakeHost("sw1"))
+
+    processor.task_instance_completed(
+        _FakeTask("x"), _FakeHost("sw1"), _FakeMultiResult(failed=True)
+    )
+
+    (line,) = console.lines
+    assert "sw1: failed" in line and "[red]" in line and "retry" not in line
+
+
+def test_the_retry_check_is_not_asked_about_hosts_that_succeeded():
+    asked = []
+    processor = _processor(
+        _FakeProgress(), retry_check=lambda host, result: asked.append(host.name) or True
+    )
+    processor.task_instance_started(_FakeTask("x"), _FakeHost("sw1"))
+
+    processor.task_instance_completed(_FakeTask("x"), _FakeHost("sw1"), _FakeMultiResult())
+
+    assert asked == []
 
 
 def test_live_region_never_exceeds_in_flight_hosts_for_a_large_inventory():
@@ -197,6 +242,18 @@ def test_track_attaches_one_processor_when_interactive():
         assert nr.with_processors_called_with is not None
         assert len(nr.with_processors_called_with) == 1
         assert isinstance(nr.with_processors_called_with[0], HostProgressProcessor)
+
+
+def test_track_hands_the_retry_check_to_its_processor():
+    reporter = Reporter(use_rich=True, stream=io.StringIO())
+    nr = _FakeNornir({"sw1": object()})
+
+    def check(host, result):
+        return True
+
+    with reporter.track(nr, description="backup", retry_check=check):
+        (processor,) = nr.with_processors_called_with
+        assert processor._retry_check is check
 
 
 def test_spinner_is_a_noop_outside_an_interactive_console():

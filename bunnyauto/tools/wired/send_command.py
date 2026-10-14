@@ -16,6 +16,7 @@ from nornir_netmiko.tasks import netmiko_send_command
 
 from bunnyauto.common import first_error
 from bunnyauto.errors import ToolError
+from bunnyauto.retry import run_with_retries
 from bunnyauto.tools.base import Status, ToolResult, add_common_arguments
 
 if TYPE_CHECKING:
@@ -81,13 +82,15 @@ class SendCommand:
             )
 
         ctx.reporter.step(f"running {command!r} on {host_count} device(s)")
-        with ctx.reporter.track(targets, description=f"send-command: {command}") as tracked:
-            run_result = tracked.run(
-                task=_send,
-                name=f"send-command: {command}",
-                command=command,
-                read_timeout=ctx.settings.read_timeout,
-            )
+        run_result = run_with_retries(
+            ctx,
+            targets,
+            description=f"send-command: {command}",
+            name=f"send-command: {command}",
+            task=_send,
+            command=command,
+            read_timeout=ctx.settings.read_timeout,
+        )
 
         devices: dict[str, dict[str, object]] = {}
         failures: list[str] = []

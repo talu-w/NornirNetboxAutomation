@@ -465,6 +465,29 @@ def test_build_context_applies_timeout_overrides(env_file, nornir_config, _creds
     assert not hasattr(ctx.settings, "bogus")
 
 
+def test_build_context_retries_failed_connections_three_times_by_default(
+    env_file, nornir_config, _creds_env
+):
+    ctx = build_context(
+        env="test", reporter=make_reporter(), config_file=nornir_config, env_file=env_file
+    )
+    assert ctx.settings.connect_retries == 3
+    assert ctx.settings.retry_delay == 5.0
+
+
+def test_build_context_applies_retry_overrides(env_file, nornir_config, _creds_env):
+    ctx = build_context(
+        env="test",
+        reporter=make_reporter(),
+        config_file=nornir_config,
+        env_file=env_file,
+        connect_retries=0,
+        retry_delay=0.5,
+    )
+    assert ctx.settings.connect_retries == 0
+    assert ctx.settings.retry_delay == 0.5
+
+
 def test_build_context_defaults_region_and_site_to_none(env_file, nornir_config, _creds_env):
     ctx = build_context(
         env="test",

@@ -37,6 +37,7 @@ from bunnyauto.environments import Environment, resolve_environment
 from bunnyauto.errors import NetBoxError, RoleScopeError, TagMismatchError
 from bunnyauto.netbox.roles import RoleTree
 from bunnyauto.preflight import preflight
+from bunnyauto.retry import DEFAULT_CONNECT_RETRIES, DEFAULT_RETRY_DELAY
 from bunnyauto.scope import Scope, resolve_scope
 
 if TYPE_CHECKING:
@@ -86,6 +87,10 @@ class Settings:
     banner_timeout: float = 120.0
     read_timeout: float = 180.0
     delay_factor: float = 2.0
+    #: Extra passes over the devices that failed to connect (see :mod:`bunnyauto.retry`).
+    connect_retries: int = DEFAULT_CONNECT_RETRIES
+    #: Seconds to wait before each of those passes.
+    retry_delay: float = DEFAULT_RETRY_DELAY
 
 
 @dataclass(slots=True)
@@ -233,6 +238,8 @@ def build_context(
     legacy_ssh: bool = False,
     output_dir: str | os.PathLike[str] = ".",
     timeouts: Mapping[str, float] | None = None,
+    connect_retries: int | None = None,
+    retry_delay: float | None = None,
     need_devices: bool = True,
     need_netbox: bool = True,
     category: Category | None = None,
@@ -278,6 +285,11 @@ def build_context(
     extra_timeouts = {
         key: float(value) for key, value in (timeouts or {}).items() if key in _TIMEOUT_FIELDS
     }
+    retry_settings: dict[str, Any] = {}
+    if connect_retries is not None:
+        retry_settings["connect_retries"] = max(0, connect_retries)
+    if retry_delay is not None:
+        retry_settings["retry_delay"] = max(0.0, retry_delay)
     branch_role = None
     if category is not None and category.branch is not None and need_netbox:
         branch_role = environment.roles.get(category.branch)
@@ -307,6 +319,7 @@ def build_context(
         force_tag=force_tag,
         output_dir=Path(output_dir).expanduser(),
         **extra_timeouts,
+        **retry_settings,
     )
     return Context(
         settings=settings,
