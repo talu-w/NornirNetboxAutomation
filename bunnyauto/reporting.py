@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import json
 import sys
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, TextIO
@@ -159,7 +159,13 @@ class Reporter:
     # -- live progress -----------------------------------------------------
 
     @contextmanager
-    def track(self, nr: Any, *, description: str = "") -> Iterator[Any]:
+    def track(
+        self,
+        nr: Any,
+        *,
+        description: str = "",
+        retry_check: Callable[[Any, Any], bool] | None = None,
+    ) -> Iterator[Any]:
         """Run a Nornir task under a live progress display, if interactive.
 
         One pinned "overall" bar (``X/N`` devices) plus one bar per host
@@ -171,6 +177,9 @@ class Reporter:
         Yields something to call ``.run()`` on. Outside an interactive TTY (CI,
         ``--json``) this is a no-op that yields ``nr`` unchanged, so callers can
         use it unconditionally: ``with ctx.reporter.track(targets) as tracked:``.
+
+        ``retry_check(host, result)`` says whether a failed host is about to be run
+        again; if so its line reads "will retry" instead of "failed".
         """
         if self._console is None:
             yield nr
@@ -191,7 +200,7 @@ class Reporter:
         )
         with progress:
             processor = build_host_progress(
-                progress, self._console, len(hosts), description or "running"
+                progress, self._console, len(hosts), description or "running", retry_check
             )
             yield nr.with_processors([processor])
 

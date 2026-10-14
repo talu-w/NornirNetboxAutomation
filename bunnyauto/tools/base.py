@@ -14,8 +14,9 @@ import argparse
 import os
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
-from bunnyauto.common import env_flag, positive_float
+from bunnyauto.common import env_flag, non_negative_float, non_negative_int, positive_float
 from bunnyauto.result import EXIT_CODES, Status, ToolResult
+from bunnyauto.retry import DEFAULT_CONNECT_RETRIES, DEFAULT_RETRY_DELAY
 
 if TYPE_CHECKING:
     from bunnyauto.context import Context
@@ -49,6 +50,8 @@ COMMON_ARG_DESTS = frozenset(
         "banner_timeout",
         "read_timeout",
         "delay_factor",
+        "connect_retries",
+        "retry_delay",
     }
 )
 
@@ -152,6 +155,23 @@ def add_ssh_arguments(parser: argparse.ArgumentParser) -> None:
     ssh.add_argument("--read-timeout", type=positive_float, default=None, dest="read_timeout")
     ssh.add_argument(
         "--global-delay-factor", type=positive_float, default=None, dest="delay_factor"
+    )
+    ssh.add_argument(
+        "--connect-retries",
+        type=non_negative_int,
+        default=None,
+        dest="connect_retries",
+        help=(
+            "after the first pass, try the devices that failed to connect again, this many "
+            f"times (default: {DEFAULT_CONNECT_RETRIES}; 0 = never)"
+        ),
+    )
+    ssh.add_argument(
+        "--retry-delay",
+        type=non_negative_float,
+        default=None,
+        dest="retry_delay",
+        help=f"seconds to wait before each retry pass (default: {DEFAULT_RETRY_DELAY:g})",
     )
 
 

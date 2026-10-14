@@ -248,6 +248,8 @@ def _run_tool(
         assume_yes=False,
         ask_fn=input_fn,
         timeouts=timeouts_from_args(args),
+        connect_retries=getattr(args, "connect_retries", None),
+        retry_delay=getattr(args, "retry_delay", None),
         need_devices=getattr(tool, "needs_devices", True),
         need_netbox=getattr(tool, "needs_netbox", True),
         category=CATEGORIES[tool.category],

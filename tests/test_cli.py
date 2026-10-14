@@ -13,6 +13,7 @@ import pytest
 from bunnyauto import cli
 from bunnyauto.errors import InventoryError
 from bunnyauto.result import Status, ToolResult
+from bunnyauto.tools.base import add_ssh_arguments
 
 
 def test_parser_requires_env():
@@ -66,6 +67,53 @@ def test_parser_accepts_role_region_and_site():
     assert args.role == "access-switch"
     assert args.region == "south"
     assert args.site == "dallas-metro-it-services"
+
+
+def test_parser_accepts_connect_retry_options():
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            "--env",
+            "test",
+            "wired",
+            "backup",
+            "--connect-retries",
+            "0",
+            "--retry-delay",
+            "1.5",
+        ]
+    )
+    assert args.connect_retries == 0
+    assert args.retry_delay == 1.5
+
+
+def test_parser_leaves_the_retry_options_unset_by_default():
+    args = cli.build_parser().parse_args(["--env", "test", "wired", "backup"])
+    assert args.connect_retries is None
+    assert args.retry_delay is None
+
+
+@pytest.mark.parametrize("flag", ["--connect-retries", "--retry-delay"])
+def test_parser_rejects_negative_retry_options(flag, capsys):
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(["--env", "test", "wired", "backup", flag, "-1"])
+    assert "must not be negative" in capsys.readouterr().err
+
+
+def test_main_hands_the_retry_options_to_build_context(monkeypatch, fake_registry):
+    fake_registry(_FakeTool(result=ToolResult(status=Status.OK, summary="ok")))
+    captured = {}
+
+    def _fake_build_context(**kwargs):
+        captured.update(kwargs)
+        return _FakeCtx()
+
+    monkeypatch.setattr(cli, "build_context", _fake_build_context)
+
+    cli.main(["--env", "test", "wired", "send-command", "show version", "--connect-retries", "5"])
+
+    assert captured["connect_retries"] == 5
+    assert captured["retry_delay"] is None
 
 
 def test_every_category_has_its_tools():
@@ -136,6 +184,7 @@ class _FakeTool:
         self.ran_with = None
 
     def add_arguments(self, parser: argparse.ArgumentParser) -> None:
+        add_ssh_arguments(parser)
         parser.add_argument("command")
 
     def run(self, ctx, args):

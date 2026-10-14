@@ -70,6 +70,28 @@ def positive_float(value: str) -> float:
     return parsed
 
 
+def non_negative_int(value: str) -> int:
+    """argparse ``type=`` for a whole number that may be zero."""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(f"{value!r} is not a whole number") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must not be negative")
+    return parsed
+
+
+def non_negative_float(value: str) -> float:
+    """argparse ``type=`` for a number of seconds that may be zero."""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(f"{value!r} is not a number") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must not be negative")
+    return parsed
+
+
 def env_flag(name: str, default: bool = False) -> bool:
     """Read a boolean-ish environment variable (``1/true/yes/on``)."""
     raw = os.getenv(name)
