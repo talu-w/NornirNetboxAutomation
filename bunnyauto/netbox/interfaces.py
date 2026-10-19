@@ -94,15 +94,15 @@ FAMILY_ALIASES: dict[str, str] = {
     "portchannel": "po",
     "lo": "lo",
     "loopback": "lo",
-    # VLAN SVIs: ``show interfaces`` says "Vlan100" (what create-interfaces
-    # writes), ``show interfaces description`` says "Vl100".
+    # VLAN SVIs: ``show interfaces`` says "Vlan100" (what the create step
+    # of ``wired interfaces`` writes), ``show interfaces description`` says "Vl100".
     "vl": "vlan",
     "vlan": "vlan",
     "ap": "ap",
     "appgigabitethernet": "ap",
 }
 
-#: Canonical family -> the NetBox interface type ``create-interfaces`` creates it as.
+#: Canonical family -> the NetBox interface type ``wired interfaces`` creates it as.
 _FAMILY_TYPES: dict[str, str] = {
     "po": "lag",
     "lo": "virtual",

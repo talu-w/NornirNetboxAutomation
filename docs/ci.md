@@ -4,7 +4,7 @@ Three GitHub Actions workflows drive the network as code:
 
 | Workflow | Trigger | What it does | Writes? |
 |---|---|---|---|
-| [`plan.yml`](../.github/workflows/plan.yml) | every PR | ruff + pytest, then **plan** `wired create-interfaces` + `wired sync-interfaces` against **test** and post the diff as a PR comment | no |
+| [`plan.yml`](../.github/workflows/plan.yml) | every PR | ruff + pytest, then **plan** `wired interfaces` (create missing interfaces, then sync them) against **test** and post the diff as a PR comment | no |
 | [`apply.yml`](../.github/workflows/apply.yml) | push to `main` | plan against **prod**, then **apply** after a required reviewer approves the `production` environment | yes (prod NetBox) |
 | [`nightly.yml`](../.github/workflows/nightly.yml) | 07:00 UTC daily | `wired backup` (redacted) + both `wired health` reports for **test** and **prod**, committed to the backups repo | no (backups repo only) |
 
@@ -79,8 +79,8 @@ Config `diff`s over time in that repo are the running record of the network.
 ## Day-to-day flow
 
 1. Change something in NetBox (or in a device the pipeline reconciles from).
-2. Open a PR. `plan.yml` comments what `wired sync-interfaces` / `wired create-interfaces`
-   would change against **test**.
+2. Open a PR. `plan.yml` comments what `wired interfaces` would create and sync
+   against **test**.
 3. Merge. `apply.yml` plans against **prod** and waits.
 4. A reviewer reads the prod plan and approves the `production` deployment.
 5. `apply.yml` applies to the prod NetBox.
@@ -114,7 +114,12 @@ a small helper defined at the top of the step:
 | `10` | success, plus a warning on the run page (with `--apply` this means changes were found but not written, which shouldn't happen) |
 | `1`, `2`, anything else | the step fails with that code; the commands after it don't run |
 
-So `wired sync-interfaces` only runs once `wired create-interfaces` has succeeded.
+`wired interfaces` does both jobs in one command: it creates the interfaces NetBox is
+missing (types, stack member numbers, optics), then syncs every interface's VLANs,
+enabled state and description, so a new interface is complete after one apply.
+In a plan, the interfaces it would create are listed as awaiting creation by the
+sync step rather than reported as missing. `--only create` / `--only sync` run one
+step by itself.
 
 **The plan steps** (`plan.yml` → "Plan against test", `apply.yml` → "Plan against
 prod") run `scripts/ci_plan.py`. It runs the tools with `--json` and has only two

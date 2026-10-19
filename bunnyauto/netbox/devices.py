@@ -2,7 +2,8 @@
 
 The host-matching helpers were first shared by ``create-interfaces`` and
 ``sync-interfaces`` (ported from the copies duplicated in
-``create_interfaces_netbox.py`` and ``netbox_interfaces_update.py``).
+``create_interfaces_netbox.py`` and ``netbox_interfaces_update.py``), now the
+create and sync steps of ``wired interfaces``.
 :func:`add_tag` came out of ``wireless sync``, and is the one way any tool adds
 a tag to an existing device.
 """
