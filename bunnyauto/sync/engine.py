@@ -6,13 +6,20 @@ patches only the NetBox interfaces whose state differs. Never creates VLANs or
 interfaces; missing or ambiguous objects are reported and skipped.
 
 The NetBox client (``nb``) and the tagged Nornir inventory are supplied by the
-``sync-interfaces`` tool; this module holds the parsing + reconciliation logic.
+sync step of ``wired interfaces`` (:mod:`bunnyauto.tools.wired.sync_interfaces`);
+this module holds the parsing + reconciliation logic.
+
+**Awaiting creation.** In a plan, the create step has not made the interfaces
+it found missing, so they can't be matched yet. The ports it would create are
+passed in as ``pending`` (:func:`build_interface_search_scope`): they are listed
+in :attr:`SyncSummary.pending` instead of reported as errors, and an
+``--apply`` run syncs them right after they are created.
 
 **Stacks.** One SSH session to a stack reports every member's ports, but NetBox
 keeps each member as its own device. :func:`build_interface_search_scope`
 resolves the members with :func:`bunnyauto.netbox.stacks.resolve_stack`, the
-resolver ``create-interfaces`` uses (the device's Virtual Chassis, else the
-``<host>-<member>`` names), so both tools agree on where a port lives. A member
+resolver the create step uses (the device's Virtual Chassis, else the
+``<host>-<member>`` names), so both steps agree on where a port lives. A member
 found by name must be in the run's scope; a Virtual Chassis member is part of
 the in-scope switch, so it counts even without the env tag. :func:`match_scoped_interface`
 matches a member's port on that member's device only, never on a same-named
@@ -136,8 +143,11 @@ class SyncSummary:
     #: Ports skipped because their stack member has no NetBox device in scope.
     blocked: list[BlockedMember] = field(default_factory=list)
     #: ``"<device>/<interface>"`` -> the stack member device that port belongs on:
-    #: copies on the wrong member, left by create-interfaces runs before stacks.
+    #: copies on the wrong member, left by create runs before stacks were handled.
     misplaced: dict[str, str] = field(default_factory=dict)
+    #: Reported ports not in NetBox yet that this run's create step would create
+    #: (plan mode); synced once they exist, so not errors.
+    pending: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -150,6 +160,9 @@ class InterfaceSearchScope:
         int,
         tuple[dict[str, list[Any]], dict[tuple[str, str], list[Any]]],
     ]
+    #: ``(NetBox device id, interface signature)`` of ports the create step would
+    #: create on one of these devices, and hasn't (a plan): see :func:`_place`.
+    pending: frozenset[tuple[int, tuple[str, str]]] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -1377,6 +1390,7 @@ def build_interface_search_scope(
     in_scope: Iterable[Any],
     *,
     scope_label: str = "",
+    pending: Iterable[tuple[int, str]] = (),
 ) -> InterfaceSearchScope:
     """Resolve the switch's stack members and load each one's own interfaces.
 
@@ -1385,6 +1399,9 @@ def build_interface_search_scope(
     by name must be ``in_scope`` (the run's tag + role branch + region/site); a
     Virtual Chassis member of the in-scope switch counts even outside it, and
     is logged. ``scope_label`` names the scope in those notes and reasons.
+    ``pending`` lists ``(NetBox device id, port name)`` pairs the create step
+    would create but hasn't yet (a plan); the ones on this stack's devices are
+    kept, so those ports are reported as awaiting creation, not as missing.
     """
 
     device = resolve_device(nb, collected)
@@ -1415,6 +1432,11 @@ def build_interface_search_scope(
             device_id: interface_indexes(own_interfaces(nb, member))
             for device_id, member in devices.items()
         },
+        pending=frozenset(
+            (int(device_id), interface_signature(name))
+            for device_id, name in pending
+            if int(device_id) in devices
+        ),
     )
 
 
@@ -1479,7 +1501,7 @@ def match_scoped_interface(
         aliases = " / ".join(member_local_names(discovered_name))
         error = (
             f"interface does not exist on NetBox device {owner.name!r} (stack member "
-            f"{member}), under that name or as {aliases}; wired create-interfaces creates it"
+            f"{member}), under that name or as {aliases}; wired interfaces creates it"
         )
     else:
         error = f"{error} on device {owner.name!r}"
@@ -1834,10 +1856,26 @@ def _place(
             item.ports.append(name)
         return None
     if match.error:
+        if _awaits_creation(name, scope):
+            # Not in NetBox yet, and this run's create step makes it: not an error.
+            # The VLAN and metadata passes both report most ports; list each once.
+            signature = interface_signature(name)
+            if all(interface_signature(port) != signature for port in summary.pending):
+                summary.pending.append(name)
+            return None
         summary.skipped += 1
         summary.errors.append(match.error)
         return None
     return match
+
+
+def _awaits_creation(name: str, scope: InterfaceSearchScope) -> bool:
+    """Will this run's create step make reported port ``name`` on one of the stack's devices?"""
+
+    if not scope.pending:
+        return False
+    signature = interface_signature(name)
+    return any((device_id, signature) in scope.pending for device_id in scope.devices_by_id)
 
 
 def _record_update(summary: SyncSummary, change: str, owner: Any, stack: Stack) -> None:
@@ -1870,8 +1908,8 @@ def _report_stack_leftovers(
         device, copy, owner = copies[0]
         summary.warnings.append(
             f"{len(copies)} interface(s) on {device.name} belong to another stack member "
-            f"(e.g. {copy.name} belongs on {owner.name}), likely left by a create-interfaces "
-            "run before stacks were handled — no longer synced; nothing is deleted, remove "
+            f"(e.g. {copy.name} belongs on {owner.name}), likely left by an interface "
+            "create run before stacks were handled — no longer synced; nothing is deleted, remove "
             "them in NetBox once any cables or IPs are moved"
         )
 

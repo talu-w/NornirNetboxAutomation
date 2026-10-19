@@ -19,7 +19,8 @@ import subprocess
 import sys
 
 # Mutating tools as (category, tool), in the order the pipeline applies them.
-PLAN_TOOLS = (("wired", "create-interfaces"), ("wired", "sync-interfaces"))
+# ``wired interfaces`` creates missing interfaces, then syncs them, in one run.
+PLAN_TOOLS = (("wired", "interfaces"),)
 
 _STATUS_EMOJI = {
     "ok": "✅",

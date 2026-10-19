@@ -85,8 +85,9 @@ jobs:
           # A step stops at the first command that exits non-zero, so a bare
           # `bunnyauto ...` line would fail the job on a successful apply (20)
           # and skip the line after it. run_bunnyauto maps the success codes to
-          # 0; any other code fails the step and skips the commands below it,
-          # so sync-interfaces only runs once create-interfaces has succeeded.
+          # 0; any other code fails the step and skips the commands below it.
+          # `wired interfaces` creates the missing interfaces, then syncs every
+          # interface (VLANs, state, descriptions) in the same run.
           run_bunnyauto() {
             local code=0
             bunnyauto "$@" || code=$?
@@ -98,5 +99,4 @@ jobs:
                  return "$code" ;;
             esac
           }
-          run_bunnyauto --env prod wired create-interfaces --apply --yes
-          run_bunnyauto --env prod wired sync-interfaces --apply --yes
+          run_bunnyauto --env prod wired interfaces --apply --yes

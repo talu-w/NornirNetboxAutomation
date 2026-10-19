@@ -71,25 +71,19 @@ def fake_tool(monkeypatch):
 
 
 def test_ci_plan_in_sync(fake_tool, capsys):
-    fake_tool(
-        {
-            "create-interfaces": {"status": "ok", "summary": "in sync", "changes": []},
-            "sync-interfaces": {"status": "ok", "summary": "in sync", "changes": []},
-        }
-    )
+    fake_tool({"interfaces": {"status": "ok", "summary": "in sync", "changes": []}})
     assert ci_plan.main(["--env", "test"]) == 0
     out = capsys.readouterr().out
     assert "NetBox is in sync" in out
-    assert "`wired sync-interfaces`" in out
+    assert "`wired interfaces`" in out
 
 
 def test_ci_plan_drift(fake_tool, capsys):
     fake_tool(
         {
-            "create-interfaces": {"status": "ok", "summary": "in sync", "changes": []},
-            "sync-interfaces": {
+            "interfaces": {
                 "status": "drift",
-                "summary": "3 interfaces would change",
+                "summary": "create: in sync | sync: 3 interfaces would change",
                 "changes": ["sw1: Gi1/0/1 vlan 10->20"],
             },
         }
@@ -103,12 +97,11 @@ def test_ci_plan_drift(fake_tool, capsys):
 def test_ci_plan_hard_error(fake_tool, capsys):
     fake_tool(
         {
-            "create-interfaces": {
+            "interfaces": {
                 "status": "error",
                 "summary": "NetBox unreachable",
                 "exit_code": 1,
             },
-            "sync-interfaces": {"status": "ok", "summary": "in sync", "changes": []},
         }
     )
     assert ci_plan.main(["--env", "test"]) == 1
@@ -122,7 +115,7 @@ def test_ci_plan_parses_bad_json(monkeypatch):
         return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="bunnyauto: NetBox down\n")
 
     monkeypatch.setattr(ci_plan.subprocess, "run", _fake_run)
-    code, payload = ci_plan._run_tool("test", "wired", "sync-interfaces")
+    code, payload = ci_plan._run_tool("test", "wired", "interfaces")
     assert payload["status"] == "error"
     assert "NetBox down" in payload["summary"]
 
@@ -138,10 +131,7 @@ def test_ci_plan_runs_the_categorized_commands(monkeypatch):
 
     monkeypatch.setattr(ci_plan.subprocess, "run", _fake_run)
     assert ci_plan.main(["--env", "test"]) == 0
-    assert [cmd[-2:] for cmd in seen] == [
-        ["wired", "create-interfaces"],
-        ["wired", "sync-interfaces"],
-    ]
+    assert [cmd[-2:] for cmd in seen] == [["wired", "interfaces"]]
 
 
 def test_ci_plan_tools_exist_in_the_registry():

@@ -1,4 +1,4 @@
-"""Tests for the create-interfaces tool (no real Nornir or NetBox)."""
+"""Tests for the create step of ``wired interfaces`` (no real Nornir or NetBox)."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from bunnyauto.result import Status
 from bunnyauto.scope import Scope
 from bunnyauto.tools.wired import create_interfaces as ci
 from bunnyauto.tools.wired.create_interfaces import (
-    TOOL,
+    STEP,
     DiscoveredInterface,
     Discovery,
     parse_interfaces,
@@ -335,7 +335,7 @@ def test_plan_reports_drift(wired):
     ctx = _ctx(apply=False)
     ctx._nb = nb
 
-    result = TOOL.run(ctx, _args())
+    result = STEP.run(ctx, _args())
 
     assert result.status is Status.DRIFT
     assert result.exit_code == 10
@@ -348,7 +348,7 @@ def test_apply_creates(wired):
     ctx = _ctx(apply=True)
     ctx._nb = nb
 
-    result = TOOL.run(ctx, _args())
+    result = STEP.run(ctx, _args())
 
     assert result.status is Status.CHANGED
     assert result.exit_code == 20
@@ -360,7 +360,7 @@ def test_in_sync_is_ok(wired):
     nb = wired(existing={1: ["Gi1/0/1"]}, discovered={"sw1": ["Gi1/0/1"]})
     ctx = _ctx()
     ctx._nb = nb
-    result = TOOL.run(ctx, _args())
+    result = STEP.run(ctx, _args())
     assert result.status is Status.OK
     assert result.changes == []
 
@@ -369,7 +369,7 @@ def test_collection_failure_is_error(wired):
     nb = wired(existing={1: []}, discovered={"sw1": []}, failed_hosts={"sw1"})
     ctx = _ctx()
     ctx._nb = nb
-    result = TOOL.run(ctx, _args())
+    result = STEP.run(ctx, _args())
     assert result.status is Status.ERROR
 
 
@@ -379,7 +379,7 @@ def test_unknown_device_raises(monkeypatch):
     ctx = _ctx()
     ctx._nb = nb
     with pytest.raises(ToolError, match="was not found"):
-        TOOL.run(ctx, _args(device="sw99"))
+        STEP.run(ctx, _args(device="sw99"))
 
 
 # ---------------------------------------------------------------------------
@@ -410,7 +410,7 @@ def _created(nb) -> set[tuple[int, str]]:
 def test_stack_member_ports_are_created_on_their_own_member(wired):
     nb = wired(existing={}, discovered={A1: STACK_PORTS}, devices=_stack())
 
-    result = TOOL.run(_ctx(apply=True, nb=nb), _args())
+    result = STEP.run(_ctx(apply=True, nb=nb), _args())
 
     assert result.status is Status.CHANGED
     assert _created(nb) == {
@@ -424,7 +424,7 @@ def test_stack_member_ports_are_created_on_their_own_member(wired):
 def test_plan_names_the_member_and_where_its_ports_were_seen(wired):
     nb = wired(existing={}, discovered={A1: STACK_PORTS}, devices=_stack())
 
-    result = TOOL.run(_ctx(nb=nb), _args())
+    result = STEP.run(_ctx(nb=nb), _args())
 
     assert result.status is Status.DRIFT
     assert (
@@ -443,7 +443,7 @@ def test_member_port_already_on_its_member_is_not_recreated(wired):
         devices=_stack(),
     )
 
-    result = TOOL.run(_ctx(apply=True, nb=nb), _args())
+    result = STEP.run(_ctx(apply=True, nb=nb), _args())
 
     assert _created(nb) == {(3, "GigabitEthernet3/0/1")}
     assert result.data[A2]["existing"] == 1
@@ -467,7 +467,7 @@ def test_member_port_under_member_ones_number_is_renamed(wired):
         devices=_bravo(),
     )
 
-    plan = TOOL.run(_ctx(nb=nb), _args())
+    plan = STEP.run(_ctx(nb=nb), _args())
 
     assert plan.status is Status.DRIFT
     assert plan.changes == [
@@ -485,7 +485,7 @@ def test_member_port_under_member_ones_number_is_renamed(wired):
     assert "1 interface(s) with the wrong stack member number" in plan.summary
     assert nb.dcim.interfaces.updated == []
 
-    applied = TOOL.run(_ctx(apply=True, nb=nb), _args())
+    applied = STEP.run(_ctx(apply=True, nb=nb), _args())
 
     assert applied.status is Status.CHANGED
     # Same interface (its id, so its cables and IPs, kept), new name; member 1's untouched.
@@ -503,7 +503,7 @@ def test_rename_changes_only_the_member_number(wired):
         devices=_bravo(),
     )
 
-    TOOL.run(_ctx(apply=True, nb=nb), _args())
+    STEP.run(_ctx(apply=True, nb=nb), _args())
 
     assert nb.dcim.interfaces.updated == [{"id": 2000, "name": "Gi2/0/39"}]
 
@@ -516,7 +516,7 @@ def test_no_rename_when_the_member_already_has_the_right_name(wired):
         devices=_bravo(),
     )
 
-    result = TOOL.run(_ctx(apply=True, nb=nb), _args())
+    result = STEP.run(_ctx(apply=True, nb=nb), _args())
 
     assert result.status is Status.OK
     assert nb.dcim.interfaces.updated == []
@@ -530,7 +530,7 @@ def test_template_name_without_a_member_number_is_left_alone(wired):
     )
     notes = io.StringIO()
 
-    result = TOOL.run(_ctx(apply=True, stream=notes, nb=nb), _args())
+    result = STEP.run(_ctx(apply=True, stream=notes, nb=nb), _args())
 
     assert result.status is Status.OK
     assert nb.dcim.interfaces.updated == nb.dcim.interfaces.created == []
@@ -546,7 +546,7 @@ def test_standalone_switch_ports_are_never_renumbered(wired):
         devices=[_Device(1, "bldg-sw", ip="10.0.0.9/24")],
     )
 
-    TOOL.run(_ctx(apply=True, nb=nb), _args())
+    STEP.run(_ctx(apply=True, nb=nb), _args())
 
     assert nb.dcim.interfaces.updated == []
     assert _created(nb) == {(1, "GigabitEthernet2/0/1")}
@@ -564,7 +564,7 @@ def test_rename_failure_is_reported(wired):
 
     nb.dcim.interfaces.update = refuse
 
-    result = TOOL.run(_ctx(apply=True, nb=nb), _args())
+    result = STEP.run(_ctx(apply=True, nb=nb), _args())
 
     assert result.status is Status.PARTIAL  # member 1 was fine
     assert result.data[BRAVO2]["error"] == "rename failed: 400 Bad Request"
@@ -580,7 +580,7 @@ def test_copy_on_the_wrong_member_is_reported_and_never_deleted(wired):
     )
     notes = io.StringIO()
 
-    result = TOOL.run(_ctx(apply=True, stream=notes, nb=nb), _args())
+    result = STEP.run(_ctx(apply=True, stream=notes, nb=nb), _args())
 
     assert (2, "GigabitEthernet2/0/1") in _created(nb)
     assert result.data[A1]["misplaced"] == {"GigabitEthernet2/0/1": A2}
@@ -596,7 +596,7 @@ def test_template_names_on_other_members_are_not_misplaced_member_one_ports(wire
         devices=_stack(),
     )
 
-    result = TOOL.run(_ctx(nb=nb), _args())
+    result = STEP.run(_ctx(nb=nb), _args())
 
     assert all("misplaced" not in entry for entry in result.data.values())
 
@@ -604,7 +604,7 @@ def test_template_names_on_other_members_are_not_misplaced_member_one_ports(wire
 def test_member_missing_from_netbox_is_skipped_not_put_on_the_connected_device(wired):
     nb = wired(existing={}, discovered={A1: STACK_PORTS}, devices=_stack(members=2))
 
-    result = TOOL.run(_ctx(apply=True, nb=nb), _args())
+    result = STEP.run(_ctx(apply=True, nb=nb), _args())
 
     assert not any(name == "GigabitEthernet3/0/1" for _, name in _created(nb))
     assert result.status is Status.PARTIAL
@@ -628,7 +628,7 @@ def test_member_outside_the_scope_is_named_in_the_reason(wired):
         everywhere=[*_stack(members=2), untagged],
     )
 
-    result = TOOL.run(_ctx(nb=nb), _args())
+    result = STEP.run(_ctx(nb=nb), _args())
 
     (blocked,) = result.data[A1]["blocked"]
     assert blocked["reason"].startswith(f"{A3} is outside this run's scope (tag 'nornirtest'")
@@ -642,7 +642,7 @@ def test_member_already_on_the_connected_device_is_not_blocked(wired):
         devices=[_Device(1, "core-1", ip="10.0.0.1/24")],
     )
 
-    result = TOOL.run(_ctx(nb=nb), _args())
+    result = STEP.run(_ctx(nb=nb), _args())
 
     assert result.status is Status.OK
     assert "blocked" not in result.data["core-1"]
@@ -658,7 +658,7 @@ def test_copy_on_the_connected_device_never_stands_in_for_an_out_of_scope_member
         everywhere=[*_stack(members=1), _Device(2, A2)],
     )
 
-    result = TOOL.run(_ctx(nb=nb), _args())
+    result = STEP.run(_ctx(nb=nb), _args())
 
     assert result.status is Status.PARTIAL
     (blocked,) = result.data[A1]["blocked"]
@@ -676,7 +676,7 @@ def test_line_card_ports_stay_present_when_the_other_chassis_is_out_of_scope(wir
         everywhere=[core1, _Device(2, "core-2", ip="10.0.0.2/24")],
     )
 
-    result = TOOL.run(_ctx(nb=nb), _args())
+    result = STEP.run(_ctx(nb=nb), _args())
 
     assert result.status is Status.OK
     assert "blocked" not in result.data["core-1"]
@@ -690,7 +690,7 @@ def test_switch_with_its_own_management_ip_is_never_a_stack_member(wired):
         devices=[_Device(1, "core-1", ip="10.0.0.1/24"), _Device(2, "core-2", ip="10.0.0.2/24")],
     )
 
-    result = TOOL.run(_ctx(apply=True, nb=nb), _args())
+    result = STEP.run(_ctx(apply=True, nb=nb), _args())
 
     assert nb.dcim.interfaces.created == []
     (blocked,) = result.data["core-1"]["blocked"]
@@ -705,7 +705,7 @@ def test_redundant_pair_named_like_a_stack_keeps_its_own_ports(wired):
         devices=[_Device(1, "dist-1", ip="10.0.0.1/24"), _Device(2, "dist-2", ip="10.0.0.2/24")],
     )
 
-    TOOL.run(_ctx(apply=True, nb=nb), _args())
+    STEP.run(_ctx(apply=True, nb=nb), _args())
 
     assert _created(nb) == {(2, "GigabitEthernet1/0/1"), (2, "GigabitEthernet1/0/2")}
 
@@ -718,7 +718,7 @@ def test_router_slot_numbering_is_not_read_as_a_stack(wired):
         devices=[_Device(1, "rtr-1", ip="10.0.0.1/24"), _Device(2, "rtr-0")],
     )
 
-    TOOL.run(_ctx(apply=True, nb=nb), _args())
+    STEP.run(_ctx(apply=True, nb=nb), _args())
 
     assert _created(nb) == {(1, "GigabitEthernet0/0/0"), (1, "GigabitEthernet1/0/0")}
 
@@ -734,7 +734,7 @@ def test_virtual_chassis_routes_ports_by_position(wired):
         chassis=chassis,
     )
 
-    TOOL.run(_ctx(apply=True, nb=nb), _args())
+    STEP.run(_ctx(apply=True, nb=nb), _args())
 
     assert _created(nb) == {(10, "GigabitEthernet1/0/1"), (10, "Po1"), (11, "GigabitEthernet2/0/1")}
 
@@ -746,7 +746,7 @@ def test_port_channel_on_another_member_is_not_recreated(wired):
         devices=_stack(members=2),
     )
 
-    result = TOOL.run(_ctx(nb=nb), _args())
+    result = STEP.run(_ctx(nb=nb), _args())
 
     assert result.status is Status.OK
     assert result.data[A1]["on_other_member"] == {"Port-channel1": [A2]}
@@ -762,7 +762,7 @@ def test_unreachable_member_is_covered_by_its_stack(wired):
     )
     notes = io.StringIO()
 
-    result = TOOL.run(_ctx(stream=notes, nb=nb), _args())
+    result = STEP.run(_ctx(stream=notes, nb=nb), _args())
 
     assert result.status is Status.DRIFT
     assert "error" not in result.data[A2]
@@ -772,7 +772,7 @@ def test_unreachable_member_is_covered_by_its_stack(wired):
 def test_unreachable_member_of_an_unchecked_stack_still_fails(wired):
     nb = wired(existing={}, discovered={A2: []}, failed_hosts={A2}, devices=_stack())
 
-    result = TOOL.run(_ctx(nb=nb), _args())
+    result = STEP.run(_ctx(nb=nb), _args())
 
     assert result.status is Status.ERROR
     assert result.data[A2]["ok"] is False
@@ -781,7 +781,7 @@ def test_unreachable_member_of_an_unchecked_stack_still_fails(wired):
 def test_stack_reached_through_two_members_is_checked_once(wired):
     nb = wired(existing={}, discovered={A1: STACK_PORTS, A2: STACK_PORTS}, devices=_stack())
 
-    TOOL.run(_ctx(apply=True, nb=nb), _args())
+    STEP.run(_ctx(apply=True, nb=nb), _args())
 
     names = [(c["device"], c["name"]) for c in nb.dcim.interfaces.created]
     assert len(names) == len(set(names)) == 4
@@ -798,7 +798,7 @@ def test_connected_member_two_does_not_lend_its_template_names_to_member_one(wir
         everywhere=[a2, _Device(1, A1)],
     )
 
-    result = TOOL.run(_ctx(nb=nb), _args())
+    result = STEP.run(_ctx(nb=nb), _args())
 
     assert result.changes == [
         f"{A2}: would rename GigabitEthernet1/0/1 to GigabitEthernet2/0/1 "
@@ -825,7 +825,7 @@ def test_untagged_virtual_chassis_members_get_their_own_ports(wired):
     )
     notes = io.StringIO()
 
-    result = TOOL.run(_ctx(apply=True, stream=notes, nb=nb), _args())
+    result = STEP.run(_ctx(apply=True, stream=notes, nb=nb), _args())
 
     assert result.status is Status.CHANGED
     assert _created(nb) == {
@@ -848,7 +848,7 @@ TX = "10/100/1000BaseTX"
 def test_new_interface_gets_the_type_the_device_reports(wired):
     nb = wired(existing={1: []}, discovered={"sw1": [("Gi1/0/1", TX), ("Gi1/1/1", "Not Present")]})
 
-    result = TOOL.run(_ctx(apply=True, nb=nb), _args())
+    result = STEP.run(_ctx(apply=True, nb=nb), _args())
 
     assert result.status is Status.CHANGED
     types = {c["name"]: c["type"] for c in nb.dcim.interfaces.created}
@@ -863,7 +863,7 @@ def test_existing_interface_with_the_wrong_type_is_corrected(wired):
         discovered={"sw1": [("GigabitEthernet1/0/1", TX)]},
     )
 
-    plan = TOOL.run(_ctx(nb=nb), _args())
+    plan = STEP.run(_ctx(nb=nb), _args())
 
     assert plan.status is Status.DRIFT
     assert plan.changes == [
@@ -876,7 +876,7 @@ def test_existing_interface_with_the_wrong_type_is_corrected(wired):
     assert "wrong type" in plan.summary
     assert nb.dcim.interfaces.updated == []
 
-    applied = TOOL.run(_ctx(apply=True, nb=nb), _args())
+    applied = STEP.run(_ctx(apply=True, nb=nb), _args())
 
     assert applied.status is Status.CHANGED
     assert nb.dcim.interfaces.updated == [{"id": 1000, "type": "1000base-tx"}]
@@ -890,7 +890,7 @@ def test_matching_type_is_left_alone(wired):
         discovered={"sw1": [("Gi1/0/1", TX), ("Te1/1/1", "SFP-10GBase-SR")]},
     )
 
-    result = TOOL.run(_ctx(nb=nb), _args())
+    result = STEP.run(_ctx(nb=nb), _args())
 
     assert result.status is Status.OK
     assert result.changes == []
@@ -902,7 +902,7 @@ def test_cage_modelled_as_its_optic_or_x2_is_left_alone(wired):
         discovered={"sw1": [("Te1/1/1", "SFP-10GBase-SR"), ("Te1/1/2", "SFP-10GBase-LR")]},
     )
 
-    assert TOOL.run(_ctx(nb=nb), _args()).status is Status.OK
+    assert STEP.run(_ctx(nb=nb), _args()).status is Status.OK
 
 
 def test_copper_type_on_a_transceiver_cage_is_corrected(wired):
@@ -916,7 +916,7 @@ def test_copper_type_on_a_transceiver_cage_is_corrected(wired):
         },
     )
 
-    TOOL.run(_ctx(apply=True, nb=nb), _args())
+    STEP.run(_ctx(apply=True, nb=nb), _args())
 
     assert nb.dcim.interfaces.updated == [
         {"id": 1000, "type": "1000base-x-sfp"},
@@ -930,7 +930,7 @@ def test_no_usable_media_type_never_changes_a_type(wired):
         discovered={"sw1": [("Gi1/0/1", "unknown"), ("Port-channel1", "")]},
     )
 
-    result = TOOL.run(_ctx(apply=True, nb=nb), _args())
+    result = STEP.run(_ctx(apply=True, nb=nb), _args())
 
     assert result.status is Status.OK
     assert nb.dcim.interfaces.updated == []
@@ -943,7 +943,7 @@ def test_unmapped_media_type_is_noted_and_changes_nothing(wired):
     )
     notes = io.StringIO()
 
-    result = TOOL.run(_ctx(apply=True, stream=notes, nb=nb), _args())
+    result = STEP.run(_ctx(apply=True, stream=notes, nb=nb), _args())
 
     assert nb.dcim.interfaces.updated == []
     # the new port falls back to the name-only guess
@@ -959,7 +959,7 @@ def test_type_this_netbox_lacks_falls_back_to_the_older_one(wired):
         types=[t for t in NETBOX_TYPES if t != "1000base-tx"],
     )
 
-    TOOL.run(_ctx(apply=True, nb=nb), _args())
+    STEP.run(_ctx(apply=True, nb=nb), _args())
 
     assert nb.dcim.interfaces.updated == []
     assert nb.dcim.interfaces.created[0]["type"] == "1000base-t"
@@ -973,7 +973,7 @@ def test_unreadable_type_choices_warn_and_use_long_standing_types(wired):
     )
     notes = io.StringIO()
 
-    result = TOOL.run(_ctx(apply=True, stream=notes, nb=nb), _args())
+    result = STEP.run(_ctx(apply=True, stream=notes, nb=nb), _args())
 
     assert result.status is Status.CHANGED
     assert nb.dcim.interfaces.updated == []  # 1000base-t stays
@@ -989,7 +989,7 @@ def test_type_update_failure_is_reported(wired):
 
     nb.dcim.interfaces.update = refuse
 
-    result = TOOL.run(_ctx(apply=True, nb=nb), _args())
+    result = STEP.run(_ctx(apply=True, nb=nb), _args())
 
     assert result.status is Status.ERROR
     assert result.data["sw1"]["error"] == "type update failed: 400 Bad Request"
@@ -1006,7 +1006,7 @@ def test_stack_members_template_named_port_gets_its_type_corrected(wired):
         devices=_stack(members=2),
     )
 
-    result = TOOL.run(_ctx(nb=nb), _args())
+    result = STEP.run(_ctx(nb=nb), _args())
 
     assert result.changes == [
         f"{A2}: would change GigabitEthernet1/0/1 from 1000base-t to 1000base-tx "
@@ -1015,7 +1015,7 @@ def test_stack_members_template_named_port_gets_its_type_corrected(wired):
         f"(wrong stack member number) [stack member 2, seen on {A1}]",
     ]
 
-    TOOL.run(_ctx(apply=True, nb=nb), _args())
+    STEP.run(_ctx(apply=True, nb=nb), _args())
 
     assert nb.dcim.interfaces.updated == [
         {"id": 2000, "type": "1000base-tx"},
@@ -1080,7 +1080,7 @@ def test_optic_gets_an_inventory_item_on_its_interface(wired):
         optics={"sw1": [SR]},
     )
 
-    plan = TOOL.run(_ctx(nb=nb), _args())
+    plan = STEP.run(_ctx(nb=nb), _args())
 
     assert plan.status is Status.DRIFT
     assert plan.changes == [
@@ -1090,7 +1090,7 @@ def test_optic_gets_an_inventory_item_on_its_interface(wired):
     assert "1 transceiver(s) not yet in NetBox" in plan.summary
     assert nb.dcim.inventory_items.created == []
 
-    applied = TOOL.run(_ctx(apply=True, nb=nb), _args())
+    applied = STEP.run(_ctx(apply=True, nb=nb), _args())
 
     assert applied.status is Status.CHANGED
     assert nb.dcim.inventory_items.created == [
@@ -1116,7 +1116,7 @@ def test_optic_already_recorded_on_its_interface_is_in_sync(wired):
         items=[_item(5, "Te1/1/1 optic", 1, interface_id=1000, serial="avd1234abcd")],
     )
 
-    result = TOOL.run(_ctx(apply=True, nb=nb), _args())
+    result = STEP.run(_ctx(apply=True, nb=nb), _args())
 
     assert result.status is Status.OK
     assert nb.dcim.inventory_items.created == []
@@ -1132,7 +1132,7 @@ def test_optic_recorded_on_another_device_is_reported_not_duplicated(wired):
     )
     notes = io.StringIO()
 
-    result = TOOL.run(_ctx(apply=True, stream=notes, nb=nb), _args())
+    result = STEP.run(_ctx(apply=True, stream=notes, nb=nb), _args())
 
     assert nb.dcim.inventory_items.created == []
     assert result.status is Status.OK  # a note for a person, not a failure
@@ -1149,7 +1149,7 @@ def test_port_holding_a_different_optic_is_reported_not_replaced(wired):
     )
     notes = io.StringIO()
 
-    TOOL.run(_ctx(apply=True, stream=notes, nb=nb), _args())
+    STEP.run(_ctx(apply=True, stream=notes, nb=nb), _args())
 
     assert nb.dcim.inventory_items.created == []
     assert "NetBox already has an optic (serial OLD999) on this port" in notes.getvalue()
@@ -1160,10 +1160,10 @@ def test_optic_in_a_port_created_this_run_is_attached_to_the_new_interface(wired
         existing={1: []}, discovered={"sw1": ["TenGigabitEthernet1/1/1"]}, optics={"sw1": [SR]}
     )
 
-    plan = TOOL.run(_ctx(nb=nb), _args())
+    plan = STEP.run(_ctx(nb=nb), _args())
     assert any("(with the new interface)" in c for c in plan.changes)
 
-    TOOL.run(_ctx(apply=True, nb=nb), _args())
+    STEP.run(_ctx(apply=True, nb=nb), _args())
 
     (item,) = nb.dcim.inventory_items.created
     assert item["component_id"] == 9000  # the id NetBox gave the interface just created
@@ -1179,7 +1179,7 @@ def test_optic_is_not_recorded_when_its_interface_could_not_be_created(wired):
 
     nb.dcim.interfaces.create = refuse
 
-    result = TOOL.run(_ctx(apply=True, nb=nb), _args())
+    result = STEP.run(_ctx(apply=True, nb=nb), _args())
 
     assert nb.dcim.inventory_items.created == []
     assert result.data["sw1"]["error"] == "create failed: 400 Bad Request"
@@ -1195,7 +1195,7 @@ def test_stack_members_optic_goes_on_the_member_device(wired):
         optics={A1: [optic]},
     )
 
-    TOOL.run(_ctx(apply=True, nb=nb), _args())
+    STEP.run(_ctx(apply=True, nb=nb), _args())
 
     # Named after the interface as renamed this run: Te1/1/1 -> Te2/1/1.
     (item,) = nb.dcim.inventory_items.created
@@ -1220,7 +1220,7 @@ def test_optic_keeps_the_old_interface_name_when_the_rename_fails(wired):
 
     nb.dcim.interfaces.update = refuse
 
-    TOOL.run(_ctx(apply=True, nb=nb), _args())
+    STEP.run(_ctx(apply=True, nb=nb), _args())
 
     (item,) = nb.dcim.inventory_items.created
     assert (item["component_id"], item["name"]) == (2000, "TenGigabitEthernet1/1/1")
@@ -1234,7 +1234,7 @@ def test_unreadable_inventory_still_checks_interfaces(wired):
     )
     notes = io.StringIO()
 
-    result = TOOL.run(_ctx(stream=notes, nb=nb), _args())
+    result = STEP.run(_ctx(stream=notes, nb=nb), _args())
 
     assert result.status is Status.DRIFT
     assert "transceivers not checked — show inventory failed: timed out" in notes.getvalue()
@@ -1243,6 +1243,6 @@ def test_unreadable_inventory_still_checks_interfaces(wired):
 def test_no_optics_means_no_inventory_lookups(wired):
     nb = wired(existing={1: ["Gi1/0/1"]}, discovered={"sw1": ["Gi1/0/1"]})
 
-    TOOL.run(_ctx(nb=nb), _args())
+    STEP.run(_ctx(nb=nb), _args())
 
     assert nb.dcim.inventory_items.queries == []

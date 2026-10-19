@@ -1,6 +1,12 @@
-"""``wired create-interfaces`` — create missing interfaces, correct their types, record optics.
+"""The create step of ``wired interfaces``: create missing interfaces, fix types, record optics.
 
-Ported from ``create_interfaces_netbox.py``. Plans by default; ``--apply`` writes.
+Ported from ``create_interfaces_netbox.py`` (and formerly its own tool,
+``wired create-interfaces``). :mod:`bunnyauto.tools.wired.interfaces` runs this
+step first, then the sync step (:mod:`bunnyauto.tools.wired.sync_interfaces`),
+so the interfaces made here get their VLANs, state and description in the same
+run. Plans by default; ``--apply`` writes. :meth:`CreateInterfaces.execute`
+also hands the sync step what it needs: the interfaces still to be created (a
+plan), and the hosts that couldn't be reached (not worth another SSH attempt).
 It creates interfaces NetBox is missing and corrects the **type** of ones it
 has, and the **stack member number** in the name of a stack member's port (see
 below). It never changes anything else on an interface, and never deletes one.
@@ -39,7 +45,7 @@ chassis member); a member found only by name must be in scope. A member with no
 usable NetBox device gets nothing. Its ports are reported, never parked on
 another member. A copy already on the connected device counts as present only
 when NetBox has no device of that member's own
-(:meth:`~bunnyauto.netbox.stacks.Stack.stand_in`, the rule ``sync-interfaces``
+(:meth:`~bunnyauto.netbox.stacks.Stack.stand_in`, the rule the sync step
 uses too). When the member's device exists but is out of scope, the copy is a
 leftover and the ports are reported.
 
@@ -100,7 +106,7 @@ from bunnyauto.netbox.transceivers import (
     load_inventory_items,
     plan_inventory_item,
 )
-from bunnyauto.retry import run_with_retries
+from bunnyauto.retry import is_connect_failure, run_with_retries
 from bunnyauto.tools.base import Status, ToolResult, add_common_arguments
 
 if TYPE_CHECKING:
@@ -322,9 +328,57 @@ def _show_inventory(task: Task) -> tuple[Any, str]:
     return rows, ""
 
 
+def add_device_argument(parser: argparse.ArgumentParser) -> None:
+    """``--device``: one device (and its stack) instead of the whole scope; both steps honour it."""
+    parser.add_argument(
+        "--device",
+        default=None,
+        help=(
+            "limit to one device by name (must still be in scope); "
+            "a stack's other members are checked along with it"
+        ),
+    )
+
+
+def add_arguments(parser: argparse.ArgumentParser) -> None:
+    """The create step's own options (``--device`` is added by :func:`add_device_argument`)."""
+    parser.add_argument(
+        "--include-virtual",
+        action="store_true",
+        dest="include_virtual",
+        help="also create loopbacks, VLANs, and tunnels (Port-Channels are always included)",
+    )
+
+
+def select_device(ctx: Context, in_scope: list[Any], device: str | None) -> list[Any]:
+    """``in_scope`` narrowed to ``--device`` (the whole scope without one)."""
+    if not device:
+        return in_scope
+    wanted = device.casefold()
+    tagged = [d for d in in_scope if str(d.name).casefold() == wanted]
+    if not tagged:
+        raise ToolError(f"device {device!r} was not found in scope ({ctx.scope().describe()})")
+    return tagged
+
+
+@dataclass(frozen=True, slots=True)
+class CreateOutcome:
+    """The create step's result, plus what the sync step that follows it needs."""
+
+    result: ToolResult
+    #: ``(NetBox device id, port name)`` of each interface this run would create
+    #: but hasn't: all of the missing ones in a plan, none once applied.
+    pending: tuple[tuple[int, str], ...] = ()
+    #: Hosts whose SSH session never came up (retries spent): the sync step
+    #: doesn't try them again.
+    unreachable: frozenset[str] = frozenset()
+
+
 @dataclass(slots=True)
 class CreateInterfaces:
-    name: str = "create-interfaces"
+    """The create step. Not a registered tool: ``wired interfaces`` runs it."""
+
+    name: str = "create"
     summary: str = (
         "Create the interfaces NetBox is missing and correct wrong types and stack member numbers"
     )
@@ -332,37 +386,24 @@ class CreateInterfaces:
     category: str = "wired"
 
     def add_arguments(self, parser: argparse.ArgumentParser) -> None:
+        """Everything this step accepts on its own (used by its tests)."""
         add_common_arguments(parser)
-        parser.add_argument(
-            "--device",
-            default=None,
-            help=(
-                "limit to one device by name (must still be in scope); "
-                "a stack's other members are checked along with it"
-            ),
-        )
-        parser.add_argument(
-            "--include-virtual",
-            action="store_true",
-            dest="include_virtual",
-            help="also create loopbacks, VLANs, and tunnels (Port-Channels are always included)",
-        )
+        add_device_argument(parser)
+        add_arguments(parser)
 
     def run(self, ctx: Context, args: argparse.Namespace) -> ToolResult:
+        return self.execute(ctx, args).result
+
+    def execute(self, ctx: Context, args: argparse.Namespace) -> CreateOutcome:
         nb = ctx.netbox()
         in_scope = ctx.target_devices()
-        tagged = in_scope
-        if args.device:
-            wanted = args.device.casefold()
-            tagged = [d for d in in_scope if str(d.name).casefold() == wanted]
-            if not tagged:
-                raise ToolError(
-                    f"device {args.device!r} was not found in scope ({ctx.scope().describe()})"
-                )
+        tagged = select_device(ctx, in_scope, getattr(args, "device", None))
         if not tagged:
-            return ToolResult(
-                status=Status.OK,
-                summary=f"no NetBox devices in scope ({ctx.scope().describe()})",
+            return CreateOutcome(
+                ToolResult(
+                    status=Status.OK,
+                    summary=f"no NetBox devices in scope ({ctx.scope().describe()})",
+                )
             )
 
         selected = select_tagged_inventory(ctx.nornir(), tagged)
@@ -373,10 +414,10 @@ class CreateInterfaces:
         run_result = run_with_retries(
             ctx,
             selected,
-            description="create-interfaces: discover",
-            name="create-interfaces: discover",
+            description="interfaces (create): discover",
+            name="interfaces (create): discover",
             task=_collect,
-            include_virtual=args.include_virtual,
+            include_virtual=getattr(args, "include_virtual", False),
         )
 
         plans: dict[int, _DevicePlan] = {}
@@ -447,7 +488,7 @@ class CreateInterfaces:
             for plan in ordered:
                 _apply(ctx, nb, plan, failures)
 
-        return _result(
+        result = _result(
             apply=ctx.settings.apply,
             changes=changes,
             plans=ordered,
@@ -455,6 +496,18 @@ class CreateInterfaces:
             failures=failures,
             progressed=bool(stacks_seen) and (not ordered or any(not p.error for p in ordered)),
         )
+        pending = (
+            ()
+            if ctx.settings.apply
+            else tuple((int(p.device.id), i.name) for p in ordered for i in p.missing)
+        )
+        hosts = selected.inventory.hosts
+        no_session = frozenset(
+            name
+            for name, multi in run_result.items()
+            if name in unreachable and is_connect_failure(hosts.get(name), multi)
+        )
+        return CreateOutcome(result, pending, no_session)
 
 
 def _apply(ctx: Context, nb: Any, plan: _DevicePlan, failures: dict[str, str]) -> None:
@@ -978,4 +1031,4 @@ def _discovered(multi) -> Discovery | None:
     return None
 
 
-TOOL = CreateInterfaces()
+STEP = CreateInterfaces()

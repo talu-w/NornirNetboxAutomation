@@ -120,7 +120,7 @@ def test_every_category_has_its_tools():
     parser = cli.build_parser()
     for argv in (
         ["wired", "backup"],
-        ["wired", "sync-interfaces"],
+        ["wired", "interfaces"],
         ["wireless", "sync"],
         ["security", "subnet-check", "10.0.0.0/24"],
         ["netbox", "import-device-type", "x.yaml"],
@@ -319,7 +319,7 @@ def test_json_output_is_always_valid_json_even_on_error(tmp_path):
             str(env_file),
             "--json",
             "wired",
-            "sync-interfaces",
+            "interfaces",
         ],
         capture_output=True,
         text=True,

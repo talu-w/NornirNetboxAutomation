@@ -86,43 +86,38 @@ _APPLY = ("apply.yml", "apply-prod", "Apply to prod NetBox")
 
 
 @pytest.mark.parametrize(
-    "codes",
+    "code",
     [
-        pytest.param([0, 0], id="nothing-to-change"),
-        pytest.param([20, 20], id="both-changed"),  # 20 used to fail the job here
-        pytest.param([20, 0], id="created-then-in-sync"),
-        pytest.param([10, 0], id="drift"),
+        pytest.param(0, id="nothing-to-change"),
+        pytest.param(20, id="changed"),  # 20 used to fail the job here
+        pytest.param(10, id="drift"),
     ],
 )
-def test_apply_success_codes_run_both_tools(tmp_path, codes):
-    code, calls, _ = _run_step(tmp_path, _step_script(*_APPLY), command="bunnyauto", codes=codes)
-    assert code == 0
-    assert "wired create-interfaces --apply --yes" in calls[0]
-    assert "wired sync-interfaces --apply --yes" in calls[1]
+def test_apply_success_codes_pass(tmp_path, code):
+    result, calls, _ = _run_step(tmp_path, _step_script(*_APPLY), command="bunnyauto", codes=[code])
+    assert result == 0
+    assert len(calls) == 1
+    assert "wired interfaces --apply --yes" in calls[0]
+
+
+def test_apply_runs_the_combined_tool_not_the_old_pair(tmp_path):
+    _, calls, _ = _run_step(tmp_path, _step_script(*_APPLY), command="bunnyauto", codes=[0])
+    assert not any("create-interfaces" in call or "sync-interfaces" in call for call in calls)
 
 
 @pytest.mark.parametrize("failure", [1, 2, 127])
-def test_apply_stops_when_create_interfaces_fails(tmp_path, failure):
+def test_apply_fails_when_the_interfaces_tool_fails(tmp_path, failure):
     code, calls, output = _run_step(
         tmp_path, _step_script(*_APPLY), command="bunnyauto", codes=[failure]
     )
     assert code == failure
-    assert len(calls) == 1  # sync-interfaces never ran
+    assert len(calls) == 1
     assert f"failed with exit code {failure}" in output
     assert "::error::" in output
 
 
-def test_apply_fails_when_sync_interfaces_fails(tmp_path):
-    code, calls, output = _run_step(
-        tmp_path, _step_script(*_APPLY), command="bunnyauto", codes=[20, 2]
-    )
-    assert code == 2
-    assert len(calls) == 2
-    assert "::error::" in output
-
-
 def test_apply_drift_is_a_warning(tmp_path):
-    _, _, output = _run_step(tmp_path, _step_script(*_APPLY), command="bunnyauto", codes=[10, 0])
+    _, _, output = _run_step(tmp_path, _step_script(*_APPLY), command="bunnyauto", codes=[10])
     assert "::warning::" in output
     assert "exited 10 (DRIFT)" in output
 

@@ -1,4 +1,4 @@
-"""Tests for sync-interfaces: engine parsers, tool status wiring, stack routing."""
+"""Tests for the sync step of ``wired interfaces``: engine parsers, status wiring, stacks."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from bunnyauto.result import Status
 from bunnyauto.scope import Scope
 from bunnyauto.sync import engine
 from bunnyauto.tools.wired import sync_interfaces
-from bunnyauto.tools.wired.sync_interfaces import TOOL
+from bunnyauto.tools.wired.sync_interfaces import STEP
 
 # ---------------------------------------------------------------------------
 # engine parsers
@@ -265,7 +265,7 @@ def wired(monkeypatch):
         monkeypatch.setattr(
             engine,
             "build_interface_search_scope",
-            lambda nb, collected, in_scope, *, scope_label="": argparse.Namespace(
+            lambda nb, collected, in_scope, *, scope_label="", pending=(): argparse.Namespace(
                 stack=Stack(
                     connected=devices[collected.inventory_name],
                     anchor=devices[collected.inventory_name],
@@ -289,7 +289,7 @@ def test_no_devices(monkeypatch):
     monkeypatch.setattr(sync_interfaces, "select_tagged_inventory", lambda nr, d: None)
     ctx = _ctx()
     ctx._nb = _NB([])
-    result = TOOL.run(ctx, _args())
+    result = STEP.run(ctx, _args())
     assert result.status is Status.OK
     assert "nornirtest" in result.summary
 
@@ -305,7 +305,7 @@ def test_plan_reports_drift(wired):
     )
     ctx = _ctx(apply=False)
     ctx._nb = nb
-    result = TOOL.run(ctx, _args())
+    result = STEP.run(ctx, _args())
 
     assert result.status is Status.DRIFT
     assert result.exit_code == 10
@@ -316,7 +316,7 @@ def test_apply_reports_changed(wired):
     nb = wired({"sw1": _Summary("sw1", dry_run=False, updated=3, changes=["a", "b", "c"])})
     ctx = _ctx(apply=True)
     ctx._nb = nb
-    result = TOOL.run(ctx, _args())
+    result = STEP.run(ctx, _args())
     assert result.status is Status.CHANGED
     assert result.exit_code == 20
 
@@ -325,7 +325,7 @@ def test_in_sync_is_ok(wired):
     nb = wired({"sw1": _Summary("sw1", dry_run=True, updated=0, unchanged=50)})
     ctx = _ctx()
     ctx._nb = nb
-    result = TOOL.run(ctx, _args())
+    result = STEP.run(ctx, _args())
     assert result.status is Status.OK
 
 
@@ -338,7 +338,7 @@ def test_device_error_is_partial(wired):
     )
     ctx = _ctx()
     ctx._nb = nb
-    result = TOOL.run(ctx, _args())
+    result = STEP.run(ctx, _args())
     assert result.status is Status.PARTIAL
 
 
@@ -348,7 +348,7 @@ def test_unmatched_inventory_raises(monkeypatch):
     ctx = _ctx()
     ctx._nb = _NB([object()])
     with pytest.raises(ToolError, match="matched the Nornir inventory"):
-        TOOL.run(ctx, _args())
+        STEP.run(ctx, _args())
 
 
 # ---------------------------------------------------------------------------
@@ -420,7 +420,7 @@ def stack_run(monkeypatch):
             "build_vlan_cache",
             lambda nb_: engine.VlanCache(by_vid={}, by_id={}, groups_by_id={}),
         )
-        return TOOL.run(_ctx(apply=apply, stream=stream, nb=nb), _args()), nb
+        return STEP.run(_ctx(apply=apply, stream=stream, nb=nb), _args()), nb
 
     return _run
 
@@ -502,7 +502,7 @@ def test_member_port_missing_from_its_member_is_an_error_not_a_write_to_the_copy
     assert "(1 device(s) failed)" in result.summary
     (error,) = result.data[A1]["errors"]
     assert error.startswith(f"Gi2/0/1: interface does not exist on NetBox device '{A2}'")
-    assert "wired create-interfaces creates it" in error
+    assert "wired interfaces creates it" in error
 
 
 def test_member_outside_the_scope_is_blocked_and_its_copy_is_never_written(stack_run):

@@ -16,7 +16,7 @@ fields (``manufacturer``, ``model``, ``slug``, ``part_number``, ``u_height``,
   (derived from the YAML's manufacturer name).
 * **Device type** — created if missing (by slug). If NetBox already has a
   device type with that slug, its top-level fields are **never touched** —
-  same "don't clobber what's already there" rule as ``create-interfaces``.
+  same "don't clobber what's already there" rule as ``wired interfaces``.
 * **Child templates** — for a device type this run creates, every template in
   the YAML is created. For a device type that already existed, only
   templates NetBox is missing (matched by name) are created; existing ones
